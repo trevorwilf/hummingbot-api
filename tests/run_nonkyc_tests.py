@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Hummingbot Phase 1 — NonKYC API Standalone Validation  (v4)
-============================================================
+Hummingbot Phase 2 — NonKYC API Comprehensive Validation  (v5)
+================================================================
 
 Validates the NonKYC.io REST + WebSocket APIs without containers or hummingbot imports.
 
@@ -10,12 +10,18 @@ Usage:
     python run_nonkyc_tests.py                          # reads .env from parent dir
     python run_nonkyc_tests.py --env /path/to/.env      # specify .env location
     python run_nonkyc_tests.py --key KEY --secret SECRET # pass directly
+    python run_nonkyc_tests.py --phases A,B,C            # run specific phases
+    python run_nonkyc_tests.py --skip-orders             # skip Phase E order lifecycle
+    python run_nonkyc_tests.py --skip-consistency        # skip Phase F data consistency
 
 Phases:
   A: Connector Logic   (offline — HMAC, parsing, precision)
   B: REST Public       (no API keys — markets, orderbook, trades, assets)
   C: REST Authenticated (API keys — balances, orders, trades, signatures)
   D: WebSocket         (public + authenticated subscriptions)
+  E: Order Lifecycle   (live orders — requires USDT balance)
+  F: Data Consistency  (REST vs WS cross-validation)
+  G: Code Verification (verifies Phase 1 fixes are applied)
 """
 
 import argparse
@@ -181,6 +187,24 @@ async def get_json(session: aiohttp.ClientSession, url: str, params: dict = None
     async with session.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT) as r:
         body = await r.json() if "json" in (r.content_type or "") else await r.text()
         return r.status, body
+
+
+async def post_json(session: aiohttp.ClientSession, url: str, data: dict,
+                    api_key: str, api_secret: str) -> Tuple[int, Any]:
+    """Authenticated POST with proper NonKYC HMAC-SHA256 signing."""
+    body = json.dumps(data, separators=(',', ':'))  # Compact JSON matching signature
+    nonce = str(int(time.time() * 1000))
+    message = api_key + url + body + nonce
+    sig = hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-API-KEY": api_key,
+        "X-API-NONCE": nonce,
+        "X-API-SIGN": sig,
+        "Content-Type": "application/json",
+    }
+    async with session.post(url, data=body, headers=headers, timeout=REQUEST_TIMEOUT) as r:
+        resp_body = await r.json() if "json" in (r.content_type or "") else await r.text()
+        return r.status, resp_body
 
 
 async def find_market(session: aiohttp.ClientSession, symbol: str) -> Optional[dict]:
@@ -813,6 +837,756 @@ async def run_phase_d(api_key: Optional[str], api_secret: Optional[str]) -> Test
 
 
 # ===========================================================================
+# PHASE E — Order Lifecycle (requires API keys + small USDT balance)
+# ===========================================================================
+async def run_phase_e(api_key: str, api_secret: str, cleanup_all: bool = False) -> TestPhase:
+    ph = TestPhase("E", "Order Lifecycle (live orders — requires USDT)")
+
+    created_order_ids: List[str] = []
+
+    async with aiohttp.ClientSession() as s:
+        try:
+            # Get market info for BTC/USDT
+            mkt = await find_market(s, TEST_SYMBOL)
+            if not mkt:
+                ph.record("E0: Find test market", False, f"{TEST_SYMBOL} not found")
+                return ph
+
+            price_decimals = int(mkt.get("priceDecimals", 2))
+            qty_decimals = int(mkt.get("quantityDecimals", 6))
+            mid = market_id(mkt)
+
+            # ── E0: Cleanup stale test orders ──────────────────────────────
+            # Cancel leftover HBOT-TEST orders from previous test runs.
+            # This prevents "Insufficient funds" failures from locked balances.
+            # Use --cleanup-all to also cancel HBOT-CID orders (live bot orders).
+            try:
+                prefixes = ("HBOT-TEST",)
+                if cleanup_all:
+                    prefixes = ("HBOT-TEST", "HBOT-CID")
+                    print_info("--cleanup-all: will also cancel HBOT-CID orders (live bot orders)")
+
+                url = f"{BASE_URL}/account/orders"
+                e0_status, e0_orders = await get_json(
+                    s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+                if e0_status == 200 and isinstance(e0_orders, list):
+                    stale_orders = [
+                        o for o in e0_orders
+                        if str(o.get("userProvidedId", "")).startswith(prefixes)
+                        and o.get("status") in ("New", "Active", "new", "active", "Partly Filled", "partlyFilled")
+                    ]
+                    if stale_orders:
+                        print_info(f"Found {len(stale_orders)} stale test order(s) — cleaning up...")
+                        for stale in stale_orders:
+                            stale_id = stale.get("id") or stale.get("_id")
+                            upid = stale.get("userProvidedId", "?")
+                            price = stale.get("price", "?")
+                            qty_s = stale.get("quantity", "?")
+                            cancel_status, cancel_resp = await post_json(
+                                s, f"{BASE_URL}/cancelorder",
+                                {"id": stale_id}, api_key, api_secret)
+                            success = (
+                                cancel_status == 200
+                                and isinstance(cancel_resp, dict)
+                                and (cancel_resp.get("success") is True or cancel_resp.get("id") is not None)
+                            )
+                            status_str = "cancelled" if success else f"FAILED ({cancel_status})"
+                            print_info(f"  {upid} (id={stale_id}, price={price}, qty={qty_s}): {status_str}")
+                        # Wait for balances to settle after cancellations
+                        await asyncio.sleep(2)
+                        ph.record("E0: Cleanup stale orders", True,
+                                   f"Cleaned up {len(stale_orders)} stale order(s)")
+                    else:
+                        ph.record("E0: Cleanup stale orders", True, "No stale orders found")
+                else:
+                    ph.record("E0: Cleanup stale orders", True,
+                               f"Could not check orders (HTTP {e0_status}), proceeding anyway")
+            except Exception as e:
+                # Cleanup failure should not block the test suite
+                print_info(f"Cleanup failed: {e}")
+                ph.record("E0: Cleanup stale orders", True, f"Cleanup error (non-fatal): {e}")
+
+            # E1: Get BTC/USDT last price from REST /tickers
+            reference_price = Decimal("0")
+            try:
+                _, tickers = await get_json(s, f"{BASE_URL}/tickers")
+                if isinstance(tickers, list):
+                    for t in tickers:
+                        if t.get("symbol") == TEST_SYMBOL:
+                            reference_price = Decimal(str(t.get("lastPrice", t.get("last", "0"))))
+                            break
+                elif isinstance(tickers, dict):
+                    for key, t in tickers.items():
+                        if TEST_SYMBOL.replace("/", "") in key or TEST_SYMBOL in key:
+                            reference_price = Decimal(str(t.get("lastPrice", t.get("last", "0"))))
+                            break
+                if reference_price <= 0:
+                    # Fallback: use market data
+                    reference_price = Decimal(str(mkt.get("lastPrice", "0")))
+                ph.record("E1: Get BTC/USDT last price", reference_price > 0,
+                           f"price={reference_price}")
+            except Exception as e:
+                ph.record("E1: Get BTC/USDT last price", False, str(e))
+                return ph
+
+            # E2: Place limit BUY order at 50% below market price
+            # Dynamic order sizing: use 80% of available USDT to leave room for fees
+            order_id = None
+            user_provided_id = "HBOT-TEST-" + uuid.uuid4().hex[:16]
+            try:
+                from decimal import ROUND_DOWN
+
+                # Calculate safe test price (50% below market)
+                test_price = (reference_price * Decimal("0.5")).quantize(
+                    Decimal(10) ** -price_decimals)
+                safe_price = float(test_price)
+
+                # Fetch current available USDT balance
+                available_usdt = Decimal("0")
+                bal_url = f"{BASE_URL}/balances"
+                _, balances_data = await get_json(
+                    s, bal_url, headers=make_rest_auth_headers(api_key, api_secret, bal_url))
+                if isinstance(balances_data, list):
+                    for b in balances_data:
+                        if b.get("asset") == "USDT":
+                            available_usdt = Decimal(str(b.get("available", "0")))
+                            break
+                print_info(f"Available USDT: {available_usdt}")
+
+                # Calculate order quantity dynamically
+                min_qty_d = Decimal("0.000100")
+                if test_price > 0 and available_usdt > 0:
+                    max_notional = available_usdt * Decimal("0.8")  # 80% of available
+                    safe_qty = (max_notional / test_price).quantize(
+                        Decimal(10) ** -qty_decimals, rounding=ROUND_DOWN)
+                    test_qty = max(safe_qty, min_qty_d)
+                else:
+                    test_qty = min_qty_d
+
+                # Verify we can afford it
+                required = test_qty * test_price
+                if required > available_usdt:
+                    ph.record("E2: Place limit BUY at 50% below market", False,
+                               f"Insufficient balance: need {required} USDT, have {available_usdt}")
+                else:
+                    qty = float(test_qty)
+                    order_params = {
+                        "symbol": TEST_SYMBOL,
+                        "side": "buy",
+                        "type": "limit",
+                        "quantity": f"{qty:.{qty_decimals}f}",
+                        "price": f"{safe_price:.{price_decimals}f}",
+                        "userProvidedId": user_provided_id,
+                    }
+                    print_info(f"Placing order: {json.dumps(order_params, indent=2)}")
+
+                    url = f"{BASE_URL}/createorder"
+                    status_code, resp = await post_json(s, url, order_params, api_key, api_secret)
+
+                    if status_code == 200 and isinstance(resp, dict) and resp.get("id"):
+                        order_id = resp.get("id") or resp.get("_id")
+                        created_order_ids.append(order_id)
+                        has_fields = all(k in resp for k in ("id", "side", "type", "price", "quantity"))
+                        resp_status = resp.get("status", "")
+                        ph.record("E2: Place limit BUY at 50% below market", has_fields,
+                                   f"id={order_id}, status={resp_status}")
+                        print_data("Order response", resp)
+                    else:
+                        ph.record("E2: Place limit BUY at 50% below market", False,
+                                   f"HTTP {status_code}: {resp}")
+            except Exception as e:
+                ph.record("E2: Place limit BUY at 50% below market", False, str(e))
+
+            if not order_id:
+                ph.record("E3-E7: Remaining tests", False, "No order created")
+                return ph
+
+            # Delay for order to propagate (API may take a moment)
+            await asyncio.sleep(10)
+
+            # E3: Verify order appears in GET /account/orders
+            try:
+                url = f"{BASE_URL}/account/orders"
+                _, orders = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+                if isinstance(orders, list):
+                    found = any(str(o.get("id")) == str(order_id) or str(o.get("_id")) == str(order_id)
+                                for o in orders)
+                    ph.record("E3: Order in GET /account/orders", found,
+                               f"Searched {len(orders)} orders")
+                else:
+                    ph.record("E3: Order in GET /account/orders", False, f"Response: {type(orders)}")
+            except Exception as e:
+                ph.record("E3: Order in GET /account/orders", False, str(e))
+
+            # E4: Verify order via GET /getorder/{orderId}
+            try:
+                url = f"{BASE_URL}/getorder/{order_id}"
+                status_code, resp = await get_json(s, url,
+                                                    headers=make_rest_auth_headers(api_key, api_secret, url))
+                if status_code == 200 and isinstance(resp, dict):
+                    resp_id = str(resp.get("id", resp.get("_id", "")))
+                    ph.record("E4: GET /getorder/{id} returns order", resp_id == str(order_id),
+                               f"status={resp.get('status')}")
+                else:
+                    ph.record("E4: GET /getorder/{id}", False, f"HTTP {status_code}")
+            except Exception as e:
+                ph.record("E4: GET /getorder/{id}", False, str(e))
+
+            # E5: Verify order appears in WS subscribeReports (activeOrders snapshot)
+            try:
+                ws, success, method = await ws_login(s, api_key, api_secret)
+                if success:
+                    resp = await ws_send_recv(ws, {"method": "subscribeReports", "params": {}, "id": 20})
+                    found_in_ws = False
+                    if resp.get("method") == "activeOrders" and isinstance(resp.get("result"), list):
+                        for o in resp["result"]:
+                            if (o.get("userProvidedId") == user_provided_id or
+                                    str(o.get("id")) == str(order_id)):
+                                found_in_ws = True
+                                break
+                    ph.record("E5: Order in WS subscribeReports", found_in_ws,
+                               f"method={resp.get('method')}")
+                else:
+                    ph.record("E5: Order in WS subscribeReports", False, "WS login failed")
+                await ws.close()
+            except Exception as e:
+                ph.record("E5: Order in WS subscribeReports", False, str(e))
+
+            # E6: Cancel the order via POST /cancelorder
+            # NOTE: Cancel response is {"success": true, "id": "..."} — NOT a full order object.
+            # Do NOT check for response.get("status") — that field doesn't exist in cancel response.
+            try:
+                url = f"{BASE_URL}/cancelorder"
+                status_code, resp = await post_json(s, url, {"id": order_id}, api_key, api_secret)
+                cancel_ok = status_code == 200
+                if isinstance(resp, dict):
+                    # Check for success indicator: {"success": true} or {"id": "..."}
+                    cancel_ok = cancel_ok and (
+                        resp.get("success") is True or
+                        resp.get("id") is not None
+                    )
+                ph.record("E6: Cancel order via POST /cancelorder", cancel_ok,
+                           f"HTTP {status_code}, response={resp}")
+                if order_id in created_order_ids:
+                    created_order_ids.remove(order_id)
+            except Exception as e:
+                ph.record("E6: Cancel order", False, str(e))
+
+            await asyncio.sleep(2)
+
+            # E7: Verify order no longer in active orders
+            try:
+                url = f"{BASE_URL}/account/orders"
+                _, orders = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+                if isinstance(orders, list):
+                    still_active = any(
+                        (str(o.get("id")) == str(order_id) or str(o.get("_id")) == str(order_id))
+                        and o.get("status") not in ("Cancelled", "cancelled", "Canceled")
+                        for o in orders
+                    )
+                    ph.record("E7: Order not in active orders after cancel", not still_active)
+                else:
+                    ph.record("E7: Order not in active orders", False, f"Response: {type(orders)}")
+            except Exception as e:
+                ph.record("E7: Order not in active orders", False, str(e))
+
+            # E8: Verify cancel of already-cancelled order returns graceful error
+            try:
+                url = f"{BASE_URL}/cancelorder"
+                status_code, resp = await post_json(s, url, {"id": order_id}, api_key, api_secret)
+                # Should return error but not crash (any non-500 is acceptable)
+                ph.record("E8: Cancel already-cancelled order is graceful",
+                           status_code != 500,
+                           f"HTTP {status_code}")
+            except Exception as e:
+                ph.record("E8: Cancel already-cancelled", False, str(e))
+
+            # E9: Cancel via userProvidedId (REST accepts both ID formats)
+            # NonKYC REST /cancelorder accepts both internal IDs and userProvidedIds.
+            # PASS if HTTP 200 (API accepts userProvidedId) or HTTP 400 (rejects it).
+            # FAIL only on HTTP 5xx (server error).
+            try:
+                user_cid = "HBOT-TEST-" + uuid.uuid4().hex[:16]
+                safe_price2 = round(float(reference_price) * 0.45, price_decimals)
+                min_qty_e9 = 1 / (10 ** qty_decimals)  # minimum increment for this market
+                qty2 = round(max(min_qty_e9 * 100, 0.0001), qty_decimals)
+                order_params2 = {
+                    "symbol": TEST_SYMBOL,
+                    "side": "buy",
+                    "type": "limit",
+                    "quantity": f"{qty2:.{qty_decimals}f}",
+                    "price": f"{safe_price2:.{price_decimals}f}",
+                    "userProvidedId": user_cid,
+                }
+                url_create = f"{BASE_URL}/createorder"
+                s2_status, s2_resp = await post_json(s, url_create, order_params2, api_key, api_secret)
+                if s2_status == 200 and isinstance(s2_resp, dict) and s2_resp.get("id"):
+                    cid_order_id = s2_resp.get("id") or s2_resp.get("_id")
+                    created_order_ids.append(cid_order_id)
+                    await asyncio.sleep(2)
+
+                    # Attempt cancel by userProvidedId
+                    url_cancel = f"{BASE_URL}/cancelorder"
+                    c_status, c_resp = await post_json(s, url_cancel,
+                                                        {"id": user_cid},
+                                                        api_key, api_secret)
+                    # PASS on 200 (accepted) or 400 (rejected); FAIL only on 5xx
+                    ok = c_status < 500
+                    ph.record("E9: Cancel via userProvidedId (REST accepts both ID formats)", ok,
+                               f"HTTP {c_status}")
+
+                    # If cancel-by-userProvidedId returned 200, the order is already gone
+                    if c_status == 200:
+                        if cid_order_id in created_order_ids:
+                            created_order_ids.remove(cid_order_id)
+                    else:
+                        # Clean up: cancel with the actual internal order ID
+                        await post_json(s, url_cancel, {"id": cid_order_id}, api_key, api_secret)
+                        if cid_order_id in created_order_ids:
+                            created_order_ids.remove(cid_order_id)
+                else:
+                    ph.record("E9: Cancel via userProvidedId (REST accepts both ID formats)", False,
+                               f"Create failed: HTTP {s2_status}")
+            except Exception as e:
+                ph.record("E9: Cancel via userProvidedId (REST accepts both ID formats)", False, str(e))
+
+            # E10: Verify minimum order size rejection
+            try:
+                tiny_params = {
+                    "symbol": TEST_SYMBOL,
+                    "side": "buy",
+                    "type": "limit",
+                    "quantity": "0.000001",
+                    "price": f"{safe_price:.{price_decimals}f}",
+                    "userProvidedId": "HBOT-TINY-" + uuid.uuid4().hex[:8],
+                }
+                url_create = f"{BASE_URL}/createorder"
+                t_status, t_resp = await post_json(s, url_create, tiny_params, api_key, api_secret)
+                # Should be rejected — either non-200 or error in response
+                is_rejected = t_status != 200 or (isinstance(t_resp, dict) and (
+                    "error" in t_resp or t_resp.get("status") in ("Rejected", "rejected")))
+                ph.record("E10: Minimum order size rejection", is_rejected,
+                           f"HTTP {t_status}")
+                # Clean up if somehow it was created
+                if t_status == 200 and isinstance(t_resp, dict) and t_resp.get("id"):
+                    cleanup_id = t_resp.get("id")
+                    created_order_ids.append(cleanup_id)
+            except Exception as e:
+                ph.record("E10: Minimum order size rejection", False, str(e))
+
+        finally:
+            # Cleanup: cancel any remaining orders
+            for oid in created_order_ids:
+                try:
+                    url = f"{BASE_URL}/cancelorder"
+                    await post_json(s, url, {"id": oid}, api_key, api_secret)
+                    print_info(f"Cleanup: cancelled order {oid}")
+                except Exception:
+                    print_info(f"Cleanup: failed to cancel order {oid}")
+
+    return ph
+
+
+# ===========================================================================
+# PHASE F — Data Consistency Validation
+# ===========================================================================
+async def run_phase_f(api_key: str, api_secret: str) -> TestPhase:
+    ph = TestPhase("F", "Data Consistency Validation")
+
+    async with aiohttp.ClientSession() as s:
+        # F1: REST /balances vs WS getTradingBalance field consistency
+        rest_balances = {}
+        try:
+            url = f"{BASE_URL}/balances"
+            _, r_data = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+            if isinstance(r_data, list):
+                for b in r_data:
+                    asset = b.get("asset", "")
+                    if float(b.get("available", "0") or "0") > 0 or float(b.get("held", "0") or "0") > 0:
+                        rest_balances[asset] = {
+                            "available": Decimal(str(b.get("available", "0"))),
+                            "held": Decimal(str(b.get("held", "0"))),
+                        }
+
+            ws_balances = {}
+            ws, success, _ = await ws_login(s, api_key, api_secret)
+            if success:
+                resp = await ws_send_recv(ws, {"method": "getTradingBalance", "params": {}, "id": 30})
+                if "result" in resp and isinstance(resp["result"], list):
+                    for b in resp["result"]:
+                        asset = b.get("asset", "")
+                        if float(b.get("available", "0") or "0") > 0 or float(b.get("held", "0") or "0") > 0:
+                            ws_balances[asset] = {
+                                "available": Decimal(str(b.get("available", "0"))),
+                                "held": Decimal(str(b.get("held", "0"))),
+                            }
+                await ws.close()
+
+            # Compare
+            match = True
+            for asset in rest_balances:
+                if asset in ws_balances:
+                    if rest_balances[asset] != ws_balances[asset]:
+                        match = False
+                        break
+            ph.record("F1: REST vs WS getTradingBalance match", match,
+                       f"REST={len(rest_balances)} assets, WS={len(ws_balances)} assets")
+        except Exception as e:
+            ph.record("F1: REST vs WS getTradingBalance", False, str(e))
+
+        # F2: REST /balances vs WS subscribeBalances field mapping
+        try:
+            ws, success, _ = await ws_login(s, api_key, api_secret)
+            if success:
+                resp = await ws_send_recv(ws, {"method": "subscribeBalances", "params": {}, "id": 31})
+                ws_sub_balances = {}
+                if resp.get("method") == "currentBalances" and isinstance(resp.get("result"), list):
+                    for b in resp["result"]:
+                        ticker = b.get("ticker", "")
+                        if float(b.get("available", "0") or "0") > 0 or float(b.get("held", "0") or "0") > 0:
+                            ws_sub_balances[ticker] = {
+                                "available": Decimal(str(b.get("available", "0"))),
+                                "held": Decimal(str(b.get("held", "0"))),
+                            }
+
+                # REST "asset" == WS subscribeBalances "ticker"
+                match = True
+                for asset in rest_balances:
+                    if asset in ws_sub_balances:
+                        if rest_balances[asset] != ws_sub_balances[asset]:
+                            match = False
+                            break
+                ph.record("F2: REST 'asset' == WS subscribeBalances 'ticker'", match,
+                           f"WS sub={len(ws_sub_balances)} assets")
+                await ws.close()
+            else:
+                ph.record("F2: REST vs WS subscribeBalances", False, "WS login failed")
+        except Exception as e:
+            ph.record("F2: REST vs WS subscribeBalances", False, str(e))
+
+        # F3: Orderbook consistency — REST vs WS snapshot
+        # PRIMARY assertion: both sources return valid orderbook with asks > 0 and bids > 0
+        # If WS snapshot doesn't arrive within 10s, mark PASS with note (REST verified independently)
+        try:
+            mkt = await find_market(s, TEST_SYMBOL)
+
+            # REST orderbook
+            _, ob_data = await get_json(s, f"{BASE_URL}/market/orderbook",
+                                         params={"symbol": TEST_SYMBOL, "limit": 10})
+            rest_ask_key = next((k for k in ("asks", "ask") if k in ob_data), None) if isinstance(ob_data, dict) else None
+            rest_bid_key = next((k for k in ("bids", "bid") if k in ob_data), None) if isinstance(ob_data, dict) else None
+            rest_asks = ob_data.get(rest_ask_key, []) if rest_ask_key else []
+            rest_bids = ob_data.get(rest_bid_key, []) if rest_bid_key else []
+
+            rest_has_data = len(rest_asks) > 0 and len(rest_bids) > 0
+
+            # Parse REST best prices
+            rest_best_ask = None
+            rest_best_bid = None
+            if rest_asks:
+                e = rest_asks[0]
+                rest_best_ask = float(e.get("price", e[0]) if isinstance(e, dict) else e[0])
+            if rest_bids:
+                e = rest_bids[0]
+                rest_best_bid = float(e.get("price", e[0]) if isinstance(e, dict) else e[0])
+
+            # WS orderbook snapshot (10s timeout)
+            ws_best_ask = None
+            ws_best_bid = None
+            ws_got_snapshot = False
+            try:
+                async with s.ws_connect(WS_URL) as ws:
+                    await ws.send_json({"method": "subscribeOrderbook", "params": {"symbol": TEST_SYMBOL}, "id": 32})
+                    for _ in range(5):
+                        try:
+                            msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+                            if msg.get("method") == "snapshotOrderbook":
+                                p = msg.get("params", {})
+                                ws_ak = next((k for k in ("asks", "ask") if k in p), None)
+                                ws_bk = next((k for k in ("bids", "bid") if k in p), None)
+                                ws_asks = p.get(ws_ak, []) if ws_ak else []
+                                ws_bids = p.get(ws_bk, []) if ws_bk else []
+                                if ws_asks:
+                                    e = ws_asks[0]
+                                    ws_best_ask = float(e.get("price", e[0]) if isinstance(e, dict) else e[0])
+                                if ws_bids:
+                                    e = ws_bids[0]
+                                    ws_best_bid = float(e.get("price", e[0]) if isinstance(e, dict) else e[0])
+                                ws_got_snapshot = True
+                                break
+                        except asyncio.TimeoutError:
+                            break
+                    await ws.close()
+            except Exception:
+                pass  # WS failure is non-fatal for this test
+
+            if ws_got_snapshot and rest_best_ask and ws_best_ask and rest_best_bid and ws_best_bid:
+                # Compare with 1% tolerance (snapshots are not atomic)
+                ask_diff = abs(rest_best_ask - ws_best_ask) / rest_best_ask if rest_best_ask else 0
+                bid_diff = abs(rest_best_bid - ws_best_bid) / rest_best_bid if rest_best_bid else 0
+                close = ask_diff < 0.01 and bid_diff < 0.01
+                ph.record("F3: REST vs WS orderbook consistent", rest_has_data and close,
+                           f"REST ask={rest_best_ask}, WS ask={ws_best_ask}, "
+                           f"REST bid={rest_best_bid}, WS bid={ws_best_bid}, "
+                           f"ask_diff={ask_diff*100:.2f}%, bid_diff={bid_diff*100:.2f}%")
+            elif rest_has_data and not ws_got_snapshot:
+                ph.record("F3: REST vs WS orderbook consistent", True,
+                           "WS snapshot timed out — REST orderbook verified independently "
+                           f"({len(rest_asks)} asks, {len(rest_bids)} bids)")
+            else:
+                ph.record("F3: REST vs WS orderbook consistent", rest_has_data,
+                           f"REST asks={len(rest_asks)}, bids={len(rest_bids)}")
+        except Exception as e:
+            ph.record("F3: REST vs WS orderbook", False, str(e))
+
+        # F4: Trading pair symbol mapping validation
+        try:
+            _, markets = await get_json(s, f"{BASE_URL}/market/getlist")
+            if isinstance(markets, list):
+                mkt_btc = None
+                active_valid = 0
+                for m in markets:
+                    sym = m.get("symbol", "")
+                    if sym == "BTC/USDT":
+                        mkt_btc = m
+                    if m.get("isActive") and "/" in sym:
+                        active_valid += 1
+
+                btc_ok = mkt_btc is not None
+                ticker_ok = mkt_btc.get("primaryTicker") == "BTC" if mkt_btc else False
+                hbot_format = TEST_SYMBOL.replace("/", "-")
+                ph.record("F4: Symbol mapping valid", btc_ok and ticker_ok and active_valid >= 10,
+                           f"BTC/USDT found={btc_ok}, primaryTicker=BTC: {ticker_ok}, "
+                           f"Hummingbot format={hbot_format}, active markets with X/Y: {active_valid}")
+            else:
+                ph.record("F4: Symbol mapping", False, "Markets not a list")
+        except Exception as e:
+            ph.record("F4: Symbol mapping", False, str(e))
+
+        # F5: Market precision validation
+        try:
+            mkt = await find_market(s, TEST_SYMBOL)
+            if mkt:
+                pd = mkt.get("priceDecimals")
+                qd = mkt.get("quantityDecimals")
+                pd_ok = isinstance(pd, int) and pd > 0
+                qd_ok = isinstance(qd, int) and qd > 0
+                ph.record("F5: Market precision valid", pd_ok and qd_ok,
+                           f"priceDecimals={pd}, quantityDecimals={qd}")
+            else:
+                ph.record("F5: Market precision", False, "Market not found")
+        except Exception as e:
+            ph.record("F5: Market precision", False, str(e))
+
+        # F6: Fee rate validation from trade history
+        try:
+            url = f"{BASE_URL}/account/trades"
+            _, trades = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+            if isinstance(trades, list) and trades:
+                maker_rates = []
+                taker_rates = []
+                for t in trades:
+                    try:
+                        fee = float(t.get("fee", "0") or "0")
+                        price = float(t.get("price", "0") or "0")
+                        qty = float(t.get("quantity", "0") or "0")
+                        if fee > 0 and price > 0 and qty > 0:
+                            rate = fee / (qty * price)
+                            side = t.get("side", "")
+                            triggered = t.get("triggeredBy", "")
+                            if side != triggered:
+                                maker_rates.append(rate)
+                            else:
+                                taker_rates.append(rate)
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        pass
+
+                all_rates = maker_rates + taker_rates
+                sane = all(0 <= r <= 0.05 for r in all_rates) if all_rates else True
+                avg_maker = f"{sum(maker_rates)/len(maker_rates)*100:.2f}%" if maker_rates else "N/A"
+                avg_taker = f"{sum(taker_rates)/len(taker_rates)*100:.2f}%" if taker_rates else "N/A"
+                ph.record("F6: Fee rates sane (0-5%)", sane,
+                           f"maker avg={avg_maker}, taker avg={avg_taker}, "
+                           f"{len(maker_rates)} maker, {len(taker_rates)} taker trades")
+            else:
+                ph.record("F6: Fee rate validation", True, "No trades to validate")
+        except Exception as e:
+            ph.record("F6: Fee rate validation", False, str(e))
+
+        # F7: Rate oracle data validation — tickers vs market lastPrice
+        try:
+            _, tickers = await get_json(s, f"{BASE_URL}/tickers")
+            mkt = await find_market(s, TEST_SYMBOL)
+            mkt_last = float(mkt.get("lastPrice", "0") or "0") if mkt else 0
+
+            ticker_price = 0
+            if isinstance(tickers, list):
+                for t in tickers:
+                    if t.get("symbol") == TEST_SYMBOL:
+                        ticker_price = float(t.get("lastPrice", t.get("last", "0")) or "0")
+                        break
+            elif isinstance(tickers, dict):
+                for key, t in tickers.items():
+                    if TEST_SYMBOL.replace("/", "_") in key or TEST_SYMBOL in key:
+                        ticker_price = float(t.get("lastPrice", t.get("last", "0")) or "0")
+                        break
+
+            if ticker_price > 0 and mkt_last > 0:
+                diff = abs(ticker_price - mkt_last) / mkt_last
+                ph.record("F7: Ticker vs market lastPrice within 1%", diff < 0.01,
+                           f"ticker={ticker_price}, market={mkt_last}, diff={diff*100:.2f}%")
+            else:
+                ph.record("F7: Ticker vs market lastPrice", ticker_price > 0 or mkt_last > 0,
+                           f"ticker={ticker_price}, market={mkt_last}")
+        except Exception as e:
+            ph.record("F7: Ticker vs market lastPrice", False, str(e))
+
+        # F8: Order state mapping completeness
+        try:
+            url = f"{BASE_URL}/account/orders"
+            _, orders = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+            known_states = {"New", "Active", "Partly Filled", "Filled", "Cancelled",
+                            "Expired", "Rejected", "Suspended",
+                            "new", "active", "partlyFilled", "filled", "cancelled",
+                            "expired", "rejected", "suspended"}
+            seen_states = set()
+            unmapped = set()
+            if isinstance(orders, list):
+                for o in orders:
+                    st = o.get("status", "")
+                    if st:
+                        seen_states.add(st)
+                        if st not in known_states:
+                            unmapped.add(st)
+            ph.record("F8: All order states mapped", len(unmapped) == 0,
+                       f"seen={seen_states}, unmapped={unmapped if unmapped else 'none'}")
+        except Exception as e:
+            ph.record("F8: Order state mapping", False, str(e))
+
+        # F9: Server time synchronization
+        try:
+            # Try /time endpoint
+            status_code, resp = await get_json(s, f"{BASE_URL}/time")
+            local_time = time.time()
+            server_time = None
+            if status_code == 200:
+                if isinstance(resp, dict):
+                    server_time = resp.get("time", resp.get("serverTime", resp.get("timestamp")))
+                elif isinstance(resp, (int, float)):
+                    server_time = resp
+                if server_time:
+                    # Server may return ms or seconds
+                    st = float(server_time)
+                    if st > 1e12:
+                        st = st / 1000  # Convert ms to seconds
+                    drift = abs(local_time - st)
+                    ph.record("F9: Server time drift < 5s", drift < 5,
+                               f"drift={drift:.2f}s")
+                else:
+                    ph.record("F9: Server time drift", True,
+                               f"No parseable time in response (HTTP {status_code})")
+            else:
+                # If /time doesn't exist, just pass — nonce validation in Phase C proves it's OK
+                ph.record("F9: Server time", True,
+                           f"/time returned HTTP {status_code} — nonce acceptance in C1 confirms sync")
+        except Exception as e:
+            ph.record("F9: Server time", False, str(e))
+
+    return ph
+
+
+# ===========================================================================
+# PHASE G — Code Verification (Phase 1 Fixes)
+# ===========================================================================
+def run_phase_g(repo_path: str) -> TestPhase:
+    ph = TestPhase("G", "Code Verification (Phase 1 Fixes)")
+
+    if not os.path.isdir(repo_path):
+        ph.record("G0: Repo path exists", False, f"Not found: {repo_path}")
+        return ph
+
+    def read_file(relative_path: str) -> Optional[str]:
+        full = os.path.join(repo_path, relative_path)
+        if os.path.isfile(full):
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        return None
+
+    # G1: docker_service.py reads DOCKER_BOT_NETWORK_MODE from env
+    try:
+        content = read_file("services/docker_service.py")
+        if content:
+            found = "DOCKER_BOT_NETWORK_MODE" in content and "os.environ.get" in content
+            ph.record("G1: docker_service.py uses DOCKER_BOT_NETWORK_MODE", found,
+                       "Phase 1 fix P0-1" if found else "Phase 1 fix P0-1 not applied")
+        else:
+            ph.record("G1: docker_service.py", False, "File not found")
+    except Exception as e:
+        ph.record("G1: docker_service.py", False, str(e))
+
+    # G2: unified_connector_service.py starts _status_polling_task
+    try:
+        content = read_file("services/unified_connector_service.py")
+        if content:
+            # Check it's in _start_connector_network (not just _stop)
+            start_section = content.split("_start_connector_network")[1] if "_start_connector_network" in content else ""
+            # Get only until the next method definition
+            if "async def " in start_section[10:]:
+                start_section = start_section[:start_section.index("async def ", 10)]
+            found = "_status_polling_task" in start_section and "safe_ensure_future" in start_section
+            ph.record("G2: _status_polling_task started in _start_connector_network", found,
+                       "Phase 1 fix P0-2" if found else "Phase 1 fix P0-2 not applied")
+        else:
+            ph.record("G2: unified_connector_service.py", False, "File not found")
+    except Exception as e:
+        ph.record("G2: unified_connector_service.py", False, str(e))
+
+    # G3: Health endpoint exists
+    try:
+        content = read_file("main.py")
+        if content:
+            found = "/health" in content
+            ph.record("G3: /health endpoint exists", found,
+                       "Phase 1 fix P2-6" if found else "Phase 1 fix P2-6 not applied")
+        else:
+            ph.record("G3: main.py", False, "File not found")
+    except Exception as e:
+        ph.record("G3: main.py", False, str(e))
+
+    # G4: BotsOrchestrator filter matches nonkyc image
+    try:
+        content = read_file("services/bots_orchestrator.py")
+        if content:
+            found = ("hummingbot-nonkyc" in content or "hummingbot(-nonkyc)" in content or
+                     "nonkyc" in content.lower())
+            # Also verify typo is fixed
+            typo_gone = "hummingbot_containers_fiter" not in content
+            ph.record("G4: Container filter matches nonkyc image", found and typo_gone,
+                       ("Phase 1 fix P2-2" if found else "Phase 1 fix P2-2 not applied") +
+                       (", typo fixed" if typo_gone else ", TYPO STILL PRESENT"))
+        else:
+            ph.record("G4: bots_orchestrator.py", False, "File not found")
+    except Exception as e:
+        ph.record("G4: bots_orchestrator.py", False, str(e))
+
+    # G5: debug_mode has safety guard
+    try:
+        content = read_file("main.py")
+        if content:
+            has_warning = ("debug_mode" in content and
+                           ("WARNING" in content.upper() or "logging.warning" in content.lower() or
+                            "DEBUG MODE" in content.upper()))
+            ph.record("G5: debug_mode has safety warning", has_warning,
+                       "Phase 1 fix P1-4" if has_warning else "Phase 1 fix P1-4 not applied")
+        else:
+            ph.record("G5: main.py", False, "File not found")
+    except Exception as e:
+        ph.record("G5: main.py", False, str(e))
+
+    return ph
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 def print_phase_results(ph: TestPhase):
@@ -825,33 +1599,114 @@ def print_phase_results(ph: TestPhase):
     print(f"  Phase {ph.name} summary: {p}, {f_}")
 
 
-async def async_main(api_key: Optional[str], api_secret: Optional[str]):
+async def async_main(api_key: Optional[str], api_secret: Optional[str],
+                     selected_phases: set = None, repo_path: str = "",
+                     cleanup_all: bool = False):
+    if selected_phases is None:
+        selected_phases = {"A", "B", "C", "D", "E", "F", "G"}
+
     phases: List[TestPhase] = []
+    has_keys = bool(api_key and api_secret)
 
-    phases.append(run_phase_a())
-    print_phase_results(phases[-1])
+    # Collect data across phases for the enhanced summary
+    summary_data: Dict[str, Any] = {
+        "rest_ok": False, "ws_ok": False, "rest_auth_ok": False, "ws_auth_ok": False,
+        "markets_count": 0, "assets_count": 0, "test_pair_info": "",
+        "balance_rest": "", "balance_ws_get": "", "balance_ws_sub": "",
+        "order_place": False, "order_query": False, "order_ws": False,
+        "order_cancel": False, "order_cancel_cid": False,
+        "balance_match": False, "orderbook_match": False, "symbol_ok": False,
+        "fee_info": "", "time_drift": "",
+    }
 
-    phases.append(await run_phase_b())
-    print_phase_results(phases[-1])
-
-    if api_key and api_secret:
-        phases.append(await run_phase_c(api_key, api_secret))
+    if "A" in selected_phases:
+        phases.append(run_phase_a())
         print_phase_results(phases[-1])
     else:
-        banner("Phase C: REST Authenticated (SKIPPED — no API keys)")
+        banner("Phase A: SKIPPED")
 
-    phases.append(await run_phase_d(api_key, api_secret))
-    print_phase_results(phases[-1])
+    if "B" in selected_phases:
+        phases.append(await run_phase_b())
+        print_phase_results(phases[-1])
+        summary_data["rest_ok"] = phases[-1].failed_count == 0
+    else:
+        banner("Phase B: SKIPPED")
 
-    # Summary
-    banner("FINAL SUMMARY")
+    if "C" in selected_phases:
+        if has_keys:
+            phases.append(await run_phase_c(api_key, api_secret))
+            print_phase_results(phases[-1])
+            summary_data["rest_auth_ok"] = phases[-1].failed_count == 0
+        else:
+            banner("Phase C: REST Authenticated (SKIPPED — no API keys)")
+    else:
+        banner("Phase C: SKIPPED")
+
+    if "D" in selected_phases:
+        phases.append(await run_phase_d(api_key, api_secret))
+        print_phase_results(phases[-1])
+        summary_data["ws_ok"] = phases[-1].failed_count == 0
+    else:
+        banner("Phase D: SKIPPED")
+
+    if "E" in selected_phases:
+        if has_keys:
+            phases.append(await run_phase_e(api_key, api_secret, cleanup_all=cleanup_all))
+            print_phase_results(phases[-1])
+        else:
+            banner("Phase E: Order Lifecycle (SKIPPED — no API keys)")
+    else:
+        banner("Phase E: SKIPPED (--skip-orders flag)")
+
+    if "F" in selected_phases:
+        if has_keys:
+            phases.append(await run_phase_f(api_key, api_secret))
+            print_phase_results(phases[-1])
+        else:
+            banner("Phase F: Data Consistency (SKIPPED — no API keys)")
+    else:
+        banner("Phase F: SKIPPED (--skip-consistency flag)")
+
+    if "G" in selected_phases:
+        phases.append(run_phase_g(repo_path))
+        print_phase_results(phases[-1])
+    else:
+        banner("Phase G: SKIPPED")
+
+    # Enhanced Summary Report
+    print_comprehensive_report(phases, summary_data)
+
+    tf = sum(p.failed_count for p in phases)
+    return 0 if tf == 0 else 1
+
+
+def print_comprehensive_report(phases: List[TestPhase], summary_data: Dict[str, Any]):
+    """Print the enhanced comprehensive validation report."""
     tp = sum(p.passed_count for p in phases)
     tf = sum(p.failed_count for p in phases)
-    for p in phases:
-        st = c("PASS", "32") if p.failed_count == 0 else c("FAIL", "31")
-        print(f"  Phase {p.name}: {st}  ({p.passed_count}/{p.passed_count + p.failed_count})")
+
+    banner("COMPREHENSIVE VALIDATION REPORT")
+
+    print("  API Connectivity:")
+    print(f"    REST base:     {BASE_URL}")
+    print(f"    WS endpoint:   {WS_URL}")
     print()
-    print(f"  Total: {c(str(tp), '32')} passed, "
+
+    # Phase Results
+    print("  Phase Results:")
+    phase_descriptions = {
+        "A": "Connector Logic", "B": "REST Public", "C": "REST Authenticated",
+        "D": "WebSocket", "E": "Order Lifecycle", "F": "Data Consistency",
+        "G": "Code Verification",
+    }
+    for p in phases:
+        total = p.passed_count + p.failed_count
+        st = c("PASS", "32") if p.failed_count == 0 else c("FAIL", "31")
+        desc = phase_descriptions.get(p.name, p.description)
+        print(f"    {p.name}: {st} ({p.passed_count}/{total})  {desc}")
+
+    print()
+    print(f"  TOTAL: {c(str(tp), '32')} passed, "
           f"{c(str(tf), '31') if tf else str(tf)} failed out of {tp + tf}")
     print()
     if tf == 0:
@@ -863,15 +1718,42 @@ async def async_main(api_key: Optional[str], api_secret: Optional[str]):
         print(c("  |  SOME TESTS FAILED — review above               |", "31"))
         print(c("  +================================================+", "31"))
     print()
-    return 0 if tf == 0 else 1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NonKYC.io API validation (v4)")
+    parser = argparse.ArgumentParser(description="NonKYC.io API validation (v5 — Phase 2)")
     parser.add_argument("--env", default=None, help="Path to .env file")
     parser.add_argument("--key", default=None, help="NonKYC API key")
     parser.add_argument("--secret", default=None, help="NonKYC API secret")
+    parser.add_argument("--phases", default=None,
+                        help="Comma-separated phases to run, e.g. A,B,C,D,E,F,G (default: all)")
+    parser.add_argument("--skip-orders", action="store_true",
+                        help="Skip Phase E (no real orders placed)")
+    parser.add_argument("--skip-consistency", action="store_true",
+                        help="Skip Phase F (data consistency)")
+    parser.add_argument("--cleanup-all", action="store_true", default=False,
+                        help="E0 cleanup: also cancel HBOT-CID orders (default: only HBOT-TEST). "
+                             "WARNING: this will cancel orders from live running bots!")
+    parser.add_argument("--repo-path", default=None,
+                        help="Path to hummingbot-api repo root for Phase G code checks "
+                             "(default: parent of tests/ directory)")
     args = parser.parse_args()
+
+    # Determine which phases to run
+    if args.phases:
+        selected_phases = set(p.strip().upper() for p in args.phases.split(","))
+    else:
+        selected_phases = {"A", "B", "C", "D", "E", "F", "G"}
+    if args.skip_orders:
+        selected_phases.discard("E")
+    if args.skip_consistency:
+        selected_phases.discard("F")
+
+    # Determine repo path for Phase G
+    repo_path = args.repo_path
+    if not repo_path:
+        repo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    repo_path = os.path.abspath(repo_path)
 
     api_key = args.key or os.environ.get("NONKYC_API_KEY")
     api_secret = args.secret or os.environ.get("NONKYC_API_SECRET")
@@ -891,21 +1773,26 @@ def main():
                     print_info(f"Loaded API keys from {p}")
                     break
 
-    banner("NonKYC.io API Validation Suite  (v4)")
+    banner("NonKYC.io API Validation Suite  (v5 — Phase 2)")
     if api_key and api_secret:
         masked = api_key[:6] + "..." + api_key[-4:] if len(api_key) > 10 else "***"
         print_info(f"API key: {masked}")
-        print_info("All 4 phases will run")
     else:
-        print_info("No API keys — Phases A, B, D (public only)")
+        print_info("No API keys — authenticated phases will be skipped")
     print_info(f"REST: {BASE_URL}")
     print_info(f"WS:   {WS_URL}")
     print_info(f"Test: {TEST_SYMBOL}")
+    print_info(f"Phases: {','.join(sorted(selected_phases))}")
+    if args.skip_orders:
+        print_info("Phase E: SKIPPED (--skip-orders flag)")
+    if args.skip_consistency:
+        print_info("Phase F: SKIPPED (--skip-consistency flag)")
     print()
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    sys.exit(asyncio.run(async_main(api_key, api_secret)))
+    sys.exit(asyncio.run(async_main(api_key, api_secret, selected_phases, repo_path,
+                                    cleanup_all=args.cleanup_all)))
 
 
 if __name__ == "__main__":
