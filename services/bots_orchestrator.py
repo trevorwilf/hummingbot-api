@@ -39,12 +39,12 @@ class BotsOrchestrator:
         # MQTT manager will be started asynchronously later
 
     @staticmethod
-    def hummingbot_containers_fiter(container):
+    def hummingbot_containers_filter(container):
         """Filter for Hummingbot containers based on image name pattern."""
         try:
-            # Get the image name (first tag if available, otherwise the image ID)
             image_name = container.image.tags[0] if container.image.tags else str(container.image)
-            pattern = r'.+/hummingbot:'
+            # Match: hummingbot/hummingbot:*, hummingbot-nonkyc:*, or any */hummingbot:*
+            pattern = r'(.*\/)?hummingbot(-nonkyc)?:'
             return bool(re.match(pattern, image_name))
         except Exception:
             return False
@@ -57,7 +57,7 @@ class BotsOrchestrator:
         return [
             container.name
             for container in self.docker_client.containers.list()
-            if container.status == "running" and self.hummingbot_containers_fiter(container)
+            if container.status == "running" and self.hummingbot_containers_filter(container)
         ]
 
     def start(self):

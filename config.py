@@ -46,15 +46,16 @@ class MarketDataSettings(BaseSettings):
 
 class SecuritySettings(BaseSettings):
     """Security and authentication configuration."""
-    
-    username: str = Field(default="admin", description="API basic auth username")
-    password: str = Field(default="admin", description="API basic auth password")
+
+    username: str = Field(default="admin", alias="USERNAME", description="API basic auth username")
+    password: str = Field(default="admin", alias="PASSWORD", description="API basic auth password")
     debug_mode: bool = Field(default=False, description="Enable debug mode (disables auth)")
-    config_password: str = Field(default="a", description="Bot configuration encryption password")
+    config_password: str = Field(default="a", alias="CONFIG_PASSWORD", description="Bot configuration encryption password")
 
     model_config = SettingsConfigDict(
-        env_prefix="",
-        extra="ignore"  # Ignore extra environment variables
+        env_prefix="HBOT_API_",
+        populate_by_name=True,
+        extra="ignore"
     )
 
 

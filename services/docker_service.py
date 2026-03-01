@@ -36,6 +36,35 @@ class DockerService:
         except DockerException as e:
             logger.error(f"It was not possible to connect to Docker. Please make sure Docker is running. Error: {e}")
 
+    @staticmethod
+    def _get_bot_network_mode() -> str:
+        """Return the network_mode for spawned bot containers.
+
+        Reads DOCKER_BOT_NETWORK_MODE from env (default: 'host').
+        In the VPN stack this should be set to 'container:<gluetun_container_name>'
+        so all bot traffic is routed through the VPN tunnel.
+        """
+        return os.environ.get("DOCKER_BOT_NETWORK_MODE", "host")
+
+    @staticmethod
+    def _get_compose_labels(instance_name: str) -> dict:
+        """Return Docker labels that graft the bot into the Compose project.
+
+        This makes spawned bots appear in `docker compose ps`, Dozzle,
+        and enables autoheal restart monitoring.
+        """
+        project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+        service = os.environ.get("COMPOSE_SERVICE_PREFIX", "hummingbot-bot")
+        labels = {"autoheal": "true"}
+        if project:
+            labels.update({
+                "com.docker.compose.project": project,
+                "com.docker.compose.service": f"{service}-{instance_name}",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.oneoff": "False",
+            })
+        return labels
+
     def get_active_containers(self, name_filter: str = None):
         try:
             all_containers = self.client.containers.list(filters={"status": "running"})
@@ -274,13 +303,20 @@ class DockerService:
                 'max-size': '10m',
                 'max-file': "5",
             })
+        network_mode = self._get_bot_network_mode()
+        labels = self._get_compose_labels(instance_name)
+        logger.info(
+            f"Launching bot '{instance_name}' with "
+            f"network_mode={network_mode}, labels={labels}"
+        )
         try:
             self.client.containers.run(
                 image=config.image,
                 name=instance_name,
                 volumes=volumes,
                 environment=environment,
-                network_mode="host",
+                network_mode=network_mode,
+                labels=labels,
                 detach=True,
                 tty=True,
                 stdin_open=True,

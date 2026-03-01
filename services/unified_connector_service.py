@@ -690,6 +690,9 @@ class UnifiedConnectorService:
             connector._trading_fees_polling_task = safe_ensure_future(
                 connector._trading_fees_polling_loop()
             )
+            connector._status_polling_task = safe_ensure_future(
+                connector._status_polling_loop()
+            )
             connector._user_stream_tracker_task = connector._create_user_stream_tracker_task()
             connector._user_stream_event_listener_task = safe_ensure_future(
                 connector._user_stream_event_listener()

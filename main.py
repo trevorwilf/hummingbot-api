@@ -82,6 +82,13 @@ username = settings.security.username
 password = settings.security.password
 debug_mode = settings.security.debug_mode
 
+if debug_mode:
+    logging.warning("=" * 60)
+    logging.warning("  WARNING: DEBUG MODE IS ENABLED — AUTH IS DISABLED")
+    logging.warning("  All API endpoints are accessible without credentials.")
+    logging.warning("  DO NOT run this in production!")
+    logging.warning("=" * 60)
+
 # Security setup
 security = HTTPBasic()
 
@@ -343,12 +350,15 @@ def auth_user(
     is_correct_password = secrets.compare_digest(
         current_password_bytes, correct_password_bytes
     )
-    if not (is_correct_username and is_correct_password) and not debug_mode:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
+    if not (is_correct_username and is_correct_password):
+        if debug_mode:
+            logging.warning(f"Auth bypassed in debug mode for user: {credentials.username}")
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Basic"},
+            )
     return credentials.username
 
 
@@ -379,3 +389,54 @@ async def root():
         "version": VERSION,
         "status": "running",
     }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for container orchestration and monitoring.
+
+    Returns component status for: API, database, MQTT broker.
+    Does not require authentication.
+    """
+    from sqlalchemy import text
+    from starlette.responses import JSONResponse
+
+    health = {
+        "status": "healthy",
+        "components": {}
+    }
+
+    # Check database
+    try:
+        db_manager = app.state.db_manager
+        async with db_manager.session() as session:
+            await session.execute(text("SELECT 1"))
+        health["components"]["database"] = {"status": "healthy"}
+    except Exception as e:
+        health["status"] = "degraded"
+        health["components"]["database"] = {"status": "unhealthy", "error": str(e)}
+
+    # Check MQTT broker
+    try:
+        orchestrator = app.state.bots_orchestrator
+        if orchestrator and orchestrator.mqtt_manager:
+            mqtt_connected = orchestrator.mqtt_manager.is_connected
+            health["components"]["mqtt"] = {
+                "status": "healthy" if mqtt_connected else "unhealthy"
+            }
+        else:
+            health["components"]["mqtt"] = {"status": "not_initialized"}
+    except Exception as e:
+        health["components"]["mqtt"] = {"status": "unknown", "error": str(e)}
+
+    # Check connector service
+    try:
+        connector_service = app.state.connector_service
+        health["components"]["connector_service"] = {
+            "status": "healthy" if connector_service else "not_initialized"
+        }
+    except Exception as e:
+        health["components"]["connector_service"] = {"status": "unknown", "error": str(e)}
+
+    status_code = 200 if health["status"] == "healthy" else 503
+    return JSONResponse(content=health, status_code=status_code)
