@@ -776,33 +776,33 @@ class UnifiedConnectorService:
                     logger.error(f"Error updating {key}: {result}")
 
     async def initialize_all_trading_connectors(self):
-        """
-        Initialize all trading connectors for all accounts at startup.
-
-        This ensures that:
-        1. All connectors are ready to use immediately
-        2. Existing orders from database are loaded into in_flight_orders
-        3. Order tracking and cancellation work without needing manual initialization
-        """
-        # Get list of all accounts
+        """Initialize all trading connectors for all accounts at startup (parallel)."""
         accounts = fs_util.list_folders('credentials')
+        tasks = []
+        task_labels = []
 
-        total_initialized = 0
         for account_name in accounts:
-            # Get all connector credentials for this account
             connector_names = self.list_available_credentials(account_name)
-
             for connector_name in connector_names:
-                try:
-                    logger.info(f"Initializing connector: {account_name}/{connector_name}")
-                    await self.get_trading_connector(account_name, connector_name)
-                    total_initialized += 1
-                except Exception as e:
-                    logger.error(f"Failed to initialize {account_name}/{connector_name}: {e}")
-                    # Continue with other connectors even if one fails
-                    continue
+                tasks.append(self._init_single_connector(account_name, connector_name))
+                task_labels.append(f"{account_name}/{connector_name}")
 
-        logger.info(f"Initialized {total_initialized} trading connectors across {len(accounts)} accounts")
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            total_ok = 0
+            for label, result in zip(task_labels, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to initialize {label}: {result}")
+                else:
+                    total_ok += 1
+            logger.info(f"Initialized {total_ok}/{len(tasks)} trading connectors across {len(accounts)} accounts")
+        else:
+            logger.info("No trading connectors to initialize")
+
+    async def _init_single_connector(self, account_name: str, connector_name: str):
+        """Initialize a single trading connector. Used by parallel init."""
+        logger.info(f"Initializing connector: {account_name}/{connector_name}")
+        await self.get_trading_connector(account_name, connector_name)
 
     # =========================================================================
     # Order Management

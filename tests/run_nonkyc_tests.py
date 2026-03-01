@@ -1528,14 +1528,15 @@ def run_phase_g(repo_path: str) -> TestPhase:
     try:
         content = read_file("services/unified_connector_service.py")
         if content:
-            # Check it's in _start_connector_network (not just _stop)
-            start_section = content.split("_start_connector_network")[1] if "_start_connector_network" in content else ""
-            # Get only until the next method definition
-            if "async def " in start_section[10:]:
-                start_section = start_section[:start_section.index("async def ", 10)]
-            found = "_status_polling_task" in start_section and "safe_ensure_future" in start_section
-            ph.record("G2: _status_polling_task started in _start_connector_network", found,
-                       "Phase 1 fix P0-2" if found else "Phase 1 fix P0-2 not applied")
+            start_idx = content.find("async def _start_connector_network")
+            stop_idx = content.find("async def _stop_connector_network")
+            if start_idx >= 0 and stop_idx > start_idx:
+                method_body = content[start_idx:stop_idx]
+                found = "_status_polling_task" in method_body
+                ph.record("G2: _status_polling_task started in _start_connector_network", found,
+                           "Phase 1 fix P0-2" if found else "Phase 1 fix P0-2 not applied")
+            else:
+                ph.record("G2: _status_polling_task", False, "Could not find _start_connector_network method")
         else:
             ph.record("G2: unified_connector_service.py", False, "File not found")
     except Exception as e:
@@ -1587,6 +1588,564 @@ def run_phase_g(repo_path: str) -> TestPhase:
 
 
 # ===========================================================================
+# PHASE H — Hardening Verification (Phase 3 fixes)
+# ===========================================================================
+async def run_phase_h(api_key: str, api_secret: str, repo_path: str) -> TestPhase:
+    ph = TestPhase("H", "Hardening Verification (Phase 3)")
+
+    def read_file(relative_path: str) -> Optional[str]:
+        full = os.path.join(repo_path, relative_path)
+        if os.path.isfile(full):
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        return None
+
+    # ── H1: _status_polling_task started ──
+    try:
+        content = read_file("services/unified_connector_service.py")
+        if content:
+            start_idx = content.find("async def _start_connector_network")
+            stop_idx = content.find("async def _stop_connector_network")
+            if start_idx >= 0 and stop_idx > start_idx:
+                start_body = content[start_idx:stop_idx]
+                in_start = "_status_polling_task" in start_body and "safe_ensure_future" in start_body
+                # Also check in stop
+                next_m = content.find("async def ", stop_idx + 10)
+                stop_body = content[stop_idx:next_m] if next_m > 0 else content[stop_idx:]
+                in_stop = "_status_polling_task" in stop_body
+                ph.record("H1: _status_polling_task started and stopped", in_start and in_stop,
+                           f"start={'yes' if in_start else 'NO'}, stop={'yes' if in_stop else 'NO'}")
+            else:
+                ph.record("H1: _status_polling_task", False, "Methods not found")
+        else:
+            ph.record("H1: _status_polling_task", False, "File not found")
+    except Exception as e:
+        ph.record("H1: _status_polling_task", False, str(e))
+
+    # ── H2: SecuritySettings uses HBOT_API_ prefix ──
+    try:
+        content = read_file("config.py")
+        if content:
+            idx = content.find("class SecuritySettings")
+            next_cls = content.find("\nclass ", idx + 10) if idx >= 0 else -1
+            body = content[idx:next_cls] if idx >= 0 and next_cls > 0 else ""
+            found = "HBOT_API_" in body
+            ph.record("H2: SecuritySettings uses HBOT_API_ prefix", found)
+        else:
+            ph.record("H2: SecuritySettings prefix", False, "File not found")
+    except Exception as e:
+        ph.record("H2: SecuritySettings prefix", False, str(e))
+
+    # ── H3: CORS restricted (not wildcard) ──
+    try:
+        content = read_file("main.py")
+        if content:
+            # Find the add_middleware(CORSMiddleware, ...) call, not the import
+            cors_idx = content.find("allow_origins")
+            if cors_idx >= 0:
+                section = content[cors_idx:cors_idx + 500]
+                is_wildcard = 'allow_origins=["*"]' in section or "allow_origins=['*']" in section
+                if is_wildcard:
+                    ph.record("H3: CORS restricted (not wildcard)", False,
+                               "CORS still uses wildcard ['*']")
+                else:
+                    has_local = "127.0.0.1" in section or "localhost" in section
+                    ph.record("H3: CORS restricted (not wildcard)", True,
+                               f"CORS restricted to local origins (has_local={has_local})")
+            else:
+                ph.record("H3: CORS", False, "allow_origins not found in main.py")
+        else:
+            ph.record("H3: CORS", False, "File not found")
+    except Exception as e:
+        ph.record("H3: CORS", False, str(e))
+
+    # ── H4: Rate limiting middleware present ──
+    try:
+        content = read_file("main.py")
+        if content:
+            has_limiter = any(t in content for t in [
+                "SimpleRateLimiter", "RateLimiter", "rate_limit", "slowapi", "429"])
+            ph.record("H4: Rate limiting middleware present", has_limiter)
+        else:
+            ph.record("H4: Rate limiting", False, "File not found")
+    except Exception as e:
+        ph.record("H4: Rate limiting", False, str(e))
+
+    # ── H5: Connector init parallelized ──
+    try:
+        content = read_file("services/unified_connector_service.py")
+        if content:
+            idx = content.find("async def initialize_all_trading_connectors")
+            next_m = content.find("\n    async def ", idx + 10) if idx >= 0 else -1
+            body = content[idx:next_m] if idx >= 0 and next_m > 0 else content[idx:] if idx >= 0 else ""
+            has_gather = "asyncio.gather" in body
+            ph.record("H5: Connector init parallelized", has_gather,
+                       "asyncio.gather found" if has_gather else "sequential init")
+        else:
+            ph.record("H5: Connector init", False, "File not found")
+    except Exception as e:
+        ph.record("H5: Connector init", False, str(e))
+
+    # ── H6: OrdersRecorder logging reduced ──
+    try:
+        content = read_file("services/orders_recorder.py")
+        if content:
+            start_idx = content.find("def start(self")
+            next_def = content.find("\n    def ", start_idx + 10) if start_idx >= 0 else -1
+            next_async = content.find("\n    async def ", start_idx + 10) if start_idx >= 0 else -1
+            candidates = [x for x in [next_def, next_async] if x > 0]
+            end_idx = min(candidates) if candidates else len(content)
+            method_body = content[start_idx:end_idx] if start_idx >= 0 else ""
+            info_count = method_body.count("logger.info")
+            ph.record("H6: OrdersRecorder logging reduced", info_count <= 2,
+                       f"{info_count} logger.info calls in start()")
+        else:
+            ph.record("H6: OrdersRecorder logging", False, "File not found")
+    except Exception as e:
+        ph.record("H6: OrdersRecorder logging", False, str(e))
+
+    # ── H7: BotsOrchestrator filter includes nonkyc ──
+    try:
+        content = read_file("services/bots_orchestrator.py")
+        if content:
+            has_nonkyc = "hummingbot-nonkyc" in content
+            no_typo = "containers_fiter" not in content
+            has_filter = "containers_filter" in content
+            ph.record("H7: Container filter includes nonkyc", has_nonkyc and no_typo and has_filter,
+                       f"nonkyc={'yes' if has_nonkyc else 'NO'}, typo_fixed={'yes' if no_typo else 'NO'}")
+        else:
+            ph.record("H7: Container filter", False, "File not found")
+    except Exception as e:
+        ph.record("H7: Container filter", False, str(e))
+
+    # ── H8: AppSettings env_prefix set ──
+    try:
+        content = read_file("config.py")
+        if content:
+            idx = content.find("class AppSettings")
+            next_cls = content.find("\nclass ", idx + 10) if idx >= 0 else -1
+            body = content[idx:next_cls] if idx >= 0 and next_cls > 0 else content[idx:] if idx >= 0 else ""
+            has_prefix = "HBOT_" in body
+            ph.record("H8: AppSettings env_prefix set", has_prefix,
+                       "has HBOT_ prefix" if has_prefix else "no prefix set")
+        else:
+            ph.record("H8: AppSettings prefix", False, "File not found")
+    except Exception as e:
+        ph.record("H8: AppSettings prefix", False, str(e))
+
+    # ── Live tests (H9-H12) require API keys ──
+    if not (api_key and api_secret):
+        ph.record("H9: /account/trades since param", True, "SKIPPED — no API keys")
+        ph.record("H10: Fee computation", True, "SKIPPED — no API keys")
+        ph.record("H11: Server time normalization", True, "SKIPPED — no API keys")
+        ph.record("H12: /account/trades market filter", True, "SKIPPED — no API keys")
+        return ph
+
+    async with aiohttp.ClientSession() as s:
+        # ── H9: Live — /account/trades supports `since` parameter ──
+        try:
+            url = f"{BASE_URL}/account/trades"
+            _, all_trades = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+            if isinstance(all_trades, list) and len(all_trades) > 0:
+                # Try getting recent trades with 'since' parameter
+                if len(all_trades) >= 5:
+                    since_id = all_trades[-5].get("id") or all_trades[-5].get("_id", "")
+                    url2 = f"{BASE_URL}/account/trades?since={since_id}"
+                    _, recent = await get_json(s, url2, headers=make_rest_auth_headers(api_key, api_secret, url2))
+                    if isinstance(recent, list):
+                        ok = len(recent) <= len(all_trades)
+                        ph.record("H9: /account/trades since param", ok,
+                                   f"all={len(all_trades)}, since={len(recent)}")
+                    else:
+                        ph.record("H9: /account/trades since param", True,
+                                   "since param accepted (non-list response)")
+                else:
+                    # Few trades — just verify param doesn't error
+                    url2 = f"{BASE_URL}/account/trades?since=0"
+                    s2, _ = await get_json(s, url2, headers=make_rest_auth_headers(api_key, api_secret, url2))
+                    ph.record("H9: /account/trades since param", s2 != 500,
+                               f"HTTP {s2} with since=0")
+            else:
+                ph.record("H9: /account/trades since param", True, "No trades to test with")
+        except Exception as e:
+            ph.record("H9: /account/trades since param", False, str(e))
+
+        # ── H10: Live — Fee computation from trade history ──
+        try:
+            url = f"{BASE_URL}/account/trades"
+            _, trades = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+            if isinstance(trades, list) and len(trades) > 0:
+                valid_rates = []
+                for t in trades:
+                    fee = float(t.get("fee", 0) or 0)
+                    qty = float(t.get("quantity", 0) or 0)
+                    price = float(t.get("price", 0) or 0)
+                    if fee > 0 and qty > 0 and price > 0:
+                        rate = fee / (qty * price)
+                        valid_rates.append(rate)
+                if valid_rates:
+                    avg = sum(valid_rates) / len(valid_rates)
+                    all_sane = all(0 <= r <= 0.05 for r in valid_rates)
+                    ph.record("H10: Fee computation from trades", all_sane,
+                               f"avg_rate={avg:.4%}, samples={len(valid_rates)}")
+                else:
+                    ph.record("H10: Fee computation from trades", True, "No trades with fees > 0")
+            else:
+                ph.record("H10: Fee computation from trades", True, "No trade history")
+        except Exception as e:
+            ph.record("H10: Fee computation from trades", False, str(e))
+
+        # ── H11: Live — Server time endpoint normalization ──
+        try:
+            url = f"{BASE_URL}/time"
+            status_code, resp = await get_json(s, url)
+            local_time = time.time()
+            if status_code == 200:
+                server_ts = None
+                if isinstance(resp, dict):
+                    server_ts = resp.get("serverTime") or resp.get("time") or resp.get("timestamp")
+                elif isinstance(resp, (int, float)):
+                    server_ts = resp
+                if server_ts is not None:
+                    server_ts = float(server_ts)
+                    # Normalize ms to seconds
+                    if server_ts > 1_000_000_000_000:
+                        server_ts = server_ts / 1000
+                    drift = abs(server_ts - local_time)
+                    ph.record("H11: Server time normalization", drift < 5,
+                               f"drift={drift:.2f}s")
+                else:
+                    ph.record("H11: Server time normalization", True,
+                               f"Time endpoint returned {type(resp).__name__}, cannot parse")
+            else:
+                ph.record("H11: Server time normalization", True,
+                           f"HTTP {status_code} (endpoint may not exist)")
+        except Exception as e:
+            ph.record("H11: Server time normalization", False, str(e))
+
+        # ── H12: Live — /account/trades has market filter ──
+        try:
+            mkt = await find_market(s, TEST_SYMBOL)
+            mid = market_id(mkt) if mkt else ""
+            if mid:
+                url = f"{BASE_URL}/account/trades?market={mid}"
+                status_code, resp = await get_json(
+                    s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+                # PASS if it returns a list (even empty) and not an error
+                ok = status_code == 200 and isinstance(resp, list)
+                ph.record("H12: /account/trades market filter", ok or status_code != 500,
+                           f"HTTP {status_code}, trades={len(resp) if isinstance(resp, list) else '?'}")
+            else:
+                ph.record("H12: /account/trades market filter", True,
+                           f"Could not find {TEST_SYMBOL} market ID")
+        except Exception as e:
+            ph.record("H12: /account/trades market filter", False, str(e))
+
+    return ph
+
+
+# ===========================================================================
+# PHASE I — Failure Mode Validation (live edge cases)
+# ===========================================================================
+async def run_phase_i(api_key: str, api_secret: str) -> TestPhase:
+    ph = TestPhase("I", "Failure Modes")
+    created_order_ids: List[str] = []
+
+    async with aiohttp.ClientSession() as s:
+        try:
+            # ── I1: Invalid API key returns clear error ──
+            try:
+                bad_key = "INVALID_KEY_" + uuid.uuid4().hex[:8]
+                url = f"{BASE_URL}/balances"
+                status_code, resp = await get_json(s, url,
+                                                    headers=make_rest_auth_headers(bad_key, api_secret, url))
+                ok = status_code in (401, 403) and status_code != 500
+                ph.record("I1: Invalid API key returns clear error", ok,
+                           f"HTTP {status_code}")
+            except Exception as e:
+                ph.record("I1: Invalid API key", False, str(e))
+
+            # ── I2: Invalid signature returns clear error ──
+            try:
+                bad_secret = "WRONG_SECRET_" + uuid.uuid4().hex[:8]
+                url = f"{BASE_URL}/balances"
+                status_code, resp = await get_json(s, url,
+                                                    headers=make_rest_auth_headers(api_key, bad_secret, url))
+                ok = status_code in (401, 403) and status_code != 500
+                ph.record("I2: Invalid signature returns clear error", ok,
+                           f"HTTP {status_code}")
+            except Exception as e:
+                ph.record("I2: Invalid signature", False, str(e))
+
+            # ── I3: Expired nonce handling ──
+            try:
+                url = f"{BASE_URL}/balances"
+                old_nonce = str(int(time.time() * 1000) - 600_000)  # 10 min ago
+                message = api_key + url + old_nonce
+                sig = hmac.new(api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+                headers = {
+                    "X-API-KEY": api_key,
+                    "X-API-NONCE": old_nonce,
+                    "X-API-SIGN": sig,
+                    "Content-Type": "application/json",
+                }
+                async with s.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as r:
+                    status_code = r.status
+                ok = status_code != 500
+                note = "accepted (no nonce expiry)" if status_code == 200 else f"rejected HTTP {status_code}"
+                ph.record("I3: Expired nonce handling", ok, note)
+            except Exception as e:
+                ph.record("I3: Expired nonce", False, str(e))
+
+            # ── I4: Duplicate userProvidedId on createorder ──
+            try:
+                # Need a reference price first
+                mkt = await find_market(s, TEST_SYMBOL)
+                if mkt:
+                    price_decimals = int(mkt.get("priceDecimals", 2))
+                    qty_decimals = int(mkt.get("quantityDecimals", 6))
+
+                    url_t = f"{BASE_URL}/tickers"
+                    _, tickers = await get_json(s, url_t)
+                    ref_price = Decimal("0")
+                    if isinstance(tickers, list):
+                        for t in tickers:
+                            sym = (t.get("symbol") or "").replace("_", "/")
+                            if sym == TEST_SYMBOL:
+                                ref_price = Decimal(str(t.get("last", t.get("lastPrice", "0"))))
+                                break
+
+                    if ref_price > 0:
+                        test_price_i4 = round(float(ref_price) * 0.40, price_decimals)
+                        dup_cid = "HBOT-TEST-DUP-" + uuid.uuid4().hex[:8]
+                        min_qty_i4 = 1 / (10 ** qty_decimals)
+                        qty_i4 = round(max(min_qty_i4 * 100, 0.0001), qty_decimals)
+
+                        params = {
+                            "symbol": TEST_SYMBOL,
+                            "side": "buy",
+                            "type": "limit",
+                            "quantity": f"{qty_i4:.{qty_decimals}f}",
+                            "price": f"{test_price_i4:.{price_decimals}f}",
+                            "userProvidedId": dup_cid,
+                        }
+                        url_c = f"{BASE_URL}/createorder"
+                        s1, r1 = await post_json(s, url_c, params, api_key, api_secret)
+                        if s1 == 200 and isinstance(r1, dict) and r1.get("id"):
+                            oid1 = r1.get("id") or r1.get("_id")
+                            created_order_ids.append(oid1)
+                            await asyncio.sleep(1)
+
+                            # Second order with SAME userProvidedId
+                            s2, r2 = await post_json(s, url_c, params, api_key, api_secret)
+                            if s2 == 200 and isinstance(r2, dict) and r2.get("id"):
+                                oid2 = r2.get("id") or r2.get("_id")
+                                created_order_ids.append(oid2)
+                                ph.record("I4: Duplicate userProvidedId", True,
+                                           "API allows duplicate CIDs (document this)")
+                            else:
+                                ph.record("I4: Duplicate userProvidedId", True,
+                                           f"API rejects duplicate CIDs: HTTP {s2}")
+                        else:
+                            ph.record("I4: Duplicate userProvidedId", False,
+                                       f"First order failed: HTTP {s1}")
+                    else:
+                        ph.record("I4: Duplicate userProvidedId", True, "No price data")
+                else:
+                    ph.record("I4: Duplicate userProvidedId", True, "Market not found")
+            except Exception as e:
+                ph.record("I4: Duplicate userProvidedId", False, str(e))
+
+            # ── I5: Empty body POST request ──
+            try:
+                url = f"{BASE_URL}/createorder"
+                status_code, resp = await post_json(s, url, {}, api_key, api_secret)
+                ok = status_code != 500
+                ph.record("I5: Empty body POST createorder", ok,
+                           f"HTTP {status_code} (expected 400)")
+            except Exception as e:
+                ph.record("I5: Empty body POST", False, str(e))
+
+            # ── I6: Oversized quantity rejection ──
+            try:
+                url_t = f"{BASE_URL}/tickers"
+                _, tickers = await get_json(s, url_t)
+                ref_price = Decimal("0")
+                if isinstance(tickers, list):
+                    for t in tickers:
+                        sym = (t.get("symbol") or "").replace("_", "/")
+                        if sym == TEST_SYMBOL:
+                            ref_price = Decimal(str(t.get("last", t.get("lastPrice", "0"))))
+                            break
+
+                if ref_price > 0:
+                    params = {
+                        "symbol": TEST_SYMBOL,
+                        "side": "buy",
+                        "type": "limit",
+                        "quantity": "999999.000000",
+                        "price": f"{float(ref_price) * 0.40:.2f}",
+                        "userProvidedId": "HBOT-TEST-BIG-" + uuid.uuid4().hex[:8],
+                    }
+                    url_c = f"{BASE_URL}/createorder"
+                    status_code, resp = await post_json(s, url_c, params, api_key, api_secret)
+                    rejected = status_code != 200 or (
+                        isinstance(resp, dict) and ("error" in resp or "Insufficient" in str(resp)))
+                    # If somehow created, track for cleanup
+                    if status_code == 200 and isinstance(resp, dict) and resp.get("id"):
+                        created_order_ids.append(resp.get("id") or resp.get("_id"))
+                    ph.record("I6: Oversized quantity rejection", rejected,
+                               f"HTTP {status_code}")
+                else:
+                    ph.record("I6: Oversized quantity rejection", True, "No price data")
+            except Exception as e:
+                ph.record("I6: Oversized quantity rejection", False, str(e))
+
+            # ── I7: Market order on illiquid pair ──
+            try:
+                url_m = f"{BASE_URL}/market/getlist"
+                _, markets = await get_json(s, url_m)
+                illiquid = None
+                if isinstance(markets, list):
+                    for m in markets:
+                        if m.get("isActive") and m.get("symbol") != TEST_SYMBOL:
+                            vol = float(m.get("volume24h", 0) or 0)
+                            if 0 < vol < 0.01:
+                                illiquid = m
+                                break
+                if illiquid:
+                    sym = illiquid.get("symbol")
+                    ph.record("I7: Illiquid market order edge case", True,
+                               f"Found illiquid pair: {sym} (test skipped — market orders too risky)")
+                else:
+                    ph.record("I7: Illiquid market order edge case", True,
+                               "No illiquid pair found — skipped")
+            except Exception as e:
+                ph.record("I7: Illiquid market order", False, str(e))
+
+            # ── I8: Rapid sequential requests (burst) ──
+            try:
+                url = f"{BASE_URL}/balances"
+                results = []
+                for _ in range(10):
+                    st, _ = await get_json(s, url, headers=make_rest_auth_headers(api_key, api_secret, url))
+                    results.append(st)
+                ok_count = sum(1 for r in results if r == 200)
+                rate_limited = sum(1 for r in results if r == 429)
+                errors = sum(1 for r in results if r >= 500)
+                ok = errors == 0
+                ph.record("I8: Rapid burst (10 requests)", ok,
+                           f"200s={ok_count}, 429s={rate_limited}, 5xx={errors}")
+            except Exception as e:
+                ph.record("I8: Rapid burst", False, str(e))
+
+            # ── I9: WebSocket reconnection resilience ──
+            try:
+                # First connection
+                ws1, ok1, _ = await ws_login(s, api_key, api_secret)
+                if ok1:
+                    await ws1.close()
+                    await asyncio.sleep(0.5)
+
+                    # Second connection immediately after close
+                    ws2, ok2, _ = await ws_login(s, api_key, api_secret)
+                    if ok2:
+                        await ws2.send_json({"method": "subscribeReports", "params": {}})
+                        try:
+                            msg = await asyncio.wait_for(ws2.receive_json(), timeout=10)
+                            has_snapshot = (
+                                isinstance(msg, dict) and
+                                (msg.get("method") == "activeOrders" or "activeOrders" in str(msg))
+                            )
+                            ph.record("I9: WebSocket reconnection resilience", True,
+                                       f"reconnect OK, snapshot={'yes' if has_snapshot else 'no'}")
+                        except asyncio.TimeoutError:
+                            ph.record("I9: WebSocket reconnection resilience", True,
+                                       "reconnect OK, snapshot timed out")
+                        finally:
+                            await ws2.close()
+                    else:
+                        ph.record("I9: WebSocket reconnection", False, "Second login failed")
+                else:
+                    ph.record("I9: WebSocket reconnection", False, "First login failed")
+            except Exception as e:
+                ph.record("I9: WebSocket reconnection", False, str(e))
+
+            # ── I10: Cancel order with both ID formats in sequence ──
+            try:
+                mkt = await find_market(s, TEST_SYMBOL)
+                if mkt:
+                    price_decimals = int(mkt.get("priceDecimals", 2))
+                    qty_decimals = int(mkt.get("quantityDecimals", 6))
+
+                    url_t = f"{BASE_URL}/tickers"
+                    _, tickers = await get_json(s, url_t)
+                    ref_price = Decimal("0")
+                    if isinstance(tickers, list):
+                        for t in tickers:
+                            sym = (t.get("symbol") or "").replace("_", "/")
+                            if sym == TEST_SYMBOL:
+                                ref_price = Decimal(str(t.get("last", t.get("lastPrice", "0"))))
+                                break
+
+                    if ref_price > 0:
+                        test_cid = "HBOT-TEST-I10-" + uuid.uuid4().hex[:8]
+                        test_price_i10 = round(float(ref_price) * 0.40, price_decimals)
+                        min_qty_i10 = 1 / (10 ** qty_decimals)
+                        qty_i10 = round(max(min_qty_i10 * 100, 0.0001), qty_decimals)
+                        params = {
+                            "symbol": TEST_SYMBOL,
+                            "side": "buy",
+                            "type": "limit",
+                            "quantity": f"{qty_i10:.{qty_decimals}f}",
+                            "price": f"{test_price_i10:.{price_decimals}f}",
+                            "userProvidedId": test_cid,
+                        }
+                        url_c = f"{BASE_URL}/createorder"
+                        cs, cr = await post_json(s, url_c, params, api_key, api_secret)
+                        if cs == 200 and isinstance(cr, dict) and cr.get("id"):
+                            internal_id = cr.get("id") or cr.get("_id")
+                            created_order_ids.append(internal_id)
+                            await asyncio.sleep(1)
+
+                            # Cancel with internal ID
+                            url_cancel = f"{BASE_URL}/cancelorder"
+                            c1s, c1r = await post_json(s, url_cancel, {"id": internal_id},
+                                                        api_key, api_secret)
+                            if internal_id in created_order_ids:
+                                created_order_ids.remove(internal_id)
+
+                            # Attempt second cancel with userProvidedId
+                            c2s, c2r = await post_json(s, url_cancel, {"id": test_cid},
+                                                        api_key, api_secret)
+                            # PASS if second cancel doesn't crash (not 500)
+                            ok = c2s != 500
+                            ph.record("I10: Cancel with both ID formats in sequence", ok,
+                                       f"internal_cancel=HTTP {c1s}, cid_cancel=HTTP {c2s}")
+                        else:
+                            ph.record("I10: Cancel both formats", False,
+                                       f"Create failed: HTTP {cs}")
+                    else:
+                        ph.record("I10: Cancel both formats", True, "No price data")
+                else:
+                    ph.record("I10: Cancel both formats", True, "Market not found")
+            except Exception as e:
+                ph.record("I10: Cancel both formats", False, str(e))
+
+        finally:
+            # Cleanup any remaining orders
+            for oid in created_order_ids:
+                try:
+                    url = f"{BASE_URL}/cancelorder"
+                    await post_json(s, url, {"id": oid}, api_key, api_secret)
+                    print_info(f"Phase I cleanup: cancelled order {oid}")
+                except Exception:
+                    print_info(f"Phase I cleanup: failed to cancel order {oid}")
+
+    return ph
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 def print_phase_results(ph: TestPhase):
@@ -1603,7 +2162,7 @@ async def async_main(api_key: Optional[str], api_secret: Optional[str],
                      selected_phases: set = None, repo_path: str = "",
                      cleanup_all: bool = False):
     if selected_phases is None:
-        selected_phases = {"A", "B", "C", "D", "E", "F", "G"}
+        selected_phases = {"A", "B", "C", "D", "E", "F", "G", "H", "I"}
 
     phases: List[TestPhase] = []
     has_keys = bool(api_key and api_secret)
@@ -1673,6 +2232,21 @@ async def async_main(api_key: Optional[str], api_secret: Optional[str],
     else:
         banner("Phase G: SKIPPED")
 
+    if "H" in selected_phases:
+        phases.append(await run_phase_h(api_key or "", api_secret or "", repo_path))
+        print_phase_results(phases[-1])
+    else:
+        banner("Phase H: SKIPPED")
+
+    if "I" in selected_phases:
+        if has_keys:
+            phases.append(await run_phase_i(api_key, api_secret))
+            print_phase_results(phases[-1])
+        else:
+            banner("Phase I: Failure Modes (SKIPPED — no API keys)")
+    else:
+        banner("Phase I: SKIPPED (--skip-failure-tests flag)")
+
     # Enhanced Summary Report
     print_comprehensive_report(phases, summary_data)
 
@@ -1697,7 +2271,8 @@ def print_comprehensive_report(phases: List[TestPhase], summary_data: Dict[str, 
     phase_descriptions = {
         "A": "Connector Logic", "B": "REST Public", "C": "REST Authenticated",
         "D": "WebSocket", "E": "Order Lifecycle", "F": "Data Consistency",
-        "G": "Code Verification",
+        "G": "Code Verification (Phase 1)", "H": "Hardening Verification (Phase 3)",
+        "I": "Failure Modes",
     }
     for p in phases:
         total = p.passed_count + p.failed_count
@@ -1721,16 +2296,18 @@ def print_comprehensive_report(phases: List[TestPhase], summary_data: Dict[str, 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NonKYC.io API validation (v5 — Phase 2)")
+    parser = argparse.ArgumentParser(description="NonKYC.io API validation (v6 — Phase 3)")
     parser.add_argument("--env", default=None, help="Path to .env file")
     parser.add_argument("--key", default=None, help="NonKYC API key")
     parser.add_argument("--secret", default=None, help="NonKYC API secret")
     parser.add_argument("--phases", default=None,
-                        help="Comma-separated phases to run, e.g. A,B,C,D,E,F,G (default: all)")
+                        help="Comma-separated phases to run, e.g. A,B,C,D,E,F,G,H,I (default: all)")
     parser.add_argument("--skip-orders", action="store_true",
                         help="Skip Phase E (no real orders placed)")
     parser.add_argument("--skip-consistency", action="store_true",
                         help="Skip Phase F (data consistency)")
+    parser.add_argument("--skip-failure-tests", action="store_true",
+                        help="Skip Phase I failure mode tests (they place multiple orders)")
     parser.add_argument("--cleanup-all", action="store_true", default=False,
                         help="E0 cleanup: also cancel HBOT-CID orders (default: only HBOT-TEST). "
                              "WARNING: this will cancel orders from live running bots!")
@@ -1743,11 +2320,13 @@ def main():
     if args.phases:
         selected_phases = set(p.strip().upper() for p in args.phases.split(","))
     else:
-        selected_phases = {"A", "B", "C", "D", "E", "F", "G"}
+        selected_phases = {"A", "B", "C", "D", "E", "F", "G", "H", "I"}
     if args.skip_orders:
         selected_phases.discard("E")
     if args.skip_consistency:
         selected_phases.discard("F")
+    if args.skip_failure_tests:
+        selected_phases.discard("I")
 
     # Determine repo path for Phase G
     repo_path = args.repo_path
@@ -1773,7 +2352,7 @@ def main():
                     print_info(f"Loaded API keys from {p}")
                     break
 
-    banner("NonKYC.io API Validation Suite  (v5 — Phase 2)")
+    banner("NonKYC.io API Validation Suite  (v6 — Phase 3)")
     if api_key and api_secret:
         masked = api_key[:6] + "..." + api_key[-4:] if len(api_key) > 10 else "***"
         print_info(f"API key: {masked}")

@@ -53,39 +53,22 @@ class OrdersRecorder:
         ]
         
     def start(self, connector: ConnectorBase):
-        """Start recording orders for the given connector"""
+        """Start recording orders for the given connector."""
         # Idempotency guard: prevent double-registration of listeners
         if self._connector is not None:
-            logger.warning(f"OrdersRecorder already started for {self.account_name}/{self.connector_name}, ignoring duplicate start")
+            logger.debug(f"OrdersRecorder already started for {self.account_name}/{self.connector_name}, skipping")
             return
 
         self._connector = connector
 
-        # Subscribe to order events using the same pattern as MarketsRecorder
+        # Subscribe to order events
         for event, forwarder in self._event_pairs:
             connector.add_listener(event, forwarder)
-            logger.info(f"OrdersRecorder: Added listener for {event} with forwarder {forwarder}")
-            
-            # Debug: Check if listeners were actually added
-            if hasattr(connector, '_event_listeners'):
-                listeners = connector._event_listeners.get(event, [])
-                logger.info(f"OrdersRecorder: Event {event} now has {len(listeners)} listeners")
-                for i, listener in enumerate(listeners):
-                    logger.info(f"OrdersRecorder: Listener {i}: {listener}")
-        
-        logger.info(f"OrdersRecorder started for {self.account_name}/{self.connector_name} with {len(self._event_pairs)} event listeners")
-        
-        # Debug: Print connector info
-        logger.info(f"OrdersRecorder: Connector type: {type(connector)}")
-        logger.info(f"OrdersRecorder: Connector name: {getattr(connector, 'name', 'unknown')}")
-        logger.info(f"OrdersRecorder: Connector ready: {getattr(connector, 'ready', 'unknown')}")
-        
-        # Test if forwarders are callable
-        for event, forwarder in self._event_pairs:
-            if callable(forwarder):
-                logger.info(f"OrdersRecorder: Forwarder for {event} is callable")
-            else:
-                logger.error(f"OrdersRecorder: Forwarder for {event} is NOT callable: {type(forwarder)}")
+
+        logger.info(
+            f"OrdersRecorder started for {self.account_name}/{self.connector_name} "
+            f"({len(self._event_pairs)} events, connector={type(connector).__name__})"
+        )
     
     async def stop(self):
         """Stop recording orders"""

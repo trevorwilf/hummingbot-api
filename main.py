@@ -300,11 +300,65 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Modify in production to specific origins
+    allow_origins=[
+        "http://127.0.0.1:8501",    # Dashboard (Streamlit)
+        "http://localhost:8501",
+        "http://127.0.0.1:8080",    # Dozzle
+        "http://localhost:8080",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiting Middleware
+# ---------------------------------------------------------------------------
+import time as _time
+from collections import defaultdict as _defaultdict
+
+
+class SimpleRateLimiter:
+    """In-memory token-bucket rate limiter. Resets per minute."""
+
+    def __init__(self, default_rpm: int = 120, trading_rpm: int = 30):
+        self._default_rpm = default_rpm
+        self._trading_rpm = trading_rpm
+        self._requests: dict[str, list[float]] = _defaultdict(list)
+
+    def check(self, key: str, limit: int = None) -> bool:
+        now = _time.time()
+        rpm = limit or self._default_rpm
+        window = self._requests[key]
+        # Prune entries older than 60 seconds
+        self._requests[key] = [t for t in window if now - t < 60]
+        if len(self._requests[key]) >= rpm:
+            return False
+        self._requests[key].append(now)
+        return True
+
+
+_rate_limiter = SimpleRateLimiter(default_rpm=120, trading_rpm=30)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    path = request.url.path
+
+    # Stricter limit for trading endpoints
+    if path.startswith("/trading/place") or path.startswith("/trading/cancel"):
+        limit = 30
+    else:
+        limit = 120
+
+    if not _rate_limiter.check(f"{client_ip}:{path}", limit):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again in a minute."}
+        )
+    return await call_next(request)
 
 
 @app.exception_handler(RequestValidationError)
