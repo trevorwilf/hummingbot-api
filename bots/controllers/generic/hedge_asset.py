@@ -35,7 +35,7 @@ class HedgeAssetConfig(ControllerConfigBase):
     # Perpetual connector
     hedge_connector_name: str = "binance_perpetual"
     hedge_trading_pair: str = "SOL-USDT"
-    leverage: int = 20
+    leverage: int = 1
     position_mode: PositionMode = PositionMode.HEDGE
 
     # Hedge params

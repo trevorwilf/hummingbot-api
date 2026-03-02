@@ -13,7 +13,7 @@ class BasicOrderOpenCloseExampleConfig(ControllerConfigBase):
     trading_pair: str = "WLD-USDT"
     side: TradeType = TradeType.BUY
     position_mode: PositionMode = PositionMode.HEDGE
-    leverage: int = 50
+    leverage: int = 1
     close_order_delay: int = 10
     open_short_to_close_long: bool = False
     close_partial_position: bool = False

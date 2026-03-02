@@ -31,7 +31,7 @@ class MultiGridStrikeConfig(ControllerConfigBase):
     controller_name: str = "multi_grid_strike"
 
     # Account configuration
-    leverage: int = 20
+    leverage: int = 1
     position_mode: PositionMode = PositionMode.HEDGE
 
     # Common configuration

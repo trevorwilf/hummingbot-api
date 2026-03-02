@@ -24,7 +24,7 @@ class SuperTrendConfig(DirectionalTradingControllerConfigBase):
             "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
             "prompt_on_new": True})
     interval: str = Field(
-        default="3m",
+        default="5m",
         json_schema_extra={"prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ", "prompt_on_new": True})
     length: int = Field(
         default=20,

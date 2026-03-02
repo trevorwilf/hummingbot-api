@@ -12,7 +12,7 @@ class BuyThreeTimesExampleConfig(ControllerConfigBase):
     connector_name: str = "binance_perpetual"
     trading_pair: str = "WLD-USDT"
     position_mode: PositionMode = PositionMode.HEDGE
-    leverage: int = 20
+    leverage: int = 1
     amount_quote: Decimal = Decimal("10")
     order_frequency: int = 10
 

@@ -12,7 +12,7 @@ class BasicOrderExampleConfig(ControllerConfigBase):
     trading_pair: str = "WLD-USDT"
     side: TradeType = TradeType.BUY
     position_mode: PositionMode = PositionMode.HEDGE
-    leverage: int = 20
+    leverage: int = 1
     amount_quote: Decimal = Decimal("10")
     order_frequency: int = 10
 

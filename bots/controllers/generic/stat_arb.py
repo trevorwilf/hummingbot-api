@@ -21,7 +21,7 @@ class StatArbConfig(ControllerConfigBase):
     controller_name: str = "stat_arb"
     connector_pair_dominant: ConnectorPair = ConnectorPair(connector_name="binance_perpetual", trading_pair="SOL-USDT")
     connector_pair_hedge: ConnectorPair = ConnectorPair(connector_name="binance_perpetual", trading_pair="POPCAT-USDT")
-    interval: str = "1m"
+    interval: str = "5m"
     lookback_period: int = 300
     entry_threshold: Decimal = Decimal("2.0")
     take_profit: Decimal = Decimal("0.0008")
@@ -35,7 +35,7 @@ class StatArbConfig(ControllerConfigBase):
     max_orders_filled_per_side: int = 2
     max_position_deviation: Decimal = Decimal("0.1")
     pos_hedge_ratio: Decimal = Decimal("1.0")
-    leverage: int = 20
+    leverage: int = 1
     position_mode: PositionMode = PositionMode.HEDGE
 
     @property

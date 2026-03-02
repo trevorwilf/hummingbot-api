@@ -25,7 +25,7 @@ class CandlesConfigRequest(BaseModel):
     """
     connector_name: str
     trading_pair: str
-    interval: str = "1m"
+    interval: str = "5m"
     max_records: int = 500
 
 class CandlesResponse(BaseModel):

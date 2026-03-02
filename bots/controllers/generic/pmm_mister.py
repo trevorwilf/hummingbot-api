@@ -42,7 +42,7 @@ class PMMisterConfig(ControllerConfigBase):
     refresh_tolerance: Decimal = Field(default=Decimal("0.0005"), json_schema_extra={"is_updatable": True})
     tolerance_scaling: Decimal = Field(default=Decimal("1.2"), json_schema_extra={"is_updatable": True})
 
-    leverage: int = Field(default=20, json_schema_extra={"is_updatable": True})
+    leverage: int = Field(default=1, json_schema_extra={"is_updatable": True})
     position_mode: PositionMode = Field(default="ONEWAY")
     take_profit: Optional[Decimal] = Field(default=Decimal("0.0001"), gt=0, json_schema_extra={"is_updatable": True})
     take_profit_order_type: Optional[OrderType] = Field(default="LIMIT_MAKER", json_schema_extra={"is_updatable": True})
