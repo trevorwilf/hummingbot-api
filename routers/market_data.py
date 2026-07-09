@@ -2,21 +2,39 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Request, HTTPException, Depends
-from hummingbot.data_feed.candles_feed.data_types import HistoricalCandlesConfig, CandlesConfig
+from fastapi import APIRouter, Depends, HTTPException, Request
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory, UnsupportedConnectorException
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, HistoricalCandlesConfig
 
 from config import settings
+from deps import get_market_data_service
+from models import (
+    AddTradingPairRequest,
+    AllTickersResponse,
+    ConnectorTickersResponse,
+    FundingInfoRequest,
+    FundingInfoResponse,
+    OrderBookLevel,
+    OrderBookQueryResult,
+    OrderBookRequest,
+    OrderBookResponse,
+    PoolPricesResponse,
+    PriceForQuoteVolumeRequest,
+    PriceForVolumeRequest,
+    PriceRequest,
+    PricesResponse,
+    QuoteVolumeForPriceRequest,
+    RateRequest,
+    RatesResponse,
+    RemoveTradingPairRequest,
+    SingleRateResponse,
+    TickerInfo,
+    TradingPairResponse,
+    VolumeForPriceRequest,
+    VWAPForVolumeRequest,
+)
 from models.market_data import CandlesConfigRequest
 from services.market_data_service import MarketDataService
-from models import (
-    PriceRequest, PricesResponse, FundingInfoRequest, FundingInfoResponse,
-    OrderBookRequest, OrderBookResponse, OrderBookLevel,
-    VolumeForPriceRequest, PriceForVolumeRequest, QuoteVolumeForPriceRequest,
-    PriceForQuoteVolumeRequest, VWAPForVolumeRequest, OrderBookQueryResult,
-    AddTradingPairRequest, RemoveTradingPairRequest, TradingPairResponse
-)
-from deps import get_market_data_service
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +78,13 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
         candles_cfg = CandlesConfig(
             connector=candles_config.connector_name, trading_pair=candles_config.trading_pair,
             interval=candles_config.interval, max_records=candles_config.max_records)
-        candles_feed = market_data_service.get_candles_feed(candles_cfg)
+
+        # Creating the feed validates the trading pair on first use (cache hit afterwards);
+        # an invalid pair raises ValueError.
+        try:
+            candles_feed = await market_data_service.get_candles_feed(candles_cfg)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         # Wait for the candles feed to be ready with a timeout
         timeout = settings.market_data.candles_ready_timeout
@@ -130,7 +154,12 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
             interval=config.interval
         )
 
-        candles = market_data_service.get_candles_feed(candles_config)
+        # Creating the feed validates the trading pair on first use (cache hit afterwards);
+        # an invalid pair raises ValueError.
+        try:
+            candles = await market_data_service.get_candles_feed(candles_config)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         timeout = settings.market_data.candles_ready_timeout
         historical_data = await asyncio.wait_for(
@@ -166,10 +195,10 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
 async def get_active_feeds(request: Request):
     """
     Get information about currently active market data feeds.
-    
+
     Args:
         request: FastAPI request object to access application state
-        
+
     Returns:
         Dictionary with active feeds information including last access times and expiration
     """
@@ -184,7 +213,7 @@ async def get_active_feeds(request: Request):
 async def get_market_data_settings():
     """
     Get current market data settings for debugging.
-    
+
     Returns:
         Dictionary with current market data configuration including cleanup and timeout settings
     """
@@ -200,7 +229,7 @@ async def get_market_data_settings():
 async def get_available_candle_connectors():
     """
     Get list of available connectors that support candle data feeds.
-    
+
     Returns:
         List of connector names that can be used for fetching candle data
     """
@@ -211,31 +240,31 @@ async def get_available_candle_connectors():
 
 @router.post("/prices", response_model=PricesResponse)
 async def get_prices(
-    request: PriceRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: PriceRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get current prices for specified trading pairs from a connector.
-    
+
     Args:
         request: Price request with connector name and trading pairs
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Current prices for the specified trading pairs
-        
+
     Raises:
         HTTPException: 500 if there's an error fetching prices
     """
     try:
         prices = await market_data_manager.get_prices(
-            request.connector_name, 
+            request.connector_name,
             request.trading_pairs
         )
-        
+
         if "error" in prices:
             raise HTTPException(status_code=500, detail=prices["error"])
-            
+
         return PricesResponse(
             connector=request.connector_name,
             prices=prices,
@@ -247,21 +276,113 @@ async def get_prices(
         raise HTTPException(status_code=500, detail=f"Error fetching prices: {str(e)}")
 
 
+# ==================== Tickers & cross-rates ====================
+
+def _tickers_to_info(tickers) -> dict:
+    """Convert {pair: Ticker} to {pair: TickerInfo}."""
+    return {pair: TickerInfo(**t.to_dict()) for pair, t in tickers.items()}
+
+
+@router.get("/tickers", response_model=AllTickersResponse)
+async def get_all_tickers(
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """Get the latest collected tickers from every connected exchange, grouped by connector."""
+    all_tickers = market_data_manager.get_tickers()
+    return AllTickersResponse(
+        tickers={name: _tickers_to_info(tickers) for name, tickers in all_tickers.items()}
+    )
+
+
+@router.get("/tickers/{connector_name}", response_model=ConnectorTickersResponse)
+async def get_connector_tickers(
+        connector_name: str,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """Get the latest collected tickers for a single connector."""
+    tickers = market_data_manager.get_tickers(connector_name).get(connector_name, {})
+    info = _tickers_to_info(tickers)
+    return ConnectorTickersResponse(connector=connector_name, count=len(info), tickers=info)
+
+
+@router.post("/rates", response_model=RatesResponse)
+async def get_rates(
+        request: RateRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """
+    Resolve cross-rates for trading pairs from the collected ticker pool.
+
+    Rates are resolved via direct, reverse or bridged paths. When ``connector`` is set, only
+    that exchange's tickers are used; otherwise the merged multi-exchange pool is used.
+    """
+    rates = {}
+    for pair in request.trading_pairs:
+        if request.connector:
+            base, quote = pair.split("-") if "-" in pair else (pair, None)
+            rate = market_data_manager.get_rate_for_connector(request.connector, base, quote) if quote else None
+        else:
+            rate = market_data_manager.get_pair_rate(pair)
+        rates[pair] = float(rate) if rate else None
+    return RatesResponse(
+        quote_token=market_data_manager.quote_token,
+        connector=request.connector,
+        rates=rates,
+    )
+
+
+@router.get("/rate/{trading_pair}", response_model=SingleRateResponse)
+async def get_single_rate(
+        trading_pair: str,
+        connector: str = None,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """
+    Resolve a cross-rate for a single ``BASE-QUOTE`` trading pair from the ticker pool.
+
+    Pass ``?connector=<name>`` to restrict resolution to a single exchange's tickers.
+    """
+    if connector:
+        base, quote = trading_pair.split("-") if "-" in trading_pair else (trading_pair, None)
+        rate = market_data_manager.get_rate_for_connector(connector, base, quote) if quote else None
+    else:
+        rate = market_data_manager.get_pair_rate(trading_pair)
+    return SingleRateResponse(
+        trading_pair=trading_pair,
+        rate=float(rate) if rate else None,
+        quote_token=market_data_manager.quote_token,
+        connector=connector,
+    )
+
+
+@router.get("/pool-prices", response_model=PoolPricesResponse)
+async def get_pool_prices(
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """Get a snapshot of the merged price pool used for cross-rate resolution."""
+    prices = {pair: float(price) for pair, price in market_data_manager.prices.items()}
+    return PoolPricesResponse(
+        quote_token=market_data_manager.quote_token,
+        prices_count=len(prices),
+        prices=prices,
+    )
+
+
 @router.post("/funding-info", response_model=FundingInfoResponse)
 async def get_funding_info(
-    request: FundingInfoRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: FundingInfoRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get funding information for a perpetual trading pair.
-    
+
     Args:
         request: Funding info request with connector name and trading pair
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Funding information including rates, timestamps, and prices
-        
+
     Raises:
         HTTPException: 400 for non-perpetual connectors, 500 for other errors
     """
@@ -269,16 +390,16 @@ async def get_funding_info(
         if "_perpetual" not in request.connector_name.lower():
             raise HTTPException(status_code=400, detail="Funding info is only available for perpetual trading pairs.")
         funding_info = await market_data_manager.get_funding_info(
-            request.connector_name, 
+            request.connector_name,
             request.trading_pair
         )
-        
+
         if "error" in funding_info:
             if "not supported" in funding_info["error"]:
                 raise HTTPException(status_code=400, detail=funding_info["error"])
             else:
                 raise HTTPException(status_code=500, detail=funding_info["error"])
-            
+
         return FundingInfoResponse(**funding_info)
     except HTTPException:
         raise
@@ -288,19 +409,19 @@ async def get_funding_info(
 
 @router.post("/order-book", response_model=OrderBookResponse)
 async def get_order_book(
-    request: OrderBookRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: OrderBookRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get order book snapshot with specified depth.
-    
+
     Args:
         request: Order book request with connector, trading pair, and depth
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book snapshot with bids and asks
-        
+
     Raises:
         HTTPException: 500 if there's an error fetching order book
     """
@@ -310,14 +431,14 @@ async def get_order_book(
             request.trading_pair,
             request.depth
         )
-        
+
         if "error" in order_book_data:
             raise HTTPException(status_code=500, detail=order_book_data["error"])
-            
+
         # Convert to response format - data comes as [price, amount] lists
         bids = [OrderBookLevel(price=bid[0], amount=bid[1]) for bid in order_book_data["bids"]]
         asks = [OrderBookLevel(price=ask[0], amount=ask[1]) for ask in order_book_data["asks"]]
-        
+
         return OrderBookResponse(
             trading_pair=order_book_data["trading_pair"],
             bids=bids,
@@ -334,16 +455,16 @@ async def get_order_book(
 
 @router.post("/order-book/price-for-volume", response_model=OrderBookQueryResult)
 async def get_price_for_volume(
-    request: PriceForVolumeRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: PriceForVolumeRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get the price required to fill a specific volume on the order book.
-    
+
     Args:
         request: Request with connector, trading pair, volume, and side
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book query result with price and volume information
     """
@@ -354,10 +475,10 @@ async def get_price_for_volume(
             request.is_buy,
             volume=request.volume
         )
-        
+
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
-            
+
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
@@ -367,16 +488,16 @@ async def get_price_for_volume(
 
 @router.post("/order-book/volume-for-price", response_model=OrderBookQueryResult)
 async def get_volume_for_price(
-    request: VolumeForPriceRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: VolumeForPriceRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get the volume available at a specific price level on the order book.
-    
+
     Args:
         request: Request with connector, trading pair, price, and side
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book query result with volume information
     """
@@ -387,10 +508,10 @@ async def get_volume_for_price(
             request.is_buy,
             price=request.price
         )
-        
+
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
-            
+
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
@@ -400,16 +521,16 @@ async def get_volume_for_price(
 
 @router.post("/order-book/price-for-quote-volume", response_model=OrderBookQueryResult)
 async def get_price_for_quote_volume(
-    request: PriceForQuoteVolumeRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: PriceForQuoteVolumeRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get the price required to fill a specific quote volume on the order book.
-    
+
     Args:
         request: Request with connector, trading pair, quote volume, and side
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book query result with price and volume information
     """
@@ -420,10 +541,10 @@ async def get_price_for_quote_volume(
             request.is_buy,
             quote_volume=request.quote_volume
         )
-        
+
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
-            
+
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
@@ -433,16 +554,16 @@ async def get_price_for_quote_volume(
 
 @router.post("/order-book/quote-volume-for-price", response_model=OrderBookQueryResult)
 async def get_quote_volume_for_price(
-    request: QuoteVolumeForPriceRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: QuoteVolumeForPriceRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get the quote volume available at a specific price level on the order book.
-    
+
     Args:
         request: Request with connector, trading pair, price, and side
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book query result with quote volume information
     """
@@ -453,10 +574,10 @@ async def get_quote_volume_for_price(
             request.is_buy,
             quote_price=request.price
         )
-        
+
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
-            
+
         return OrderBookQueryResult(**result)
     except HTTPException:
         raise
@@ -466,16 +587,16 @@ async def get_quote_volume_for_price(
 
 @router.post("/order-book/vwap-for-volume", response_model=OrderBookQueryResult)
 async def get_vwap_for_volume(
-    request: VWAPForVolumeRequest,
-    market_data_manager: MarketDataService = Depends(get_market_data_service)
+        request: VWAPForVolumeRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get the VWAP (Volume Weighted Average Price) for a specific volume on the order book.
-    
+
     Args:
         request: Request with connector, trading pair, volume, and side
         market_data_manager: Injected market data feed manager
-        
+
     Returns:
         Order book query result with VWAP information
     """
@@ -501,8 +622,8 @@ async def get_vwap_for_volume(
 
 @router.post("/trading-pair/add", response_model=TradingPairResponse)
 async def add_trading_pair(
-    request: AddTradingPairRequest,
-    market_data_service: MarketDataService = Depends(get_market_data_service)
+        request: AddTradingPairRequest,
+        market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Initialize order book for a trading pair.
@@ -551,8 +672,8 @@ async def add_trading_pair(
 
 @router.post("/trading-pair/remove", response_model=TradingPairResponse)
 async def remove_trading_pair(
-    request: RemoveTradingPairRequest,
-    market_data_service: MarketDataService = Depends(get_market_data_service)
+        request: RemoveTradingPairRequest,
+        market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Remove a trading pair from order book tracking.
@@ -604,9 +725,9 @@ async def remove_trading_pair(
 
 @router.get("/order-book/diagnostics/{connector_name}")
 async def get_order_book_diagnostics(
-    connector_name: str,
-    account_name: str = None,
-    market_data_service: MarketDataService = Depends(get_market_data_service)
+        connector_name: str,
+        account_name: str = None,
+        market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Get diagnostics for a connector's order book tracker.
@@ -639,9 +760,9 @@ async def get_order_book_diagnostics(
 
 @router.post("/order-book/restart/{connector_name}")
 async def restart_order_book_tracker(
-    connector_name: str,
-    account_name: str = None,
-    market_data_service: MarketDataService = Depends(get_market_data_service)
+        connector_name: str,
+        account_name: str = None,
+        market_data_service: MarketDataService = Depends(get_market_data_service)
 ):
     """
     Restart the order book tracker for a connector.
@@ -670,5 +791,3 @@ async def restart_order_book_tracker(
             status_code=500,
             detail=f"Error restarting order book tracker: {str(e)}"
         )
-
-

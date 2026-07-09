@@ -1,22 +1,25 @@
+import logging
 from typing import List
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class BrokerSettings(BaseSettings):
     """MQTT Broker configuration for bot communication."""
-    
+
     host: str = Field(default="localhost", description="MQTT broker host")
     port: int = Field(default=1883, description="MQTT broker port")
     username: str = Field(default="admin", description="MQTT broker username")
     password: str = Field(default="password", description="MQTT broker password")
+    performance_dump_interval: int = Field(default=5, description="Controller performance dump interval in minutes")
 
     model_config = SettingsConfigDict(env_prefix="BROKER_", extra="ignore")
 
 
 class DatabaseSettings(BaseSettings):
     """Database configuration."""
-    
+
     url: str = Field(
         default="postgresql+asyncpg://hbot:hummingbot-api@localhost:5432/hummingbot_api",
         description="Database connection URL"
@@ -27,7 +30,7 @@ class DatabaseSettings(BaseSettings):
 
 class MarketDataSettings(BaseSettings):
     """Market data feed manager configuration."""
-    
+
     cleanup_interval: int = Field(
         default=300,
         description="How often to run feed cleanup in seconds"
@@ -40,22 +43,81 @@ class MarketDataSettings(BaseSettings):
         default=30,
         description="How long to wait for a candle feed to become ready in seconds"
     )
+    ws_heartbeat_interval: int = Field(
+        default=30,
+        description="WebSocket heartbeat interval in seconds"
+    )
+    ws_min_update_interval: float = Field(
+        default=0.25,
+        description="Minimum allowed WebSocket subscription update interval in seconds"
+    )
+    ws_max_update_interval: float = Field(
+        default=60.0,
+        description="Maximum allowed WebSocket subscription update interval in seconds"
+    )
+    ticker_update_interval: int = Field(
+        default=30,
+        description="How often to refresh tickers from connected exchanges in seconds"
+    )
 
     model_config = SettingsConfigDict(env_prefix="MARKET_DATA_", extra="ignore")
 
 
-class SecuritySettings(BaseSettings):
-    """Security and authentication configuration."""
+# Insecure default credential values (SEC-018), mapped to the environment variables that override them.
+# They are kept only for local development convenience and MUST be overridden in production deployments.
+_INSECURE_SECURITY_DEFAULTS = {
+    "USERNAME": "admin",
+    "PASSWORD": "admin",
+    "CONFIG_PASSWORD": "a",
+}
 
-    username: str = Field(default="admin", description="API basic auth username")
-    password: str = Field(default="admin", description="API basic auth password")
+
+class SecuritySettings(BaseSettings):
+    """Security and authentication configuration.
+
+    All fields are read from environment variables with the HBOT_API_ prefix (or from .env):
+    - HBOT_API_USERNAME: API basic auth username (default "admin" — local development only, never use in production)
+    - HBOT_API_PASSWORD: API basic auth password (default "admin" — local development only, never use in production)
+    - HBOT_API_CONFIG_PASSWORD: password used to encrypt ALL connector credentials (default "a" — local development
+      only, never use in production)
+    - HBOT_API_DEBUG_MODE: disables auth for local debugging (default False; never enable in production)
+    """
+
+    username: str = Field(default="admin", description="API basic auth username (override via HBOT_API_USERNAME in production)")
+    password: str = Field(default="admin", description="API basic auth password (override via HBOT_API_PASSWORD in production)")
     debug_mode: bool = Field(default=False, description="Enable debug mode (disables auth)")
-    config_password: str = Field(default="a", description="Bot configuration encryption password")
+    config_password: str = Field(
+        default="a",
+        description="Bot configuration encryption password (override via HBOT_API_CONFIG_PASSWORD in production)"
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="HBOT_API_",
         extra="ignore"
     )
+
+    def insecure_defaults_in_use(self) -> List[str]:
+        """Return the env var names of security settings still set to their insecure default values."""
+        current_values = {"USERNAME": self.username, "PASSWORD": self.password, "CONFIG_PASSWORD": self.config_password}
+        return [name for name, default in _INSECURE_SECURITY_DEFAULTS.items() if current_values[name] == default]
+
+
+def warn_if_insecure_security_defaults(security: SecuritySettings) -> List[str]:
+    """Emit a high-severity log if any security setting still uses its insecure default value (SEC-018).
+
+    Returns the list of env var names that are still at their defaults (empty list when fully configured).
+    """
+    insecure = security.insecure_defaults_in_use()
+    if insecure:
+        logging.critical(
+            "SECURITY WARNING: insecure default credentials in use for: %s. "
+            "Anyone who can reach this API can authenticate with the default basic auth credentials, and all "
+            "connector credentials are encrypted with a trivially guessable password. "
+            "Set the USERNAME, PASSWORD and CONFIG_PASSWORD environment variables (e.g. in .env) before deploying "
+            "to production. Do NOT run a production deployment with these defaults.",
+            ", ".join(insecure),
+        )
+    return insecure
 
 
 class AWSSettings(BaseSettings):
@@ -72,27 +134,63 @@ class GatewaySettings(BaseSettings):
     """Gateway service configuration."""
 
     url: str = Field(
-        default="http://localhost:15888",
-        description="Gateway service URL (use 'http://gateway:15888' when running in Docker)"
+        default="https://localhost:15888",
+        description="Gateway service URL. The Gateway always runs secured (mTLS), so this must use "
+                    "the 'https' scheme (SEC-048); use 'https://gateway:15888' when running in Docker."
     )
 
     model_config = SettingsConfigDict(env_prefix="GATEWAY_", extra="ignore")
 
 
+class CORSSettings(BaseSettings):
+    """CORS configuration for the API (SEC-019).
+
+    A wildcard origin ("*") must never be combined with allow_credentials=True: browsers reject that
+    combination per the CORS spec, and Starlette works around it by reflecting any Origin, which lets
+    arbitrary third-party pages call the API from an authenticated operator's browser. Origins are
+    therefore restricted by default and configurable via environment variables:
+    - CORS_ALLOW_ORIGINS: JSON list of explicit trusted origins, e.g. '["https://dashboard.example.com"]'
+    - CORS_ALLOW_ORIGIN_REGEX: regex for trusted origins (empty by default; set e.g.
+      'https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?' to allow any localhost port)
+
+    NonKYC lockdown: the defaults below restrict CORS to the Dashboard (:8501) and Dozzle (:8080)
+    local origins only, with the permissive localhost regex disabled. Widen via the env vars above.
+    """
+
+    allow_origins: List[str] = Field(
+        default=[
+            "http://127.0.0.1:8501",    # Dashboard (Streamlit)
+            "http://localhost:8501",
+            "http://127.0.0.1:8080",    # Dozzle
+            "http://localhost:8080",
+        ],
+        description='Explicit list of trusted CORS origins, e.g. CORS_ALLOW_ORIGINS=\'["https://dashboard.example.com"]\''
+    )
+    allow_origin_regex: str = Field(
+        default="",
+        description="Regex matching trusted CORS origins; empty disables regex matching (NonKYC lockdown default)."
+    )
+    allow_credentials: bool = Field(default=True, description="Allow credentialed (cookies/auth) cross-origin requests")
+    allow_methods: List[str] = Field(default=["*"], description="HTTP methods allowed for cross-origin requests")
+    allow_headers: List[str] = Field(default=["*"], description="HTTP headers allowed for cross-origin requests")
+
+    model_config = SettingsConfigDict(env_prefix="CORS_", extra="ignore")
+
+
 class AppSettings(BaseSettings):
     """Main application settings."""
-    
+
     # Static paths
     controllers_path: str = "bots/conf/controllers"
     controllers_module: str = "bots.controllers"
     password_verification_path: str = "credentials/master_account/.password_verification"
-    
+
     # Environment-configurable settings
     logfire_environment: str = Field(
         default="dev",
         description="Logfire environment name"
     )
-    
+
     # Account state update interval
     account_update_interval: int = Field(
         default=5,
@@ -114,8 +212,9 @@ class Settings(BaseSettings):
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)
     gateway: GatewaySettings = Field(default_factory=GatewaySettings)
+    cors: CORSSettings = Field(default_factory=CORSSettings)
     app: AppSettings = Field(default_factory=AppSettings)
-    
+
     # Direct banned_tokens field to handle env parsing
     banned_tokens: List[str] = Field(
         default=["NAV", "ARS", "ETHW", "ETHF"],
@@ -129,6 +228,4 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-
-# Create global settings instance
 settings = Settings()

@@ -36,9 +36,8 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials  # noqa: E402
 from hummingbot.client.config.client_config_map import GatewayConfigMap  # noqa: E402
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger  # noqa: E402
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient  # noqa: E402
-from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES, RateOracle  # noqa: E402
 
-from config import settings  # noqa: E402
+from config import settings, warn_if_insecure_security_defaults  # noqa: E402
 from database import AsyncDatabaseManager  # noqa: E402
 from routers import (  # noqa: E402
     accounts,
@@ -51,22 +50,27 @@ from routers import (  # noqa: E402
     executors,
     gateway,
     gateway_clmm,
-    gateway_proxy,
     gateway_swap,
     market_data,
     portfolio,
-    rate_oracle,
     scripts,
+    storage,
+    system,
     trading,
+    websocket,
 )
 from services.accounts_service import AccountsService  # noqa: E402
+from services.backtesting_service import BacktestingService  # noqa: E402
 from services.bots_orchestrator import BotsOrchestrator  # noqa: E402
 from services.docker_service import DockerService  # noqa: E402
 from services.executor_service import ExecutorService  # noqa: E402
+from services.executor_ws_manager import ExecutorWebSocketManager  # noqa: E402
 from services.gateway_service import GatewayService  # noqa: E402
 from services.market_data_service import MarketDataService  # noqa: E402
+from services.trading_history_service import TradingHistoryService  # noqa: E402
 from services.trading_service import TradingService  # noqa: E402
 from services.unified_connector_service import UnifiedConnectorService  # noqa: E402
+from services.websocket_manager import WebSocketManager  # noqa: E402
 from utils.bot_archiver import BotArchiver  # noqa: E402
 from utils.security import BackendAPISecurity  # noqa: E402
 
@@ -101,6 +105,9 @@ async def lifespan(app: FastAPI):
     Lifespan context manager for the FastAPI application.
     Handles startup and shutdown events.
     """
+    # SEC-018: warn loudly if USERNAME/PASSWORD/CONFIG_PASSWORD are still the insecure defaults
+    warn_if_insecure_security_defaults(settings.security)
+
     # Ensure password verification file exists
     if BackendAPISecurity.new_password_required():
         # Create secrets manager with CONFIG_PASSWORD
@@ -114,10 +121,17 @@ async def lifespan(app: FastAPI):
 
     # Initialize GatewayHttpClient singleton
     parsed_gateway_url = urlparse(settings.gateway.url)
+    gateway_use_ssl = parsed_gateway_url.scheme == "https"
+    if gateway_use_ssl:
+        # SEC-048: the in-process GatewayHttpClient reads its client certs only from
+        # root_path()/certs. Mirror the shared cert set there if the Gateway was already
+        # started in a previous run (no-op when certs haven't been generated yet).
+        from utils.gateway_certs import sync_client_certs_to_root
+        sync_client_certs_to_root()
     gateway_config = GatewayConfigMap(
         gateway_api_host=parsed_gateway_url.hostname or "localhost",
         gateway_api_port=str(parsed_gateway_url.port or 15888),
-        gateway_use_ssl=parsed_gateway_url.scheme == "https"
+        gateway_use_ssl=gateway_use_ssl
     )
     GatewayHttpClient.get_instance(gateway_config)
     logging.info(f"Initialized GatewayHttpClient with URL: {settings.gateway.url}")
@@ -128,42 +142,21 @@ async def lifespan(app: FastAPI):
     await db_manager.create_tables()
     logging.info("Database initialized")
 
-    # Read rate oracle configuration from conf_client.yml
+    # Read the global quote token (the currency everything is valued in) from conf_client.yml.
+    # Prices come from our own ticker pool (MarketDataService), not the legacy RateOracle.
     from utils.file_system import FileSystemUtil
     fs_util = FileSystemUtil()
 
+    quote_token = "USDT"
     try:
         conf_client_path = "credentials/master_account/conf_client.yml"
         config_data = fs_util.read_yaml_file(conf_client_path)
-
-        # Get rate_oracle_source configuration
-        rate_oracle_source_data = config_data.get("rate_oracle_source", {})
-        source_name = rate_oracle_source_data.get("name", "binance")
-
-        # Get global_token configuration
-        global_token_data = config_data.get("global_token", {})
-        quote_token = global_token_data.get("global_token_name", "USDT")
-
-        # Create rate source instance
-        if source_name in RATE_ORACLE_SOURCES:
-            rate_source = RATE_ORACLE_SOURCES[source_name]()
-            logging.info(f"Configured RateOracle with source: {source_name}, quote_token: {quote_token}")
-        else:
-            logging.warning(f"Unknown rate oracle source '{source_name}', defaulting to binance")
-            rate_source = RATE_ORACLE_SOURCES["binance"]()
-            source_name = "binance"
-
-        # Initialize RateOracle with configured source and quote token
-        rate_oracle = RateOracle.get_instance()
-        rate_oracle.source = rate_source
-        rate_oracle.quote_token = quote_token
-
+        quote_token = config_data.get("global_token", {}).get("global_token_name", "USDT")
+        logging.info(f"Configured global quote token: {quote_token}")
     except FileNotFoundError:
-        logging.warning("conf_client.yml not found, using default RateOracle configuration (binance, USDT)")
-        rate_oracle = RateOracle.get_instance()
+        logging.warning("conf_client.yml not found, defaulting global quote token to USDT")
     except Exception as e:
-        logging.warning(f"Error reading conf_client.yml: {e}, using default RateOracle configuration")
-        rate_oracle = RateOracle.get_instance()
+        logging.warning(f"Error reading conf_client.yml: {e}, defaulting global quote token to USDT")
 
     # =========================================================================
     # 2. UnifiedConnectorService - Single source of truth for all connectors
@@ -179,13 +172,17 @@ async def lifespan(app: FastAPI):
     # 3. Services that depend on connector_service
     # =========================================================================
 
-    # MarketDataService - candles, order books, prices
+    # MarketDataService - candles, order books, tickers, cross-rate pricing
     market_data_service = MarketDataService(
         connector_service=connector_service,
-        rate_oracle=rate_oracle,
+        quote_token=quote_token,
         cleanup_interval=settings.market_data.cleanup_interval,
-        feed_timeout=settings.market_data.feed_timeout
+        feed_timeout=settings.market_data.feed_timeout,
+        ticker_update_interval=settings.market_data.ticker_update_interval,
     )
+    # Connector trade-volume telemetry resolves rates through the ticker pool instead of the
+    # legacy RateOracle singleton.
+    connector_service.set_rate_provider(market_data_service)
     logging.info("MarketDataService initialized")
 
     # TradingService - order placement, positions, trading interfaces
@@ -197,14 +194,18 @@ async def lifespan(app: FastAPI):
 
     # AccountsService - account management, balances, portfolio (simplified)
     accounts_service = AccountsService(
+        db_manager=db_manager,
+        connector_service=connector_service,
+        market_data_service=market_data_service,
+        trading_service=trading_service,
         account_update_interval=settings.app.account_update_interval,
         gateway_url=settings.gateway.url
     )
-    # Inject services into AccountsService
-    accounts_service._connector_service = connector_service
-    accounts_service._market_data_service = market_data_service
-    accounts_service._trading_service = trading_service
     logging.info("AccountsService initialized")
+
+    # TradingHistoryService - read-only persistence queries for orders/trades/funding
+    trading_history_service = TradingHistoryService(db_manager=db_manager)
+    logging.info("TradingHistoryService initialized")
 
     # =========================================================================
     # 4. ExecutorService - depends on TradingService (NO circular dependency)
@@ -218,17 +219,6 @@ async def lifespan(app: FastAPI):
         max_retries=10
     )
     logging.info("ExecutorService initialized")
-    # Ensure lp_executor is in the registry (workspace hummingbot may load after class definition)
-    try:
-        from hummingbot.strategy_v2.executors.lp_executor.data_types import LPExecutorConfig
-        from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
-        print(f"[LP-FIX] imports OK. Registry before: {list(ExecutorService.EXECUTOR_REGISTRY.keys())}", flush=True)
-        ExecutorService.EXECUTOR_REGISTRY["lp_executor"] = (LPExecutor, LPExecutorConfig)
-        print(f"[LP-FIX] Registry after: {list(ExecutorService.EXECUTOR_REGISTRY.keys())}", flush=True)
-    except Exception as e:
-        import traceback
-        print(f"[LP-FIX] FAILED: {e}", flush=True)
-        traceback.print_exc()
 
     # =========================================================================
     # 5. Other Services
@@ -238,11 +228,25 @@ async def lifespan(app: FastAPI):
         broker_host=settings.broker.host,
         broker_port=settings.broker.port,
         broker_username=settings.broker.username,
-        broker_password=settings.broker.password
+        broker_password=settings.broker.password,
+        db_manager=db_manager,
+        performance_dump_interval=settings.broker.performance_dump_interval
     )
 
+    backtesting_service = BacktestingService()
     docker_service = DockerService()
     gateway_service = GatewayService()
+    # If a secured Gateway is already running but this API lost the shared mTLS certs (e.g. the
+    # API container was recreated without the persisted bots/ mount), regenerate the cert set and
+    # restart the Gateway so it loads a matching server cert. Non-fatal: the API must still boot
+    # even when Docker is unavailable or the Gateway is simply not running.
+    if gateway_use_ssl:
+        try:
+            reconcile = gateway_service.reconcile_certs()
+            if reconcile.get("action") != "none":
+                logging.info(f"Gateway cert reconciliation: {reconcile.get('message')}")
+        except Exception as e:
+            logging.warning(f"Gateway cert reconciliation skipped: {e}")
     bot_archiver = BotArchiver(
         settings.aws.api_key,
         settings.aws.secret_key,
@@ -258,9 +262,15 @@ async def lifespan(app: FastAPI):
     logging.info("Initializing all trading connectors...")
     await connector_service.initialize_all_trading_connectors()
 
+    # Reconcile persisted active orders against the exchange (e.g. after an API
+    # restart/crash that lost in-memory references). Confirmed-closed orders are
+    # marked terminal; still-open orders are re-tracked so they stay cancelable.
+    # Runs after connectors reload their persisted in-flight orders.
+    await connector_service.reconcile_active_orders()
+
     bots_orchestrator.start()
     market_data_service.start()
-    await market_data_service.warmup_rate_oracle()
+    await market_data_service.warmup_tickers()
     executor_service.start()
     await executor_service.cleanup_orphaned_executors()
     await executor_service.recover_positions_from_db()
@@ -275,11 +285,20 @@ async def lifespan(app: FastAPI):
     app.state.market_data_service = market_data_service
     app.state.trading_service = trading_service
     app.state.accounts_service = accounts_service
+    app.state.trading_history_service = trading_history_service
     app.state.executor_service = executor_service
+    websocket_manager = WebSocketManager(market_data_service)
+    app.state.websocket_manager = websocket_manager
+
+    app.state.backtesting_service = backtesting_service
     app.state.bots_orchestrator = bots_orchestrator
     app.state.docker_service = docker_service
     app.state.gateway_service = gateway_service
     app.state.bot_archiver = bot_archiver
+
+    # WebSocket manager for executor streaming
+    executor_ws_manager = ExecutorWebSocketManager(executor_service, market_data_service, bots_orchestrator)
+    app.state.executor_ws_manager = executor_ws_manager
 
     logging.info("All services started successfully")
 
@@ -291,7 +310,9 @@ async def lifespan(app: FastAPI):
 
     logging.info("Shutting down services...")
 
-    bots_orchestrator.stop()
+    websocket_manager.shutdown()
+    await executor_ws_manager.shutdown()
+    await bots_orchestrator.stop()
     await accounts_service.stop()
     await executor_service.stop()
     market_data_service.stop()
@@ -307,20 +328,22 @@ app = FastAPI(
     description="API for managing Hummingbot trading instances",
     version=VERSION,
     lifespan=lifespan,
+    redirect_slashes=False,
 )
 
-# Add CORS middleware
+# Add CORS middleware (SEC-019). Origins are restricted by default: a wildcard origin must not be
+# combined with allow_credentials=True. Trusted origins are configured via CORS_ALLOW_ORIGINS /
+# CORS_ALLOW_ORIGIN_REGEX (see config.CORSSettings); the default only allows localhost origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:8501",    # Dashboard (Streamlit)
-        "http://localhost:8501",
-        "http://127.0.0.1:8080",    # Dozzle
-        "http://localhost:8080",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # NonKYC lockdown: CORSSettings defaults to the Dashboard (:8501) + Dozzle (:8080) local
+    # origins with the permissive localhost regex disabled (see config.CORSSettings). Operators can
+    # still widen this via CORS_ALLOW_ORIGINS / CORS_ALLOW_ORIGIN_REGEX.
+    allow_origins=settings.cors.allow_origins,
+    allow_origin_regex=settings.cors.allow_origin_regex or None,
+    allow_credentials=settings.cors.allow_credentials,
+    allow_methods=settings.cors.allow_methods,
+    allow_headers=settings.cors.allow_headers,
 )
 
 
@@ -415,7 +438,15 @@ def auth_user(
     is_correct_password = secrets.compare_digest(
         current_password_bytes, correct_password_bytes
     )
-    if not (is_correct_username and is_correct_password) and not debug_mode:
+    if not (is_correct_username and is_correct_password):
+        # NonKYC debug mode: when explicitly enabled, bypass auth but warn loudly so an
+        # accidentally-enabled debug deployment is obvious in the logs. Defaults to False.
+        if debug_mode:
+            logging.warning(
+                "DEBUG MODE: bypassing authentication for request with invalid credentials "
+                f"(username={credentials.username!r})"
+            )
+            return credentials.username
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -438,12 +469,15 @@ app.include_router(bot_orchestration.router, dependencies=[Depends(auth_user)])
 app.include_router(controllers.router, dependencies=[Depends(auth_user)])
 app.include_router(scripts.router, dependencies=[Depends(auth_user)])
 app.include_router(market_data.router, dependencies=[Depends(auth_user)])
-app.include_router(rate_oracle.router, dependencies=[Depends(auth_user)])
 app.include_router(backtesting.router, dependencies=[Depends(auth_user)])
 app.include_router(archived_bots.router, dependencies=[Depends(auth_user)])
+app.include_router(storage.router, dependencies=[Depends(auth_user)])
+app.include_router(system.router, dependencies=[Depends(auth_user)])
 
 app.include_router(executors.router, dependencies=[Depends(auth_user)])
-app.include_router(gateway_proxy.router, dependencies=[Depends(auth_user)])
+
+# WebSocket router (handles its own auth)
+app.include_router(websocket.router)
 
 
 @app.get("/")

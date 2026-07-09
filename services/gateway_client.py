@@ -1,6 +1,6 @@
 import logging
-from decimal import Decimal
-from typing import Dict, List, Optional
+import ssl
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
@@ -13,9 +13,29 @@ class GatewayClient:
     Provides essential functionality for wallet management and balance queries.
     """
 
-    def __init__(self, base_url: str = "http://localhost:15888"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:15888",
+        ssl_context_factory: Optional[Callable[[], ssl.SSLContext]] = None,
+    ):
+        """
+        Args:
+            base_url: Gateway base URL. Use an ``https://`` scheme together with
+                ``ssl_context_factory`` to talk to a secured (mTLS) Gateway (SEC-048).
+            ssl_context_factory: Zero-arg callable returning a client SSLContext presenting the
+                shared client cert. Called lazily (and cached) on the first ``https`` request, so
+                certs generated *after* the API started — e.g. once the Gateway is started — are
+                picked up without an API restart. Ignored for plain ``http://``.
+        """
         self.base_url = base_url
+        self._ssl_context_factory = ssl_context_factory
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        self._is_https = base_url.lower().startswith("https://")
         self._session: Optional[aiohttp.ClientSession] = None
+        # Guards the "certs unavailable" warning so background pollers don't spam it every cycle
+        # while the Gateway is simply not started. Logged once on the transition, then suppressed
+        # until certs become available again.
+        self._certs_unavailable_warned = False
 
     @staticmethod
     def parse_network_id(network_id: str) -> tuple[str, str]:
@@ -39,12 +59,34 @@ class GatewayClient:
         default_wallet = await self.get_default_wallet_address(chain)
         if not default_wallet:
             raise ValueError(f"No wallet configured for chain '{chain}'")
+        # Skip placeholder wallet addresses (e.g., "ethereum-default-wallet", "solana-default-wallet")
+        if default_wallet.endswith("-default-wallet"):
+            raise ValueError(f"No valid wallet configured for chain '{chain}' (found placeholder: {default_wallet})")
         return default_wallet
+
+    def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Lazily build and cache the client SSLContext for https Gateways.
+
+        Deferred so certs created after startup (once the Gateway is started) are picked up.
+        Raises FileNotFoundError (from the factory) while the cert set is still absent.
+        """
+        if not self._is_https or self._ssl_context_factory is None:
+            return None
+        if self._ssl_context is None:
+            self._ssl_context = self._ssl_context_factory()
+            # Certs are now available; allow a fresh warning if they ever disappear again.
+            self._certs_unavailable_warned = False
+        return self._ssl_context
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            ssl_context = self._get_ssl_context()
+            if ssl_context is not None:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                self._session = aiohttp.ClientSession(connector=connector)
+            else:
+                self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self):
@@ -54,8 +96,21 @@ class GatewayClient:
 
     async def _request(self, method: str, path: str, params: Dict = None, json: Dict = None) -> Optional[Dict]:
         """Make HTTP request to Gateway"""
-        session = await self._get_session()
         url = f"{self.base_url}/{path}"
+
+        try:
+            session = await self._get_session()
+        except FileNotFoundError as e:
+            # https Gateway selected but the shared certs aren't available yet (Gateway not
+            # started). Return a clean error instead of crashing the caller. Warn only once on
+            # the transition so background pollers don't spam the log every cycle while the
+            # Gateway stays unstarted (a normal, optional state).
+            if not self._certs_unavailable_warned:
+                logger.warning(f"Gateway mTLS certs unavailable, cannot reach {url}: {e}")
+                self._certs_unavailable_warned = True
+            else:
+                logger.debug(f"Gateway mTLS certs still unavailable, cannot reach {url}: {e}")
+            return {"error": "Gateway client certificates not available; start the Gateway first", "status": 503}
 
         try:
             if method == "GET":
@@ -66,7 +121,7 @@ class GatewayClient:
                         return {"error": error_body, "status": response.status}
                     return await response.json()
             elif method == "POST":
-                async with session.post(url, json=json) as response:
+                async with session.post(url, params=params, json=json) as response:
                     if not response.ok:
                         error_body = await self._get_error_body(response)
                         logger.warning(f"Gateway request failed: {method} {url} - {response.status} - {error_body}")
@@ -160,41 +215,16 @@ class GatewayClient:
             "setDefault": set_default
         })
 
-    async def create_wallet(self, chain: str, set_default: bool = True) -> Dict:
-        """Create a new wallet in Gateway"""
-        return await self._request("POST", "wallet/create", json={
-            "chain": chain,
-            "setDefault": set_default
-        })
-
-    async def show_private_key(self, chain: str, address: str, passphrase: str) -> Dict:
-        """Show private key for a wallet"""
-        return await self._request("POST", "wallet/show-private-key", json={
-            "chain": chain,
-            "address": address,
-            "passphrase": passphrase
-        })
-
-    async def send_transaction(
-        self,
-        chain: str,
-        network: str,
-        address: str,
-        to_address: str,
-        amount: str
-    ) -> Dict:
-        """Send a native token transaction"""
-        return await self._request("POST", "wallet/send", json={
-            "chain": chain,
-            "network": network,
-            "address": address,
-            "toAddress": to_address,
-            "amount": amount
-        })
-
     async def remove_wallet(self, chain: str, address: str) -> Dict:
         """Remove a wallet from Gateway"""
         return await self._request("DELETE", "wallet/remove", json={
+            "chain": chain,
+            "address": address
+        })
+
+    async def set_default_wallet(self, chain: str, address: str) -> Dict:
+        """Set the default wallet for a chain in Gateway"""
+        return await self._request("POST", "wallet/setDefault", json={
             "chain": chain,
             "address": address
         })
@@ -246,11 +276,18 @@ class GatewayClient:
             "network": network
         })
 
+    async def save_token(self, chain: str, network: str, token_address: str) -> Dict:
+        """Save a token by address - auto-fetches info from GeckoTerminal"""
+        chain_network = f"{chain}-{network}"
+        return await self._request("POST", f"tokens/save/{token_address}", params={
+            "chainNetwork": chain_network
+        }, json={})
+
     async def get_config(self, namespace: str) -> Dict:
         """Get configuration for a specific namespace (connector or chain-network)"""
         return await self._request("GET", "config", params={"namespace": namespace})
 
-    async def update_config(self, namespace: str, path: str, value: any) -> Dict:
+    async def update_config(self, namespace: str, path: str, value: Any) -> Dict:
         """Update a configuration value for a namespace"""
         return await self._request("POST", "config/update", json={
             "namespace": namespace,
@@ -258,18 +295,58 @@ class GatewayClient:
             "value": value
         })
 
-    async def get_pools(self, connector: str, network: str) -> List[Dict]:
-        """Get pools for a connector and network"""
-        return await self._request("GET", "pools", params={
-            "connector": connector,
+    async def get_api_keys(self) -> Dict:
+        """Get all configured API keys from Gateway"""
+        return await self._request("GET", "config", params={"namespace": "apiKeys"})
+
+    async def update_api_keys(self, api_keys: Dict[str, str]) -> List[Dict]:
+        """
+        Update API keys in Gateway configuration.
+
+        Args:
+            api_keys: Dict mapping provider name to API key value
+                     (e.g., {"helius": "abc123", "infura": "xyz789"})
+
+        Returns:
+            List of results for each API key update
+        """
+        results = []
+        for provider, api_key in api_keys.items():
+            result = await self._request("POST", "config/update", json={
+                "namespace": "apiKeys",
+                "path": provider,
+                "value": api_key
+            })
+            results.append(result)
+        return results
+
+    async def get_pools(
+        self,
+        chain: str,
+        network: str,
+        connector: Optional[str] = None,
+        pool_type: Optional[str] = None,
+        search: Optional[str] = None
+    ) -> List[Dict]:
+        """Get pools for a chain and network with optional filtering"""
+        params = {
+            "chain": chain,
             "network": network
-        })
+        }
+        if connector:
+            params["connector"] = connector
+        if pool_type:
+            params["type"] = pool_type.lower()
+        if search:
+            params["search"] = search
+        return await self._request("GET", "pools", params=params)
 
     async def add_pool(
         self,
+        chain: str,
+        network: str,
         connector: str,
         pool_type: str,
-        network: str,
         address: str,
         base_symbol: str,
         quote_symbol: str,
@@ -279,6 +356,7 @@ class GatewayClient:
     ) -> Dict:
         """Add a new pool"""
         payload = {
+            "chain": chain,
             "connector": connector,
             "type": pool_type.lower(),  # Gateway expects lowercase (amm, clmm)
             "network": network,
@@ -292,12 +370,17 @@ class GatewayClient:
             payload["feePct"] = fee_pct
         return await self._request("POST", "pools", json=payload)
 
-    async def delete_pool(self, connector: str, network: str, pool_type: str, address: str) -> Dict:
+    async def save_pool(self, chain_network: str, address: str) -> Dict:
+        """Save a pool by address using GeckoTerminal lookup"""
+        return await self._request("POST", f"pools/save/{address}", params={
+            "chainNetwork": chain_network
+        }, json={})
+
+    async def delete_pool(self, chain: str, network: str, address: str) -> Dict:
         """Delete a pool from Gateway's pool list"""
         return await self._request("DELETE", f"pools/{address}", params={
-            "connector": connector,
-            "network": network,
-            "type": pool_type.lower()  # Gateway expects lowercase (amm, clmm)
+            "chain": chain,
+            "network": network
         })
 
     async def pool_info(self, connector: str, network: str, pool_address: str) -> Dict:
@@ -572,7 +655,6 @@ class GatewayClient:
         self,
         network_id: str,
         tx_hash: str,
-        wallet_address: Optional[str] = None
     ) -> Optional[Dict]:
         """
         Poll transaction status on blockchain.
@@ -580,12 +662,12 @@ class GatewayClient:
         Args:
             network_id: Network ID in format 'chain-network' (e.g., 'solana-mainnet-beta', 'ethereum-mainnet')
             tx_hash: Transaction hash/signature
-            wallet_address: Optional wallet address for verification
 
         Returns:
             Transaction status dict with fields:
-            - txStatus: 1 for confirmed, 0 for failed/pending
+            - txStatus: 1 for confirmed, 0 for pending, -1 for failed
             - fee: Transaction fee amount
+            - error: Parsed error message if transaction failed (e.g., "SLIPPAGE_EXCEEDED (0x1771): ...")
             - txData: Full transaction data including meta.err
             Returns None if Gateway is unavailable or request fails.
         """
@@ -602,11 +684,8 @@ class GatewayClient:
                 "network": network,
                 "signature": tx_hash
             }
-            if wallet_address:
-                payload["walletAddress"] = wallet_address
 
             return await self._request("POST", f"chains/{chain}/poll", json=payload)
         except Exception as e:
             logger.error(f"Error polling transaction {tx_hash}: {e}")
             return None
-

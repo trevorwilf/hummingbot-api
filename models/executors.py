@@ -31,6 +31,7 @@ class PositionHold(BaseModel):
     trading_pair: str = Field(description="Trading pair (e.g., 'BTC-USDT')")
     connector_name: str = Field(description="Connector name")
     account_name: str = Field(description="Account name")
+    controller_id: str = Field(default="main", description="Controller that owns this position")
 
     # Buy side tracking
     buy_amount_base: Decimal = Field(default=Decimal("0"), description="Total bought amount in base currency")
@@ -42,6 +43,9 @@ class PositionHold(BaseModel):
 
     # Realized PnL from matched positions
     realized_pnl_quote: Decimal = Field(default=Decimal("0"), description="Realized PnL from matched buy/sell pairs")
+
+    # Cumulative fees
+    cum_fees_quote: Decimal = Field(default=Decimal("0"), description="Cumulative fees paid in quote currency")
 
     # Tracking
     executor_ids: List[str] = Field(default_factory=list, description="IDs of executors contributing to this position")
@@ -96,7 +100,8 @@ class PositionHold(BaseModel):
         side: str,
         amount_base: Decimal,
         amount_quote: Decimal,
-        executor_id: Optional[str] = None
+        executor_id: Optional[str] = None,
+        fees_quote: Decimal = Decimal("0")
     ):
         """
         Add a fill to the position tracking.
@@ -106,6 +111,7 @@ class PositionHold(BaseModel):
             amount_base: Amount in base currency
             amount_quote: Amount in quote currency
             executor_id: Optional executor ID to track
+            fees_quote: Fees paid for this fill in quote currency
         """
         if side.upper() == "BUY":
             self.buy_amount_base += amount_base
@@ -113,6 +119,8 @@ class PositionHold(BaseModel):
         else:
             self.sell_amount_base += amount_base
             self.sell_amount_quote += amount_quote
+
+        self.cum_fees_quote += fees_quote
 
         # Calculate realized PnL when we have matched volume
         self._calculate_realized_pnl()
@@ -123,24 +131,36 @@ class PositionHold(BaseModel):
         self.last_updated = datetime.utcnow()
 
     def _calculate_realized_pnl(self):
-        """Calculate realized PnL from matched buy/sell pairs using FIFO."""
-        matched = self.matched_amount_base
+        """Calculate realized PnL from matched buy/sell pairs and settle matched volume.
+
+        After settling, only the unmatched (open) position remains, so breakeven
+        prices always reflect the current position, not historical closed trades.
+        """
+        matched = min(self.buy_amount_base, self.sell_amount_base)
         if matched > 0 and self.buy_amount_base > 0 and self.sell_amount_base > 0:
-            # Average prices
+            # Average prices before settlement
             avg_buy = self.buy_amount_quote / self.buy_amount_base
             avg_sell = self.sell_amount_quote / self.sell_amount_base
             # Realized PnL = matched_amount * (avg_sell - avg_buy)
-            self.realized_pnl_quote = matched * (avg_sell - avg_buy)
+            self.realized_pnl_quote += matched * (avg_sell - avg_buy)
+
+            # Settle matched volume: remove it from both sides
+            self.buy_amount_base -= matched
+            self.buy_amount_quote -= matched * avg_buy
+            self.sell_amount_base -= matched
+            self.sell_amount_quote -= matched * avg_sell
 
     def get_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """
-        Calculate unrealized PnL for unmatched position.
+        Calculate unrealized PnL for unmatched position (raw price movement).
+
+        Fees are tracked separately in cum_fees_quote.
 
         Args:
             current_price: Current market price
 
         Returns:
-            Unrealized PnL in quote currency
+            Unrealized PnL in quote currency (before fees)
         """
         if self.net_amount_base > 0:
             # Long position: profit if price goes up
@@ -158,6 +178,7 @@ class PositionHold(BaseModel):
         self.buy_amount_quote += other.buy_amount_quote
         self.sell_amount_base += other.sell_amount_base
         self.sell_amount_quote += other.sell_amount_quote
+        self.cum_fees_quote += other.cum_fees_quote
 
         for eid in other.executor_ids:
             if eid not in self.executor_ids:
@@ -172,6 +193,7 @@ class PositionHoldResponse(BaseModel):
     trading_pair: str
     connector_name: str
     account_name: str
+    controller_id: str = Field(default="main", description="Controller that owns this position")
     buy_amount_base: float
     buy_amount_quote: float
     sell_amount_base: float
@@ -183,6 +205,7 @@ class PositionHoldResponse(BaseModel):
     unmatched_amount_base: float
     position_side: Optional[str]
     realized_pnl_quote: float
+    cum_fees_quote: float = 0.0
     unrealized_pnl_quote: Optional[float] = None
     executor_count: int
     executor_ids: List[str]
@@ -211,7 +234,7 @@ EXECUTOR_TYPES = Literal[
     "twap_executor",
     "xemm_executor",
     "order_executor",
-    "lp_executor"
+    "lp_executor",
 ]
 
 
@@ -246,21 +269,20 @@ class CreateExecutorRequest(BaseModel):
                 },
                 {
                     "summary": "LP Executor",
-                    "description": "Create an LP position on a CLMM DEX (Meteora, Raydium)",
+                    "description": "Create an LP position on a CLMM DEX",
                     "value": {
                         "account_name": "master_account",
                         "executor_config": {
                             "type": "lp_executor",
-                            "connector_name": "meteora/clmm",
+                            "connector_name": "solana-mainnet-beta",
+                            "lp_provider": "meteora/clmm",
                             "trading_pair": "SOL-USDC",
                             "pool_address": "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR",
                             "lower_price": "80",
                             "upper_price": "100",
                             "base_amount": "0",
                             "quote_amount": "10.0",
-                            "side": 1,
-                            "auto_close_above_range_seconds": None,
-                            "auto_close_below_range_seconds": 300,
+                            "side": "BUY",
                             "extra_params": {"strategyType": 0},
                             "keep_position": False
                         }
@@ -273,6 +295,10 @@ class CreateExecutorRequest(BaseModel):
     account_name: Optional[str] = Field(
         None,
         description="Account name to use (defaults to master_account)"
+    )
+    controller_id: str = Field(
+        default="main",
+        description="Controller ID that owns this executor (for per-agent isolation)"
     )
     executor_config: Dict[str, Any] = Field(
         ...,
@@ -309,6 +335,10 @@ class ExecutorFilterRequest(PaginationParams):
     status: Optional[str] = Field(
         None,
         description="Filter by status (RUNNING, TERMINATED, etc.)"
+    )
+    controller_ids: Optional[List[str]] = Field(
+        None,
+        description="Filter by controller IDs"
     )
 
 
@@ -383,6 +413,7 @@ class CreateExecutorResponse(BaseModel):
     executor_type: str = Field(description="Type of executor created")
     connector_name: str = Field(description="Connector name")
     trading_pair: str = Field(description="Trading pair")
+    controller_id: str = Field(default="main", description="Controller that owns this executor")
     status: str = Field(description="Initial status")
     created_at: str = Field(description="Creation timestamp (ISO format)")
 
@@ -415,6 +446,34 @@ class ExecutorsSummaryResponse(BaseModel):
     by_type: Dict[str, int] = Field(description="Executor count by type")
     by_connector: Dict[str, int] = Field(description="Executor count by connector")
     by_status: Dict[str, int] = Field(description="Executor count by status")
+
+
+class ExecutorTypeBreakdown(BaseModel):
+    """Performance breakdown for a single executor type."""
+    executor_type: str = Field(description="Executor type name")
+    total: int = Field(description="Total executors of this type")
+    completed: int = Field(description="Completed executors")
+    running: int = Field(description="Currently running executors")
+    pnl_quote: float = Field(description="Net PnL in quote currency")
+    volume_quote: float = Field(description="Total filled volume in quote currency")
+    fees_quote: float = Field(description="Cumulative fees in quote currency")
+
+
+class PerformanceReportResponse(BaseModel):
+    """Performance report for executors, optionally filtered by controller_id."""
+    controller_id: Optional[str] = Field(None, description="Controller ID filter (None = all)")
+    total_executors: int = Field(description="Total executor count")
+    by_status: Dict[str, int] = Field(description="Executor count by status")
+    pnl_total_quote: float = Field(description="Realized PnL from completed executors in quote currency")
+    unrealized_pnl_quote: float = Field(description="Unrealized PnL from active executors and position holds")
+    global_pnl_quote: float = Field(description="Global PnL (realized + unrealized)")
+    pnl_pct_avg: float = Field(description="Average PnL percentage across completed executors")
+    fees_total_quote: float = Field(description="Total cumulative fees in quote currency")
+    volume_total_quote: float = Field(description="Total filled volume in quote currency")
+    win_rate: float = Field(description="Win rate: fraction of completed executors with positive PnL")
+    sharpe_ratio: Optional[float] = Field(None, description="Sharpe ratio of PnL returns (null if <2 executors)")
+    by_type: List[ExecutorTypeBreakdown] = Field(description="Performance breakdown by executor type")
+    active_positions: int = Field(description="Number of active position holds")
 
 
 class ExecutorLogEntry(BaseModel):

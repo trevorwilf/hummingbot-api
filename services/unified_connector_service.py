@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map, get_connector_class
@@ -22,11 +22,10 @@ from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.connector_metrics_collector import TradeVolumeMetricCollector
 from hummingbot.connector.exchange_py_base import ExchangePyBase
-from hummingbot.connector.gateway.gateway_lp import GatewayLp
+from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
 from utils.file_system import fs_util
@@ -64,8 +63,8 @@ class UnifiedConnectorService:
         self._data_connectors_started: Dict[str, bool] = {}
 
         # Order and funding recorders (for trading connectors)
-        self._orders_recorders: Dict[str, any] = {}
-        self._funding_recorders: Dict[str, any] = {}
+        self._orders_recorders: Dict[str, Any] = {}
+        self._funding_recorders: Dict[str, Any] = {}
         self._metrics_collectors: Dict[str, TradeVolumeMetricCollector] = {}
 
         # Locks to prevent race conditions in connector creation
@@ -73,6 +72,14 @@ class UnifiedConnectorService:
 
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
+
+        # Rate provider for trade-volume telemetry (set to MarketDataService by main on startup).
+        # Exposes get_pair_rate(pair) -> Decimal, the RateOracle-compatible interface.
+        self._rate_provider = None
+
+    def set_rate_provider(self, rate_provider):
+        """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
+        self._rate_provider = rate_provider
 
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a perpetual derivative connector.
@@ -635,21 +642,21 @@ class UnifiedConnectorService:
     ) -> ConnectorBase:
         """Create a trading connector with API keys.
 
-        For gateway connectors (containing '/'), creates a GatewayLp connector
-        which auto-detects chain/network and uses the default wallet.
+        For Gateway network connectors (e.g., 'solana-mainnet-beta'), creates a unified
+        Gateway connector which auto-detects chain/network and uses the default wallet.
+        The dex_name and trading_type are passed to methods, not to the connector.
         """
         BackendAPISecurity.login_account(
             account_name=account_name,
             secrets_manager=self.secrets_manager
         )
 
-        # Gateway connectors (e.g., 'meteora/clmm', 'raydium/clmm') are not in AllConnectorSettings
-        # They use GatewayLp which auto-detects chain/network from gateway config
-        if '/' in connector_name:
-            logger.info(f"Creating gateway connector: {connector_name}")
-            # GatewayLp handles chain/network auto-detection and default wallet lookup
-            # via start_network() call
-            return GatewayLp(
+        # Check if this is a Gateway network connector
+        # Gateway connectors are NOT in AllConnectorSettings (those are exchange connectors)
+        # Network format: "chain-network" (e.g., "solana-mainnet-beta", "ethereum-mainnet")
+        if connector_name not in self._conn_settings:
+            logger.info(f"Creating Gateway connector for network: {connector_name}")
+            return Gateway(
                 connector_name=connector_name,
                 trading_pairs=[],
                 trading_required=True,
@@ -767,6 +774,19 @@ class UnifiedConnectorService:
         # For gateway connectors, call stop_network()
         if hasattr(connector, 'stop_network'):
             await connector.stop_network()
+
+    async def refresh_connector_state(
+        self,
+        connector: ConnectorBase,
+        connector_name: str,
+        account_name: str = None
+    ):
+        """Public API to refresh a single connector's state (balances, positions, orders).
+
+        Delegates to the internal _update_connector_state implementation so callers
+        in sibling services don't depend on the underscore-prefixed helper.
+        """
+        await self._update_connector_state(connector, connector_name, account_name)
 
     async def _update_connector_state(
         self,
@@ -886,33 +906,144 @@ class UnifiedConnectorService:
         if not self.db_manager:
             return
 
+        from database import OrderRepository
+
         terminal_states = [
             OrderState.FILLED, OrderState.CANCELED,
             OrderState.FAILED, OrderState.COMPLETED
         ]
         orders_to_remove = []
 
-        for client_order_id, order in list(connector.in_flight_orders.items()):
-            try:
-                from database import OrderRepository
+        try:
+            # Single session/transaction per connector: one SELECT per order and one commit on context exit.
+            async with self.db_manager.get_session_context() as session:
+                order_repo = OrderRepository(session)
 
-                async with self.db_manager.get_session_context() as session:
-                    order_repo = OrderRepository(session)
-                    db_order = await order_repo.get_order_by_client_id(client_order_id)
+                for client_order_id, order in list(connector.in_flight_orders.items()):
+                    try:
+                        db_order = await order_repo.get_order_by_client_id(client_order_id)
 
-                    if db_order:
-                        new_status = self._map_order_state_to_status(order.current_state)
-                        if db_order.status != new_status:
-                            await order_repo.update_order_status(client_order_id, new_status)
+                        if db_order:
+                            new_status = self._map_order_state_to_status(order.current_state)
+                            if db_order.status != new_status:
+                                db_order.status = new_status
+                                await session.flush()
 
-                    if order.current_state in terminal_states:
-                        orders_to_remove.append(client_order_id)
+                        if order.current_state in terminal_states:
+                            orders_to_remove.append(client_order_id)
 
-            except Exception as e:
-                logger.error(f"Error syncing order {client_order_id}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error syncing order {client_order_id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error syncing orders for {account_name}/{connector_name}: {e}")
 
         for order_id in orders_to_remove:
             connector.in_flight_orders.pop(order_id, None)
+
+    @staticmethod
+    def _supports_order_status_query(connector: ConnectorBase) -> bool:
+        """Whether a connector can be asked the real state of a single order."""
+        return (
+            hasattr(connector, "_request_order_status")
+            and hasattr(connector, "_is_order_not_found_during_status_update_error")
+            and hasattr(connector, "in_flight_orders")
+        )
+
+    async def reconcile_active_orders(self) -> Dict[str, int]:
+        """Reconcile persisted active orders against the exchange on startup.
+
+        Must be called AFTER ``initialize_all_trading_connectors`` so that each
+        connector's persisted active orders have been reloaded into
+        ``in_flight_orders``. For every tracked order we ask the exchange for its
+        real state (``_request_order_status``) and:
+
+        - **Confirmed terminal** (filled/cancelled/failed) -> update the DB to the
+          real status and drop it from tracking.
+        - **Confirmed not found** on the exchange -> mark it CANCELLED in the DB
+          (it no longer exists) and drop it from tracking.
+        - **Still open** -> sync the DB to the live state and KEEP it tracked, so
+          it remains visible and cancelable via the trading endpoints.
+        - **Unverifiable** (transient error, or the connector isn't available)
+          -> leave the order untouched. We never mark an order terminal unless
+          the exchange confirms it, so a connector that failed to start can never
+          cause a live order to be falsely reported as cancelled.
+
+        Returns a summary dict with counts for logging/telemetry.
+        """
+        summary = {"reconciled_terminal": 0, "still_open": 0, "unverified": 0, "skipped_connectors": 0}
+        if not self.db_manager:
+            return summary
+
+        terminal_states = {
+            OrderState.FILLED, OrderState.CANCELED,
+            OrderState.FAILED, OrderState.COMPLETED,
+        }
+
+        from database import OrderRepository
+
+        for account_name, connectors in self._trading_connectors.items():
+            for connector_name, connector in connectors.items():
+                if not self._supports_order_status_query(connector) or not connector.in_flight_orders:
+                    continue
+
+                # Snapshot tracked orders (the set was loaded from the DB at init).
+                tracked_orders = list(connector.in_flight_orders.values())
+                # Single session/transaction per connector: every reconciled status update is
+                # flushed into one shared session and committed once on context exit. Each
+                # order's write runs inside its own savepoint so a SQLAlchemy error on one
+                # order is rolled back in isolation and does not poison the rest.
+                async with self.db_manager.get_session_context() as session:
+                    order_repo = OrderRepository(session)
+                    for order in tracked_orders:
+                        client_order_id = order.client_order_id
+                        note = None
+                        try:
+                            order_update = await connector._request_order_status(order)
+                            new_state = order_update.new_state
+                        except Exception as exc:
+                            if connector._is_order_not_found_during_status_update_error(exc):
+                                # The exchange does not know this order -> it is gone.
+                                new_state = OrderState.CANCELED
+                                note = "Reconciled on startup: order not found on exchange"
+                            else:
+                                # Transient/unknown error - do not touch the order.
+                                logger.warning(
+                                    f"Could not verify order {client_order_id} on "
+                                    f"{account_name}/{connector_name}: {exc}"
+                                )
+                                summary["unverified"] += 1
+                                continue
+
+                        db_status = self._map_order_state_to_status(new_state)
+                        try:
+                            async with session.begin_nested():
+                                await order_repo.update_order_status(
+                                    client_order_id=client_order_id,
+                                    status=db_status,
+                                    error_message=note,
+                                )
+                        except Exception as exc:
+                            # Savepoint rolled back: this order failed to persist but the
+                            # session stays usable for the remaining orders.
+                            logger.error(f"Failed to persist reconciled order {client_order_id}: {exc}")
+                            summary["unverified"] += 1
+                            continue
+
+                        if new_state in terminal_states:
+                            connector.in_flight_orders.pop(client_order_id, None)
+                            summary["reconciled_terminal"] += 1
+                        else:
+                            # Keep tracking so it stays cancelable via the trading endpoints.
+                            summary["still_open"] += 1
+
+        logger.info(
+            "Order reconciliation complete: "
+            f"{summary['reconciled_terminal']} closed, "
+            f"{summary['still_open']} still open (re-tracked), "
+            f"{summary['unverified']} unverified"
+        )
+        return summary
 
     async def sync_all_orders_to_database(self):
         """
@@ -921,15 +1052,21 @@ class UnifiedConnectorService:
         The connector's built-in polling already updates in_flight_orders from the exchange.
         This method syncs that state to our database and cleans up closed orders.
         """
+        tasks = []
+        task_keys = []
         for account_name, connectors in self._trading_connectors.items():
             for connector_name, connector in connectors.items():
-                try:
-                    if not connector.in_flight_orders:
-                        continue
-                    await self._sync_orders_to_database(connector, account_name, connector_name)
-                    logger.debug(f"Synced order state to DB for {account_name}/{connector_name}")
-                except Exception as e:
-                    logger.error(f"Error syncing order state for {account_name}/{connector_name}: {e}")
+                if not connector.in_flight_orders:
+                    continue
+                tasks.append(self._sync_orders_to_database(connector, account_name, connector_name))
+                task_keys.append(f"{account_name}/{connector_name}")
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for key, result in zip(task_keys, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error syncing order state for {key}: {result}")
+                else:
+                    logger.debug(f"Synced order state to DB for {key}")
 
     def _convert_db_order_to_in_flight(self, order_record) -> InFlightOrder:
         """Convert database order to InFlightOrder."""
@@ -1016,7 +1153,10 @@ class UnifiedConnectorService:
 
         try:
             instance_id = f"{account_name}_hbotapi"
-            rate_provider = RateOracle.get_instance()
+            rate_provider = self._rate_provider
+            if rate_provider is None:
+                logger.debug(f"No rate provider set, skipping trade-volume metrics for {connector_name}")
+                return
 
             metrics_collector = TradeVolumeMetricCollector(
                 connector=connector,

@@ -12,6 +12,7 @@ from docker.types import LogConfig
 from config import settings
 from models import V2ControllerDeployment
 from utils.file_system import fs_util
+from utils.gateway_certs import ensure_gateway_certs, gateway_certs_dir
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
@@ -190,17 +191,33 @@ class DockerService:
         except DockerException as e:
             return {"success": False, "message": str(e)}
 
+    @staticmethod
+    def _ensure_contained(path: str, base_dir: str, label: str):
+        """
+        Defense in depth: verify that `path` stays inside `base_dir` after resolving symlinks and
+        traversal sequences. Raises ValueError if it escapes the allowed base directory.
+        """
+        resolved_base = os.path.realpath(base_dir)
+        resolved_path = os.path.realpath(path)
+        if os.path.commonpath([resolved_base, resolved_path]) != resolved_base:
+            raise ValueError(f"Invalid {label}: '{path}' resolves outside of '{base_dir}'.")
+        return resolved_path
+
     def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
         instance_dir = os.path.join("bots", 'instances', instance_name)
+        # Defense in depth: ensure the resolved paths stay within their allowed base directories
+        # before any filesystem mutation (makedirs/copytree) takes place.
+        self._ensure_contained(instance_dir, os.path.join("bots", "instances"), "instance_name")
+        source_credentials_dir = os.path.join("bots", 'credentials', config.credentials_profile)
+        self._ensure_contained(source_credentials_dir, os.path.join("bots", "credentials"), "credentials_profile")
         if not os.path.exists(instance_dir):
             os.makedirs(instance_dir)
             os.makedirs(os.path.join(instance_dir, 'data'))
             os.makedirs(os.path.join(instance_dir, 'logs'))
 
         # Copy credentials to instance directory
-        source_credentials_dir = os.path.join("bots", 'credentials', config.credentials_profile)
         destination_credentials_dir = os.path.join(instance_dir, 'conf')
 
         # Remove the destination directory if it already exists
@@ -259,6 +276,21 @@ class DockerService:
         conf_file_path = f"instances/{instance_name}/conf/conf_client.yml"
         client_config = fs_util.read_yaml_file(conf_file_path)
         client_config['instance_id'] = instance_name
+
+        # SEC-048: point the instance at the secured (mTLS) Gateway and give it the shared
+        # cert set. Cert keys are decrypted inside the container with CONFIG_PASSWORD, so this
+        # is only enabled when a config password is set. Generation is idempotent: the instance
+        # reuses (or seeds) the same CA the Gateway uses.
+        gateway_certs_host_dir = None
+        if settings.security.config_password:
+            # Generate/locate the shared cert set (written to the local-base dir) and resolve the
+            # matching HOST path for the bind-mount source.
+            ensure_gateway_certs(settings.security.config_password)
+            gateway_certs_host_dir = gateway_certs_dir(host=True)
+            gateway_section = client_config.get('gateway') or {}
+            gateway_section['gateway_use_ssl'] = True
+            client_config['gateway'] = gateway_section
+
         fs_util.dump_dict_to_yaml(conf_file_path, client_config)
 
         # Set up Docker volumes
@@ -281,6 +313,11 @@ class DockerService:
             shared_scripts: {'bind': '/home/hummingbot/scripts', 'mode': 'rw'},
             shared_controllers: {'bind': '/home/hummingbot/controllers', 'mode': 'rw'},
         }
+
+        # SEC-048: mount the shared mTLS certs read-only where hummingbot reads them
+        # (root_path()/certs == /home/hummingbot/certs inside the instance container).
+        if gateway_certs_host_dir:
+            volumes[gateway_certs_host_dir] = {'bind': '/home/hummingbot/certs', 'mode': 'ro'}
 
         # Set up environment variables
         environment = {}

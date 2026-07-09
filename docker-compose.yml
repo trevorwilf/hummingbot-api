@@ -7,13 +7,32 @@ services:
     volumes:
       - ./bots:/hummingbot-api/bots
       - /var/run/docker.sock:/var/run/docker.sock
+      # Host metrics: mount the host's /proc read-only so the /system/resources
+      # route reports HOST CPU/RAM/load instead of the container's.
+      - /proc:/host/proc:ro
+      # Disk usage probe: psutil.disk_usage() only stats the filesystem CONTAINING
+      # this path, so a single non-sensitive host file on the root partition yields
+      # the host root disk totals without exposing the host filesystem tree.
+      - /etc/hostname:/host/disk-probe:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     env_file:
       - .env
     environment:
       # Override specific values for Docker networking
       - BROKER_HOST=emqx
       - DATABASE_URL=postgresql+asyncpg://hbot:hummingbot-api@postgres:5432/hummingbot_api
-      - GATEWAY_URL=http://host.docker.internal:15888
+      # SEC-048: reach the secured Gateway container-to-container over the shared emqx-bridge
+      # network (the Gateway container is attached to it on start). https + the 'gateway' cert SAN.
+      # Note: the Gateway's host publish is bound to 127.0.0.1, so host.docker.internal can no
+      # longer reach it — the in-network container name is the correct (and more secure) path.
+      - GATEWAY_URL=https://gateway:15888
+      # Point psutil at the mounted host paths (see volumes above)
+      - HOST_PROC=/host/proc
+      - HOST_DISK_PATH=/host/disk-probe
     extra_hosts:
       # Map host.docker.internal to host gateway for Linux compatibility
       # On macOS/Windows, Docker Desktop provides this automatically

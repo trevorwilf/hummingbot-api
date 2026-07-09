@@ -16,10 +16,12 @@ dependencies:
   - pandas-ta>=0.4.71b
   - ta-lib>=0.6.4
   - tqdm>=4.67.1
+  - psutil>=5.9.0
   - docker-py
   - pip
   - pip:
       - hummingbot
+      - geckoterminal-py>=0.3.1
       - msgpack>=1.0.5
       - flake8
       - isort

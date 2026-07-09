@@ -1,17 +1,26 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import List, Optional
 
+from pydantic import BaseModel, Field
 
 # ============================================
 # Container Management Models
 # ============================================
 
+
 class GatewayConfig(BaseModel):
-    """Configuration for Gateway container deployment"""
-    passphrase: str = Field(description="Gateway passphrase for configuration encryption")
+    """Configuration for Gateway container deployment.
+
+    The Gateway always runs secured (TLS + mTLS); there is intentionally no ``dev_mode`` and no
+    ``passphrase`` field (SEC-048):
+    - A Gateway that holds wallet keys must never be served over plain HTTP, so the API does not
+      support a dev/insecure mode.
+    - The Gateway (v2.x) uses a single ``GATEWAY_PASSPHRASE`` for *both* TLS cert-key decryption
+      and wallet encryption, and the shared mTLS cert set must be decryptable by this API's
+      clients (which use ``CONFIG_PASSWORD``). The passphrase is therefore always
+      ``CONFIG_PASSWORD``; a separate value would only break the API<->Gateway mTLS chain.
+    """
     image: str = Field(default="hummingbot/gateway:latest", description="Docker image for Gateway")
     port: int = Field(default=15888, description="Port for Gateway API")
-    dev_mode: bool = Field(default=True, description="Enable development mode")
 
 
 class GatewayStatus(BaseModel):
@@ -27,33 +36,11 @@ class GatewayStatus(BaseModel):
 # Wallet Management Models
 # ============================================
 
-class CreateWalletRequest(BaseModel):
-    """Request to create a new wallet in Gateway"""
-    chain: str = Field(description="Blockchain chain (e.g., 'solana', 'ethereum')")
-    set_default: bool = Field(default=True, description="Set as default wallet for this chain")
-
-
-class ShowPrivateKeyRequest(BaseModel):
-    """Request to show private key for a wallet"""
-    chain: str = Field(description="Blockchain chain (e.g., 'solana', 'ethereum')")
-    address: str = Field(description="Wallet address")
-    passphrase: str = Field(description="Gateway passphrase for decryption")
-
-
-class SendTransactionRequest(BaseModel):
-    """Request to send a native token transaction"""
-    chain: str = Field(description="Blockchain chain (e.g., 'solana', 'ethereum')")
-    network: str = Field(description="Network (e.g., 'mainnet-beta', 'mainnet')")
-    address: str = Field(description="Sender wallet address")
-    to_address: str = Field(description="Recipient address")
-    amount: str = Field(description="Amount to send (in native token units)")
-
-
 class GatewayWalletCredential(BaseModel):
-    """Credentials for connecting a Gateway wallet"""
+    """Credentials for adding an existing wallet to Gateway"""
     chain: str = Field(description="Blockchain chain (e.g., 'solana', 'ethereum')")
     private_key: str = Field(description="Wallet private key")
-    network: Optional[str] = Field(default=None, description="Network to use (defaults to chain's default)")
+    set_default: bool = Field(default=True, description="Set as default wallet for this chain")
 
 
 class GatewayWalletInfo(BaseModel):
@@ -61,6 +48,12 @@ class GatewayWalletInfo(BaseModel):
     chain: str = Field(description="Blockchain chain")
     address: str = Field(description="Wallet address")
     network: str = Field(description="Network the wallet is configured for")
+
+
+class SetDefaultWalletRequest(BaseModel):
+    """Request to set the default wallet for a chain"""
+    chain: str = Field(description="Blockchain chain (e.g., 'solana', 'ethereum')")
+    address: str = Field(description="Wallet address to set as default")
 
 
 # ============================================
@@ -71,7 +64,10 @@ class AddPoolRequest(BaseModel):
     """Request to add a liquidity pool"""
     connector_name: str = Field(description="DEX connector name (e.g., 'raydium', 'meteora')")
     type: str = Field(description="Pool type ('clmm' or 'amm')")
-    network: str = Field(description="Network name (e.g., 'mainnet-beta')")
+    network: Optional[str] = Field(
+        default=None,
+        description="Network name (e.g., 'mainnet-beta') - optional for /networks/{network_id}/pools"
+    )
     address: str = Field(description="Pool contract address")
     base: str = Field(description="Base token symbol")
     quote: str = Field(description="Quote token symbol")
@@ -97,3 +93,14 @@ class GatewayBalanceRequest(BaseModel):
     account_name: str = Field(description="Account name")
     chain: str = Field(description="Blockchain chain")
     tokens: Optional[List[str]] = Field(default=None, description="List of token symbols to query (optional)")
+
+
+# ============================================
+# API Keys Management Models
+# ============================================
+
+class UpdateApiKeysRequest(BaseModel):
+    """Request to update Gateway API keys"""
+    api_keys: dict = Field(
+        description="Dict mapping provider name to API key value (e.g., {'helius': 'abc123', 'infura': 'xyz789'})"
+    )

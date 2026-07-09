@@ -1,6 +1,28 @@
+import re
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Safe single path component names: prevents path traversal via '/', '\' or '..'.
+# Mirrors services.accounts_service.SAFE_NAME_PATTERN (replicated locally to avoid a
+# heavy/circular import of accounts_service into the model layer).
+SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_safe_name(name: str, label: str) -> str:
+    """Validate that a name is safe to use as a single path component (no separators or traversal sequences)."""
+    if not name or not SAFE_NAME_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"Invalid {label}: '{name}'. Only letters, numbers, underscores and hyphens are allowed."
+        )
+    return name
+
+
+def _validate_safe_config_name(name: str, label: str) -> str:
+    """Validate a config file name, ignoring an optional .yml extension before checking the base name."""
+    base_name = name[:-4] if name.endswith(".yml") else name
+    _validate_safe_name(base_name, label)
+    return name
 
 
 class BotAction(BaseModel):
@@ -94,6 +116,33 @@ class StopAndArchiveResponse(BaseModel):
 
 
 # Bot deployment models
+class V2ScriptDeployment(BaseModel):
+    """Configuration for deploying a bot with a script"""
+    instance_name: str = Field(description="Unique name for the bot instance")
+    credentials_profile: str = Field(description="Name of the credentials profile to use")
+    image: str = Field(default="hummingbot/hummingbot:latest", description="Docker image for the Hummingbot instance")
+    script: Optional[str] = Field(default=None, description="Script name to run (without .py extension)")
+    script_config: Optional[str] = Field(default=None, description="Script configuration file name (without .yml extension)")
+    headless: bool = Field(default=False, description="Run in headless mode (no UI)")
+
+    @field_validator("instance_name")
+    @classmethod
+    def _validate_instance_name(cls, v: str) -> str:
+        return _validate_safe_name(v, "instance_name")
+
+    @field_validator("credentials_profile")
+    @classmethod
+    def _validate_credentials_profile(cls, v: str) -> str:
+        return _validate_safe_name(v, "credentials_profile")
+
+    @field_validator("script_config")
+    @classmethod
+    def _validate_script_config(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_safe_config_name(v, "script_config")
+
+
 class V2ControllerDeployment(BaseModel):
     """Configuration for deploying a bot with controllers"""
     instance_name: str = Field(description="Unique name for the bot instance")
@@ -110,3 +159,25 @@ class V2ControllerDeployment(BaseModel):
     image: str = Field(default="hummingbot/hummingbot:latest", description="Docker image for the Hummingbot instance")
     script_config: Optional[str] = Field(default=None, description="Generated script configuration file name")
     headless: bool = Field(default=False, description="Run in headless mode (no UI)")
+
+    @field_validator("instance_name")
+    @classmethod
+    def _validate_instance_name(cls, v: str) -> str:
+        return _validate_safe_name(v, "instance_name")
+
+    @field_validator("credentials_profile")
+    @classmethod
+    def _validate_credentials_profile(cls, v: str) -> str:
+        return _validate_safe_name(v, "credentials_profile")
+
+    @field_validator("controllers_config")
+    @classmethod
+    def _validate_controllers_config(cls, v: List[str]) -> List[str]:
+        return [_validate_safe_config_name(controller, "controllers_config") for controller in v]
+
+    @field_validator("script_config")
+    @classmethod
+    def _validate_script_config(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_safe_config_name(v, "script_config")
