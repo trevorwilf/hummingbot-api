@@ -20,9 +20,11 @@ Paths use ``pathlib`` throughout — prod is Linux, dev is Windows.
 """
 
 import fnmatch
+import hashlib
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -1208,3 +1210,312 @@ async def run_guards(
         len(report.warnings),
     )
     return report
+
+
+# ===========================================================================
+# Phase 5 — Hook orchestration (design §3/§4, §10.6, §12, §13)
+# ===========================================================================
+#
+# ``seed_resume_state`` is the single entry point wired into
+# ``docker_service.create_hummingbot_instance``: it runs after config staging
+# and strictly before ``containers.run``, and chains the P2/P4/P3 pieces:
+# resolve → guards → copy plan → file-level copies → config-drift diff →
+# ``data/resume.manifest.json`` → structured events. On any ``ResumeError`` it
+# logs ``bot_resume_failed``, best-effort removes the just-created instance
+# dir, and re-raises so the deploy fails loudly BEFORE a container exists —
+# no half-seeded instance may ever start (§2.1, §11).
+
+# Sentinel for a field present on only one side of the config-drift diff (§12).
+_DRIFT_ABSENT = "<absent>"
+
+
+def _manifest_file_entry(path: Path, new_data_root: Path) -> dict:
+    """Manifest entry for one copied file: name (relative to ``data/``), size,
+    sha256. Size and hash come from a single read so they describe the same
+    bytes."""
+    raw = path.read_bytes()
+    try:
+        rel = path.resolve().relative_to(new_data_root)
+    except ValueError:  # pragma: no cover - defensive; dst containment is guarded
+        rel = Path(path.name)
+    return {
+        "name": rel.as_posix(),
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _execute_copy_plan(plan: CopyPlan, new_data_dir: Path) -> List[dict]:
+    """Execute the copyable items of a :class:`CopyPlan`, file-level.
+
+    Uses ``shutil.copy2`` (``copytree`` for a directory-valued extra path) with
+    a containment guard mirroring ``docker_service._ensure_contained``: every
+    destination must resolve within the new instance's ``data/``. Any I/O
+    failure aborts fail-closed (``COPY_IO_ERROR``) so the container never
+    starts on a partial seed.
+
+    Returns the manifest ``files`` entries ({name, size, sha256}) for every
+    file that landed in ``data/``.
+    """
+    new_data_dir = Path(new_data_dir)
+    new_data_root = new_data_dir.resolve()
+    entries: List[dict] = []
+
+    for item in plan.files_to_copy:
+        src = Path(item.src)
+        dst = Path(item.dst)
+        if not dst.resolve().is_relative_to(new_data_root):
+            raise ResumeError(
+                ResumeAbortReason.EXTRA_PATH_ESCAPE,
+                f"Copy destination '{dst}' resolves outside the new data/ dir "
+                f"'{new_data_root}' — containment violation, failing closed.",
+            )
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+                for copied in sorted(p for p in dst.rglob("*") if p.is_file()):
+                    entries.append(_manifest_file_entry(copied, new_data_root))
+            else:
+                shutil.copy2(src, dst)
+                entries.append(_manifest_file_entry(dst, new_data_root))
+        except (OSError, shutil.Error) as exc:
+            raise ResumeError(
+                ResumeAbortReason.COPY_IO_ERROR,
+                f"I/O error copying '{src}' -> '{dst}': {exc}. Aborting before "
+                f"container start (no half-seeded run).",
+            )
+    return entries
+
+
+def _diff_controller_configs(source: "ResolvedSource", new_instance_dir: Path) -> List[dict]:
+    """Config-drift diff (§12): source instance's controller YAMLs vs the
+    newly staged ones, field-level.
+
+    Live edits made while the old bot ran exist only in the SOURCE instance's
+    ``conf/controllers/``; a redeploy stages from the shared template. Any
+    difference is warned loudly and recorded in the manifest — the template
+    WINS (no carry-forward). A controller file absent from the source (newly
+    added controller) has nothing to drift against and is skipped.
+    """
+    drift: List[dict] = []
+    new_controllers_dir = new_instance_dir / "conf" / "controllers"
+    src_controllers_dir = source.instance_dir / "conf" / "controllers"
+    if not new_controllers_dir.is_dir():
+        return drift
+
+    for staged in sorted(new_controllers_dir.glob("*.yml")):
+        src_file = src_controllers_dir / staged.name
+        if not src_file.is_file():
+            continue
+        try:
+            src_cfg = _load_yaml(src_file)
+            new_cfg = _load_yaml(staged)
+        except Exception as exc:
+            logger.warning(
+                "Config-drift diff skipped for '%s': unparseable YAML (%s).",
+                staged.name, exc,
+            )
+            continue
+        if not isinstance(src_cfg, dict) or not isinstance(new_cfg, dict):
+            continue
+
+        fields = []
+        for key in sorted(set(src_cfg) | set(new_cfg)):
+            source_value = src_cfg.get(key, _DRIFT_ABSENT)
+            template_value = new_cfg.get(key, _DRIFT_ABSENT)
+            if source_value != template_value:
+                fields.append(
+                    {"field": key, "source": source_value, "template": template_value}
+                )
+        if fields:
+            entry = {
+                "file": staged.name,
+                "controller_id": new_cfg.get("id"),
+                "fields": fields,
+            }
+            drift.append(entry)
+            logger.warning(
+                "Config drift for controller '%s' (%s): source instance's YAML differs "
+                "from the staged template on field(s) %s — the template wins (no "
+                "carry-forward). The resumed bot runs the TEMPLATE parameters, which "
+                "may differ from what the stopped bot was running.",
+                entry["controller_id"],
+                staged.name,
+                [f["field"] for f in fields],
+            )
+    return drift
+
+
+def _resume_one_liner(new_name: str, source_name: str, files: List[dict], plan: CopyPlan, drift: List[dict]) -> str:
+    """The §13 one-line summary log."""
+    copied = ", ".join(f"{f['name']} ({f['size']} B)" for f in files) or "nothing"
+    fresh = sum(1 for d in plan.decisions.values() if d == "fresh_seed")
+    fresh_part = f"; {fresh} controller(s) fresh-seeded" if fresh else ""
+    if drift:
+        drift_part = (
+            f"{sum(len(d['fields']) for d in drift)} field(s) across "
+            f"{len(drift)} file(s)"
+        )
+    else:
+        drift_part = "none"
+    return (
+        f"Resumed {new_name} from {source_name}: copied {copied}"
+        f"{fresh_part}; config drift: {drift_part}."
+    )
+
+
+def _cleanup_failed_instance(new_instance_dir: Path) -> None:
+    """Best-effort removal of the just-created instance dir after a failed
+    resume, so no half-seeded instance is left behind for a later deploy (or
+    operator) to trip over. A cleanup failure is logged, never raised — the
+    original ``ResumeError`` is what must surface."""
+    try:
+        if new_instance_dir.exists():
+            shutil.rmtree(new_instance_dir)
+            logger.info(
+                "Removed half-created instance dir '%s' after resume failure.",
+                new_instance_dir,
+            )
+    except OSError as exc:
+        logger.error(
+            "Could not clean up instance dir '%s' after resume failure: %s",
+            new_instance_dir, exc,
+        )
+
+
+def _log_resume_failed(new_instance_dir: Path, reason: str, detail: str) -> None:
+    logger.error(
+        "bot_resume_failed: instance=%s reason=%s — %s",
+        new_instance_dir.name,
+        reason,
+        detail,
+        extra={
+            "event": "bot_resume_failed",
+            "resume_abort_reason": reason,
+            "resume_instance": new_instance_dir.name,
+        },
+    )
+
+
+async def _seed(deployment, new_instance_dir: Path, bots_path: Path, docker_client, bot_run_repo) -> dict:
+    """The hook body: resolve → guards → plan → copy → drift → manifest → events."""
+    from datetime import datetime, timezone
+
+    new_data_dir = new_instance_dir / "data"
+
+    # 1. Which prior instance to copy from (P2, §5).
+    source = await resolve_source(deployment, new_instance_dir.name, bots_path, bot_run_repo)
+
+    # 2. Fail-closed preconditions (P4, §7).
+    guard_report = await run_guards(source, new_data_dir, deployment, docker_client, bot_run_repo)
+
+    # 3. Config-derived copy set (P3, §6).
+    plan = compute_copy_plan(new_instance_dir, source, deployment)
+
+    # 4. Execute the copies, containment-guarded, fail-closed on I/O error.
+    files = _execute_copy_plan(plan, new_data_dir)
+
+    # 5. Config-drift diff (§12) — warn + record; template wins.
+    drift = _diff_controller_configs(source, new_instance_dir)
+
+    # 6. Audit manifest (§13) — also the double-resume detector: it lands in
+    #    data/ and trips the DEST_NOT_EMPTY guard of any later re-seed attempt.
+    manifest = {
+        "source_instance": source.instance_name,
+        "source_path": str(source.data_dir),
+        "mode": deployment.resume_mode,
+        "files": files,
+        "decisions": dict(plan.decisions),
+        "drift": drift,
+        "guard_report": guard_report.to_dict(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    new_data_dir.mkdir(parents=True, exist_ok=True)
+    (new_data_dir / "resume.manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+    )
+
+    # 7. Structured events + the §13 one-liner.
+    decision_summary = {
+        decision: sum(1 for d in plan.decisions.values() if d == decision)
+        for decision in sorted(set(plan.decisions.values()))
+    }
+    logger.info(
+        "bot_resume_seeded: instance=%s source=%s files=%d decisions=%s",
+        new_instance_dir.name,
+        source.instance_name,
+        len(files),
+        decision_summary,
+        extra={
+            "event": "bot_resume_seeded",
+            "resume_instance": new_instance_dir.name,
+            "resume_source": source.instance_name,
+            "resume_file_count": len(files),
+            "resume_decisions": decision_summary,
+        },
+    )
+    logger.info(_resume_one_liner(new_instance_dir.name, source.instance_name, files, plan, drift))
+    return manifest
+
+
+async def seed_resume_state(
+    deployment,
+    new_instance_dir,
+    bots_path,
+    docker_client,
+    db_manager=None,
+    bot_run_repo=None,
+) -> dict:
+    """Seed a new instance's ``data/`` from a prior run — the copy-forward hook.
+
+    Called by ``docker_service.create_hummingbot_instance`` after config
+    staging and strictly before ``containers.run``, gated on
+    ``deployment.resume_mode != "off"`` (when off, this function is never
+    invoked and the deploy path is byte-identical to pre-hook behavior).
+
+    Args:
+        deployment: The deploy model (``V2ControllerDeployment`` /
+            ``V2ScriptDeployment``) carrying the resume fields.
+        new_instance_dir: The just-created instance root (its ``conf/`` is
+            staged, its ``data/`` empty).
+        bots_path: The ``bots/`` directory containing ``instances/`` and
+            ``archived/``.
+        docker_client: The Docker SDK client (container-state guard).
+        db_manager: The app's ``AsyncDatabaseManager``; when given (and no
+            ``bot_run_repo``), a session is opened around the seeding and the
+            existing ``BotRunRepository`` is used for lineage/guard queries.
+        bot_run_repo: A ready-made repository (tests / preview flows). ``None``
+            with no ``db_manager`` degrades per design: ``latest`` falls back
+            to directory listing, source history counts as ungraceful.
+
+    Returns:
+        The resume manifest dict (also written to ``data/resume.manifest.json``).
+
+    Raises:
+        ResumeError: fail-closed on any §11 condition — after logging
+            ``bot_resume_failed`` and best-effort removing the instance dir, so
+            the deploy aborts loudly and no container ever starts.
+    """
+    new_instance_dir = Path(new_instance_dir)
+    bots_path = Path(bots_path)
+    try:
+        if bot_run_repo is None and db_manager is not None:
+            from database import BotRunRepository
+
+            async with db_manager.get_session_context() as session:
+                return await _seed(
+                    deployment, new_instance_dir, bots_path, docker_client,
+                    BotRunRepository(session),
+                )
+        return await _seed(deployment, new_instance_dir, bots_path, docker_client, bot_run_repo)
+    except ResumeError as err:
+        _log_resume_failed(new_instance_dir, err.reason.value, err.message)
+        _cleanup_failed_instance(new_instance_dir)
+        raise
+    except Exception as exc:
+        # Unexpected failures get the same fail-closed treatment: event,
+        # cleanup, re-raise — the deploy must never continue to containers.run.
+        _log_resume_failed(new_instance_dir, f"UNEXPECTED:{type(exc).__name__}", str(exc))
+        _cleanup_failed_instance(new_instance_dir)
+        raise

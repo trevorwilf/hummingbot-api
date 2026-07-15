@@ -536,7 +536,7 @@ async def deploy_v2_controllers(
         # Set generated config on the deployment and deploy
         deployment.instance_name = unique_instance_name
         deployment.script_config = script_config_filename
-        response = docker_manager.create_hummingbot_instance(deployment)
+        response = await docker_manager.create_hummingbot_instance(deployment)
 
         if response.get("success"):
             response["script_config_generated"] = script_config_filename
@@ -593,7 +593,7 @@ async def deploy_v2_script(
         deployment.instance_name = unique_instance_name
 
         # Create the hummingbot instance
-        response = docker_manager.create_hummingbot_instance(deployment)
+        response = await docker_manager.create_hummingbot_instance(deployment)
 
         if response.get("success"):
             response["unique_instance_name"] = unique_instance_name
