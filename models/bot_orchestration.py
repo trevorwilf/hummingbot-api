@@ -1,7 +1,7 @@
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Safe single path component names: prevents path traversal via '/', '\' or '..'.
 # Mirrors services.accounts_service.SAFE_NAME_PATTERN (replicated locally to avoid a
@@ -116,6 +116,26 @@ class StopAndArchiveResponse(BaseModel):
 
 
 # Bot deployment models
+def _validate_resume_extra_paths(paths: Optional[List[str]], label: str) -> Optional[List[str]]:
+    """Reject absolute paths (POSIX /... or drive-letter X:...) and any .. segment."""
+    if paths is None:
+        return paths
+    for p in paths:
+        if not p:
+            raise ValueError(f"Empty path in {label}")
+        # Reject POSIX absolute
+        if p.startswith("/"):
+            raise ValueError(f"Absolute path not allowed in {label}: '{p}'")
+        # Reject Windows drive-letter absolute (e.g. C:\ or C:/)
+        if len(p) >= 2 and p[1] == ":" and (len(p) == 2 or p[2] in ("/", "\\")):
+            raise ValueError(f"Absolute path not allowed in {label}: '{p}'")
+        # Reject any .. segment
+        parts = re.split(r"[/\\]", p)
+        if ".." in parts:
+            raise ValueError(f"Path traversal '..' not allowed in {label}: '{p}'")
+    return paths
+
+
 class V2ScriptDeployment(BaseModel):
     """Configuration for deploying a bot with a script"""
     instance_name: str = Field(description="Unique name for the bot instance")
@@ -124,6 +144,12 @@ class V2ScriptDeployment(BaseModel):
     script: Optional[str] = Field(default=None, description="Script name to run (without .py extension)")
     script_config: Optional[str] = Field(default=None, description="Script configuration file name (without .yml extension)")
     headless: bool = Field(default=False, description="Run in headless mode (no UI)")
+    # Resume / copy-forward fields (all optional, default to no-op)
+    resume_mode: Literal["off", "explicit", "latest"] = Field(default="off", description="Whether/how to seed data/ from a prior run")
+    resume_from: Optional[str] = Field(default=None, description="Prior instance name (required when resume_mode='explicit')")
+    resume_from_archive: bool = Field(default=False, description="Allow sourcing from bots/archived/ (local-move archives only)")
+    resume_extra_paths: Optional[List[str]] = Field(default=None, description="Additional relative paths to copy from source data/")
+    resume_accept_ungraceful: bool = Field(default=False, description="Override the ungraceful-source guard")
 
     @field_validator("instance_name")
     @classmethod
@@ -142,6 +168,26 @@ class V2ScriptDeployment(BaseModel):
             return v
         return _validate_safe_config_name(v, "script_config")
 
+    @field_validator("resume_from")
+    @classmethod
+    def _validate_resume_from(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_safe_name(v, "resume_from")
+
+    @field_validator("resume_extra_paths")
+    @classmethod
+    def _validate_resume_extra_paths(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _validate_resume_extra_paths(v, "resume_extra_paths")
+
+    @model_validator(mode="after")
+    def _cross_field_resume_validation(self) -> "V2ScriptDeployment":
+        if self.resume_mode == "explicit" and self.resume_from is None:
+            raise ValueError("resume_from is required when resume_mode='explicit'")
+        if self.resume_mode == "off" and self.resume_from is not None:
+            raise ValueError("resume_from must not be set when resume_mode='off'")
+        return self
+
 
 class V2ControllerDeployment(BaseModel):
     """Configuration for deploying a bot with controllers"""
@@ -159,6 +205,12 @@ class V2ControllerDeployment(BaseModel):
     image: str = Field(default="hummingbot/hummingbot:latest", description="Docker image for the Hummingbot instance")
     script_config: Optional[str] = Field(default=None, description="Generated script configuration file name")
     headless: bool = Field(default=False, description="Run in headless mode (no UI)")
+    # Resume / copy-forward fields (all optional, default to no-op)
+    resume_mode: Literal["off", "explicit", "latest"] = Field(default="off", description="Whether/how to seed data/ from a prior run")
+    resume_from: Optional[str] = Field(default=None, description="Prior instance name (required when resume_mode='explicit')")
+    resume_from_archive: bool = Field(default=False, description="Allow sourcing from bots/archived/ (local-move archives only)")
+    resume_extra_paths: Optional[List[str]] = Field(default=None, description="Additional relative paths to copy from source data/")
+    resume_accept_ungraceful: bool = Field(default=False, description="Override the ungraceful-source guard")
 
     @field_validator("instance_name")
     @classmethod
@@ -181,3 +233,23 @@ class V2ControllerDeployment(BaseModel):
         if v is None:
             return v
         return _validate_safe_config_name(v, "script_config")
+
+    @field_validator("resume_from")
+    @classmethod
+    def _validate_resume_from(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_safe_name(v, "resume_from")
+
+    @field_validator("resume_extra_paths")
+    @classmethod
+    def _validate_resume_extra_paths(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        return _validate_resume_extra_paths(v, "resume_extra_paths")
+
+    @model_validator(mode="after")
+    def _cross_field_resume_validation(self) -> "V2ControllerDeployment":
+        if self.resume_mode == "explicit" and self.resume_from is None:
+            raise ValueError("resume_from is required when resume_mode='explicit'")
+        if self.resume_mode == "off" and self.resume_from is not None:
+            raise ValueError("resume_from must not be set when resume_mode='off'")
+        return self

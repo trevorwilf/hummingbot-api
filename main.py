@@ -234,7 +234,7 @@ async def lifespan(app: FastAPI):
     )
 
     backtesting_service = BacktestingService()
-    docker_service = DockerService()
+    docker_service = DockerService(db_manager=db_manager)
     gateway_service = GatewayService()
     # If a secured Gateway is already running but this API lost the shared mTLS certs (e.g. the
     # API container was recreated without the persisted bots/ mount), regenerate the cert set and

@@ -1,0 +1,14 @@
+FAILED tests/test_auth.py::TestAuthDebugMode::test_auth_passes_correct_credentials
+FAILED tests/test_auth.py::TestAuthDebugMode::test_auth_rejects_bad_credentials_when_not_debug
+FAILED tests/test_auth.py::TestAuthDebugMode::test_debug_mode_logs_warning_on_bypass
+FAILED tests/test_config.py::TestSecuritySettingsEnvPrefix::test_explicit_env_vars_still_work
+FAILED tests/test_docker_service.py::TestDockerServiceVPNNetworkMode::test_create_instance_uses_dynamic_network_mode
+FAILED tests/test_health_endpoint.py::TestHealthEndpoint::test_health_endpoint_exists
+FAILED tests/test_health_endpoint.py::TestHealthEndpoint::test_health_no_auth_required
+FAILED tests/test_health_endpoint.py::TestHealthEndpoint::test_health_returns_components
+FAILED tests/test_nonkyc_connector_unit.py::TestNonKYCAuth::test_generate_auth_dict_get
+FAILED tests/test_nonkyc_connector_unit.py::TestNonKYCAuth::test_generate_auth_dict_post
+FAILED tests/test_phase3_hardening.py::TestFix1StatusPollingTask::test_status_polling_started
+FAILED tests/test_unified_connector_service.py::TestStartConnectorNetwork::test_all_six_tasks_started
+FAILED tests/test_unified_connector_service.py::TestStartConnectorNetwork::test_status_polling_task_is_started
+FAILED tests/test_unified_connector_service.py::TestStartConnectorNetwork::test_stop_cleans_up_status_polling
