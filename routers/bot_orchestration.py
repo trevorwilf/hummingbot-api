@@ -1,6 +1,7 @@
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
@@ -8,6 +9,7 @@ from deps import get_bot_archiver, get_bots_orchestrator, get_docker_service
 from models import StartBotAction, StopBotAction, V2ControllerDeployment, V2ScriptDeployment
 from services.bots_orchestrator import BotsOrchestrator
 from services.docker_service import DockerService
+from services.resume_service import ResumeError, preview_resume
 from utils.bot_archiver import BotArchiver
 from utils.file_system import fs_util
 
@@ -557,6 +559,12 @@ async def deploy_v2_controllers(
 
         return response
 
+    except ResumeError as e:
+        logging.error(f"Resume aborted for V2 controllers deploy: {e.reason.value} — {e.message}")
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason.value, "detail": e.message},
+        )
     except Exception as e:
         logging.error(f"Error deploying V2 controllers: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -612,6 +620,52 @@ async def deploy_v2_script(
 
         return response
 
+    except ResumeError as e:
+        logging.error(f"Resume aborted for V2 script deploy: {e.reason.value} — {e.message}")
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason.value, "detail": e.message},
+        )
     except Exception as e:
         logging.error(f"Error deploying V2 script: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/deploy-v2-controllers/resume-preview")
+async def preview_v2_controllers_resume(
+    deployment: V2ControllerDeployment,
+    docker_manager: DockerService = Depends(get_docker_service),
+):
+    """
+    Dry-run preview: resolve the resume source, run all guards, and compute the
+    copy plan — without creating directories, copying files, or starting any
+    container. Docker is contacted only for the container-state guard (one
+    read-only API call).
+
+    Args:
+        deployment: V2ControllerDeployment with resume_mode set (explicit or latest).
+
+    Returns:
+        Dict with resolved_source, files (planned, not yet copied), decisions,
+        guard_report, and would_succeed.
+
+    Raises:
+        HTTP 409 if any guard would abort the deploy (reason + detail returned).
+        HTTP 422 on model validation errors (Pydantic, standard FastAPI).
+    """
+    try:
+        result = await preview_resume(
+            deployment=deployment,
+            bots_path=Path("bots"),
+            docker_client=docker_manager.client,
+            db_manager=docker_manager.db_manager,
+        )
+        return result
+    except ResumeError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason.value, "detail": e.message},
+        )
+    except Exception as e:
+        logging.error(f"Error in resume preview: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

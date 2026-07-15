@@ -1519,3 +1519,143 @@ async def seed_resume_state(
         _log_resume_failed(new_instance_dir, f"UNEXPECTED:{type(exc).__name__}", str(exc))
         _cleanup_failed_instance(new_instance_dir)
         raise
+
+
+# ===========================================================================
+# Phase 6 — Preview / dry-run (design §5 dry-run note, R6)
+# ===========================================================================
+#
+# ``preview_resume`` is the backend for the read-only
+# ``POST /bot-orchestration/deploy-v2-controllers/resume-preview`` endpoint.
+# It stages the template controller YAMLs in a temporary directory and runs
+# resolve → guards → copy-plan without creating any instance directory, copying
+# any files, or touching Docker beyond the single container-state read done by
+# the source-container guard. The returned dict is what the router serialises
+# as the 200 response.
+
+
+async def preview_resume(
+    deployment,
+    bots_path,
+    docker_client,
+    db_manager=None,
+    bot_run_repo=None,
+) -> dict:
+    """Read-only preview of what a resume deploy would copy.
+
+    Stages the deploy's template controller YAMLs in a temporary directory
+    (which is cleaned up automatically), runs ``resolve_source`` → ``run_guards``
+    → ``compute_copy_plan``, and returns the plan as a JSON-serialisable dict.
+    No directories are created in the bot tree; no files are copied; Docker is
+    touched only for the container-state guard (a single read-only API call).
+
+    The new-instance name used for ``latest`` exclude-self logic is
+    ``deployment.instance_name`` as-is (the preview occurs before the API
+    timestamps the name, so no existing run can match it exactly).
+
+    Args:
+        deployment: The deploy model (``V2ControllerDeployment`` /
+            ``V2ScriptDeployment``) with resume fields.
+        bots_path: The ``bots/`` directory (same convention as
+            ``seed_resume_state`` — e.g. ``Path("bots")`` relative to CWD).
+        docker_client: The Docker SDK client (container-state lookup only).
+        db_manager: ``AsyncDatabaseManager`` (optional); a session is opened
+            when no ``bot_run_repo`` is provided. ``None`` degrades gracefully:
+            ``latest`` falls back to directory listing, unknown source history
+            is treated as ungraceful (same semantics as ``seed_resume_state``).
+        bot_run_repo: A ready-made repository (tests / callers that already
+            hold a session). Takes precedence over ``db_manager``.
+
+    Returns:
+        Dict with keys: ``resolved_source``, ``files``, ``decisions``,
+        ``guard_report``, ``would_succeed`` (always ``True`` — failures raise).
+
+    Raises:
+        ResumeError: fail-closed on any §11 condition (caller maps to HTTP 409).
+    """
+    import tempfile
+
+    bots_path = Path(bots_path)
+
+    # Normalise controller filenames: the model stores them without ``.yml``
+    # but the template files on disk have ``.yml``.
+    ctrl_names = []
+    for name in (getattr(deployment, "controllers_config", None) or []):
+        ctrl_names.append(name if name.endswith(".yml") else f"{name}.yml")
+
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        tmp_instance_dir = Path(_tmpdir)
+
+        # Stage template controller YAMLs so compute_copy_plan can read them.
+        controllers_dst = tmp_instance_dir / "conf" / "controllers"
+        controllers_dst.mkdir(parents=True)
+        for ctrl_name in ctrl_names:
+            src = bots_path / "conf" / "controllers" / ctrl_name
+            if src.is_file():
+                shutil.copy2(src, controllers_dst / ctrl_name)
+            else:
+                logger.warning(
+                    "preview_resume: template '%s' not found at '%s' — "
+                    "controller skipped in copy plan.",
+                    ctrl_name, src,
+                )
+
+        # Stage conf_client.yml for the sqlite-mode check.
+        credentials_profile = getattr(deployment, "credentials_profile", None)
+        if credentials_profile:
+            src_client = (
+                bots_path / "credentials" / credentials_profile / "conf_client.yml"
+            )
+            if src_client.is_file():
+                shutil.copy2(src_client, tmp_instance_dir / "conf" / "conf_client.yml")
+
+        # Run the pipeline.  The "new instance name" is the pre-timestamp name —
+        # no existing DB row can match it so exclude-self is a no-op here.
+        new_name = deployment.instance_name
+
+        async def _preview_run(repo):
+            source = await resolve_source(deployment, new_name, bots_path, repo)
+            # The preview's ``data/`` dir is virtual (doesn't exist on disk);
+            # DEST_NOT_EMPTY treats a missing dir as clean — no false abort.
+            guard_report = await run_guards(
+                source,
+                tmp_instance_dir / "data",
+                deployment,
+                docker_client,
+                repo,
+            )
+            plan = compute_copy_plan(tmp_instance_dir, source, deployment)
+            return source, guard_report, plan
+
+        if bot_run_repo is None and db_manager is not None:
+            from database import BotRunRepository
+
+            async with db_manager.get_session_context() as session:
+                source, guard_report, plan = await _preview_run(BotRunRepository(session))
+        else:
+            source, guard_report, plan = await _preview_run(bot_run_repo)
+
+        # Build the files list from the planned (not executed) copy set.
+        # Sizes and sha256 are computed from the SOURCE files — no copy occurs.
+        files = []
+        for item in plan.files_to_copy:
+            entry: dict = {"src": str(item.src), "dst": str(item.dst), "kind": item.kind}
+            try:
+                raw = Path(item.src).read_bytes()
+                entry["size"] = len(raw)
+                entry["sha256"] = hashlib.sha256(raw).hexdigest()
+            except OSError:
+                pass  # best-effort; guard already validated the ledger
+            files.append(entry)
+
+        return {
+            "resolved_source": {
+                "instance_name": source.instance_name,
+                "data_dir": str(source.data_dir),
+                "origin": source.origin,
+            },
+            "files": files,
+            "decisions": dict(plan.decisions),
+            "guard_report": guard_report.to_dict(),
+            "would_succeed": True,
+        }
