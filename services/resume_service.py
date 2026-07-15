@@ -897,3 +897,314 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
         len(plan.warnings),
     )
     return plan
+
+
+# ===========================================================================
+# Phase 4 — Preconditions & guards, fail-closed (design §7)
+# ===========================================================================
+#
+# ``run_guards`` runs the pre-copy preconditions from §7 against the resolved
+# source and the (still-empty) destination ``data/``. It builds a
+# :class:`GuardReport` recording each guard's pass/fail + message, and raises
+# ``ResumeError`` on the FIRST hard failure so the deploy aborts before any
+# container starts (§2.1). Ledger validity (§7.2) is enforced in the P3 copy
+# plan, not here — the report merely records that.
+#
+# Guards use ONLY Docker container state (never PIDs — container-namespaced and
+# meaningless to the API host, §2.2) and the API ``bot_runs`` history. No
+# filesystem writes; the destination is inspected read-only.
+
+# Docker container states that mean the source is *not* safely quiesced — an
+# active writer could still be mutating the ledger, breaking the single-owner
+# invariant (§2.2). Everything else (exited / created / dead / removing) is an
+# acceptable stopped-or-absent source.
+_ACTIVE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
+
+# API ``bot_runs.run_status`` value that denotes a clean, graceful stop
+# (database/models.py:190 — CREATED / RUNNING / STOPPED / ERROR). Anything else
+# (or a missing end marker / absent row) is treated as ungraceful (§7.5).
+_GRACEFUL_RUN_STATUS = "STOPPED"
+
+# Destination state-file globs whose presence means the new ``data/`` is not the
+# pristine empty dir the hook expects (§7.4). ``*.owner`` catches the ledger
+# sidecars (``<ledger>.json.owner``).
+_DEST_STATE_GLOBS = ("*.json", "*.sqlite", "*.owner")
+
+
+@dataclass
+class GuardCheck:
+    """One precondition result within a :class:`GuardReport`.
+
+    Attributes:
+        name: Stable machine name of the guard (e.g. ``"source_container"``).
+        passed: Whether the guard passed.
+        message: Human-readable detail (why it passed/failed, or a warning).
+    """
+
+    name: str
+    passed: bool
+    message: str
+
+
+@dataclass
+class GuardReport:
+    """The result of running all §7 preconditions.
+
+    On a hard failure ``run_guards`` raises ``ResumeError`` (with this partial
+    report attached as ``err.guard_report``); on full success it returns a
+    report whose ``passed`` is ``True``. Serialized into the resume manifest by
+    Phase 5.
+
+    Attributes:
+        checks: Per-guard results, in evaluation order.
+        warnings: Loud, operator-facing warnings (e.g. an accepted ungraceful
+            source). Also emitted at WARNING level.
+    """
+
+    checks: List[GuardCheck] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        """True iff every recorded guard passed."""
+        return all(c.passed for c in self.checks)
+
+    def _record(self, name: str, passed: bool, message: str) -> None:
+        self.checks.append(GuardCheck(name=name, passed=passed, message=message))
+        (logger.info if passed else logger.warning)(
+            "Resume guard '%s': %s — %s", name, "PASS" if passed else "FAIL", message
+        )
+
+    def _warn(self, message: str) -> None:
+        logger.warning(message)
+        self.warnings.append(message)
+
+    def to_dict(self) -> dict:
+        """A JSON-serializable summary for the resume manifest (§13)."""
+        return {
+            "passed": self.passed,
+            "checks": [
+                {"name": c.name, "passed": c.passed, "message": c.message}
+                for c in self.checks
+            ],
+            "warnings": list(self.warnings),
+        }
+
+
+def _abort_guard(reason: ResumeAbortReason, message: str, report: GuardReport):
+    """Record a failed guard, attach the partial report to the error, raise.
+
+    Centralises the fail-closed exit so every hard guard failure both lands in
+    the report (for observability) and aborts before any container starts.
+    """
+    report._record(reason.name.lower(), False, message)
+    err = ResumeError(reason, message)
+    err.guard_report = report
+    raise err
+
+
+def _guard_source_container(source: "ResolvedSource", docker_client, report: GuardReport) -> None:
+    """§7.1 — the source container must have exited.
+
+    Looks up the container named EXACTLY ``source.instance_name`` via the Docker
+    SDK. ``running`` / ``restarting`` / ``paused`` → ``SOURCE_RUNNING`` (covers
+    the idle-after-stop-bot case, where the headless process still holds the
+    ledger). ``NotFound`` → PASS: the container object is gone, so the
+    directory-on-disk is an acceptable source. No PID / ``.owner``-liveness
+    checks — Docker state is the only valid stopped-check (§2.2).
+    """
+    from docker.errors import NotFound
+
+    name = source.instance_name
+    try:
+        container = docker_client.containers.get(name)
+    except NotFound:
+        report._record(
+            "source_container",
+            True,
+            f"No container named '{name}' — source is a stopped/removed instance on disk.",
+        )
+        return
+
+    status = getattr(container, "status", None)
+    if status in _ACTIVE_CONTAINER_STATES:
+        _abort_guard(
+            ResumeAbortReason.SOURCE_RUNNING,
+            f"Source container '{name}' is '{status}' — stop the container first "
+            f"(a running or idle-after-stop-bot process still owns the ledger).",
+            report,
+        )
+    report._record(
+        "source_container",
+        True,
+        f"Source container '{name}' is '{status}' (not active) — safely quiesced.",
+    )
+
+
+def _guard_destination_empty(new_data_dir: Path, report: GuardReport) -> None:
+    """§7.4 — the destination ``data/`` must contain no state files.
+
+    Any ``*.json`` / ``*.sqlite`` / ``*.owner`` present → ``DEST_NOT_EMPTY``. At
+    the hook's attach point ``data/`` is freshly created and empty, but assert it
+    so an unexpected pre-seed is never silently overwritten.
+    """
+    new_data_dir = Path(new_data_dir)
+    if not new_data_dir.is_dir():
+        report._record(
+            "destination_empty",
+            True,
+            f"Destination '{new_data_dir}' does not exist yet — treated as empty.",
+        )
+        return
+
+    stray: List[str] = []
+    for pattern in _DEST_STATE_GLOBS:
+        stray.extend(p.name for p in new_data_dir.glob(pattern) if p.is_file())
+    if stray:
+        _abort_guard(
+            ResumeAbortReason.DEST_NOT_EMPTY,
+            f"Destination '{new_data_dir}' already holds state file(s) "
+            f"{sorted(set(stray))} — refusing to overwrite an unexpected seed.",
+            report,
+        )
+    report._record(
+        "destination_empty",
+        True,
+        f"Destination '{new_data_dir}' holds no state files — clean.",
+    )
+
+
+async def _latest_source_run(source: "ResolvedSource", bot_run_repo):
+    """Return the source's most recent ``bot_runs`` row, or ``None``.
+
+    Filters ``get_bot_runs`` (already ordered newest-first by ``deployed_at``,
+    bot_run_repository.py:121) by ``instance_name`` — the repo has no
+    instance-name filter, mirroring ``resolve_source``'s in-Python match. A repo
+    error is swallowed to ``None`` (unknown history → treated as ungraceful).
+    """
+    try:
+        runs = await bot_run_repo.get_bot_runs(limit=1000)
+    except Exception as exc:  # DB unavailable → unknown history, fail-closed below.
+        logger.warning(
+            "bot_runs lookup for ungraceful-source guard failed (%s); "
+            "treating source history as unknown (ungraceful).",
+            exc,
+        )
+        return None
+    for run in runs:
+        if getattr(run, "instance_name", None) == source.instance_name:
+            return run
+    return None
+
+
+async def _guard_ungraceful_source(
+    source: "ResolvedSource", deployment, bot_run_repo, report: GuardReport
+) -> None:
+    """§7.5 — advisory: the source should have stopped gracefully.
+
+    The source's most recent ``bot_runs`` row is graceful iff its ``run_status``
+    is ``STOPPED`` AND it carries an end marker (``stopped_at``). A non-stopped /
+    errored status, a missing end marker, or an absent row (unknown history) is
+    ungraceful → ``UNGRACEFUL_SOURCE`` unless ``resume_accept_ungraceful=True``,
+    in which case the guard PASSES with a loud warning recorded. Exchange
+    open-order verification is the operator runbook's job, not the hook's.
+    """
+    accept = bool(getattr(deployment, "resume_accept_ungraceful", False))
+    run = await _latest_source_run(source, bot_run_repo)
+
+    if run is None:
+        detail = (
+            f"No bot_runs history for source '{source.instance_name}' — unknown "
+            f"history is not graceful."
+        )
+        graceful = False
+    else:
+        status = getattr(run, "run_status", None)
+        stopped_at = getattr(run, "stopped_at", None)
+        graceful = status == _GRACEFUL_RUN_STATUS and stopped_at is not None
+        detail = (
+            f"Source '{source.instance_name}' last run_status={status!r}, "
+            f"stopped_at={stopped_at!r}."
+        )
+
+    if graceful:
+        report._record("graceful_source", True, f"Graceful stop confirmed. {detail}")
+        return
+
+    if accept:
+        message = (
+            f"UNGRACEFUL SOURCE ACCEPTED via resume_accept_ungraceful=True. {detail} "
+            f"The hook carries the ledger, NOT order cleanup — ensure the exchange "
+            f"was flat before deploying."
+        )
+        report._warn(message)
+        report._record("graceful_source", True, message)
+        return
+
+    _abort_guard(
+        ResumeAbortReason.UNGRACEFUL_SOURCE,
+        f"{detail} Source did not stop gracefully — refusing to resume. Cancel any "
+        f"open orders and set resume_accept_ungraceful=True to override.",
+        report,
+    )
+
+
+async def run_guards(
+    source: "ResolvedSource",
+    new_data_dir,
+    deployment,
+    docker_client,
+    bot_run_repo,
+) -> GuardReport:
+    """Run the §7 preconditions, fail-closed, before any copy or container start.
+
+    Evaluates the guards in §7 order and raises ``ResumeError`` on the FIRST
+    hard failure (with the partial :class:`GuardReport` attached as
+    ``err.guard_report``); returns a passing report when every guard clears.
+
+    Guards:
+        1. Source container exited (§7.1) — Docker state only.
+        2. Ledger validity (§7.2) — enforced in the P3 copy plan; recorded here.
+        3. Destination ``data/`` empty (§7.4).
+        4. Source stopped gracefully (§7.5) — advisory, overridable.
+
+    Args:
+        source: The :class:`ResolvedSource` from :func:`resolve_source` (P2).
+        new_data_dir: The new instance's ``data/`` directory (the copy target).
+        deployment: The deploy model (reads ``resume_accept_ungraceful``).
+        docker_client: The Docker SDK client (``client.containers.get``).
+        bot_run_repo: The existing ``BotRunRepository`` (or a compatible mock).
+
+    Returns:
+        A passing :class:`GuardReport`.
+
+    Raises:
+        ResumeError: on the first hard guard failure (§11).
+    """
+    report = GuardReport()
+
+    # 1. Source container has exited (§7.1).
+    _guard_source_container(source, docker_client, report)
+
+    # 2. Ledger validity (§7.2) is enforced by compute_copy_plan (P3); record it.
+    report._record(
+        "ledger_validity",
+        True,
+        "Ledger existence/JSON validity is enforced fail-closed during copy-plan "
+        "computation (compute_copy_plan, LEDGER_INVALID).",
+    )
+
+    # 3. Destination data/ contains no state files (§7.4).
+    _guard_destination_empty(new_data_dir, report)
+
+    # 4. Source stopped gracefully (§7.5), overridable via resume_accept_ungraceful.
+    await _guard_ungraceful_source(source, deployment, bot_run_repo, report)
+
+    logger.info(
+        "Resume guards passed for source '%s' → dest '%s' (%d checks, %d warning(s)).",
+        source.instance_name,
+        new_data_dir,
+        len(report.checks),
+        len(report.warnings),
+    )
+    return report
