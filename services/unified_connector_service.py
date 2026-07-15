@@ -22,7 +22,6 @@ from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.connector_metrics_collector import TradeVolumeMetricCollector
 from hummingbot.connector.exchange_py_base import ExchangePyBase
-from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
@@ -31,6 +30,17 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from utils.file_system import fs_util
 from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
 from utils.security import BackendAPISecurity
+
+# The unified Gateway (DEX) connector only exists in newer upstream hummingbot.
+# This stack pip-installs the NonKYC fork (trevorwilf/hummingbot@nonkyc), which
+# predates it, and the deployment is CEX-only — so a missing module must NOT
+# take the whole API down at import time (2026-07-12: every container restart
+# died with ModuleNotFoundError after the upstream merge). Creating a Gateway
+# network connector below fails with a clear error instead.
+try:
+    from hummingbot.connector.gateway.gateway import Gateway
+except ImportError:
+    Gateway = None
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +665,13 @@ class UnifiedConnectorService:
         # Gateway connectors are NOT in AllConnectorSettings (those are exchange connectors)
         # Network format: "chain-network" (e.g., "solana-mainnet-beta", "ethereum-mainnet")
         if connector_name not in self._conn_settings:
+            if Gateway is None:
+                raise ValueError(
+                    f"'{connector_name}' is not a configured exchange connector, and Gateway "
+                    "network connectors are unavailable: this deployment's hummingbot build "
+                    "(NonKYC fork) predates hummingbot.connector.gateway.gateway. "
+                    "CEX connectors are unaffected."
+                )
             logger.info(f"Creating Gateway connector for network: {connector_name}")
             return Gateway(
                 connector_name=connector_name,

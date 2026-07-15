@@ -46,6 +46,17 @@ class BotsOrchestrator:
         # so no per-service bootstrap is needed here.
         self.db_manager = db_manager
 
+        # Cross-stack scoping (2026-07-13): multiple stacks (hummingbot, hummingbot_us)
+        # share ONE Docker daemon on the host. Discovery by image name alone adopted the
+        # OTHER stack's bot containers too — they publish MQTT to their own stack's
+        # broker, so they surfaced here as permanently "stopped" phantoms whose stop
+        # button would kill the other stack's live bot. Bot containers are launched with
+        # com.docker.compose.project=<COMPOSE_PROJECT_NAME> (see DockerService.
+        # _get_compose_labels); discovery now ignores containers labeled for a DIFFERENT
+        # project. Unlabeled containers stay included (manual runs / legacy deploys),
+        # and with COMPOSE_PROJECT_NAME unset the legacy include-all behavior applies.
+        self._compose_project = os.environ.get("COMPOSE_PROJECT_NAME", "")
+
         # MQTT manager will be started asynchronously later
 
     @staticmethod
@@ -59,6 +70,21 @@ class BotsOrchestrator:
         except Exception:
             return False
 
+    def _is_our_container(self, container) -> bool:
+        """True for hummingbot containers that belong to THIS stack (see the
+        cross-stack scoping note in __init__)."""
+        if not self.hummingbot_containers_filter(container):
+            return False
+        if not self._compose_project:
+            return True  # single-stack / legacy: no scoping configured
+        try:
+            project = (container.labels or {}).get("com.docker.compose.project", "")
+        except Exception:
+            project = ""
+        # Only containers explicitly labeled for ANOTHER compose project are foreign;
+        # unlabeled ones (manual runs, pre-labeling deploys) remain visible.
+        return not project or project == self._compose_project
+
     async def get_active_containers(self):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._sync_get_active_containers)
@@ -67,7 +93,7 @@ class BotsOrchestrator:
         return [
             container.name
             for container in self.docker_client.containers.list()
-            if container.status == "running" and self.hummingbot_containers_filter(container)
+            if container.status == "running" and self._is_our_container(container)
         ]
 
     def start(self):
