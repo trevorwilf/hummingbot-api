@@ -3,6 +3,7 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
 from typing import Dict
 
 import docker
@@ -11,6 +12,7 @@ from docker.types import LogConfig
 
 from config import settings
 from models import V2ControllerDeployment
+from services.resume_service import seed_resume_state
 from utils.file_system import fs_util
 from utils.gateway_certs import ensure_gateway_certs, gateway_certs_dir
 
@@ -24,8 +26,11 @@ class DockerService:
     PULL_STATUS_MAX_ENTRIES = 100  # Maximum number of entries to keep
     CLEANUP_INTERVAL_SECONDS = 300  # Run cleanup every 5 minutes
 
-    def __init__(self):
+    def __init__(self, db_manager=None):
         self.SOURCE_PATH = os.getcwd()
+        # AsyncDatabaseManager (optional) — used by the copy-forward resume hook
+        # for bot_runs lineage/guard queries. Deploys with resume off never touch it.
+        self.db_manager = db_manager
         self._pull_status: Dict[str, Dict] = {}
         self._cleanup_thread = None
         self._stop_cleanup = threading.Event()
@@ -203,7 +208,7 @@ class DockerService:
             raise ValueError(f"Invalid {label}: '{path}' resolves outside of '{base_dir}'.")
         return resolved_path
 
-    def create_hummingbot_instance(self, config: V2ControllerDeployment):
+    async def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
         instance_dir = os.path.join("bots", 'instances', instance_name)
@@ -292,6 +297,22 @@ class DockerService:
             client_config['gateway'] = gateway_section
 
         fs_util.dump_dict_to_yaml(conf_file_path, client_config)
+
+        # Copy-forward resume hook (COPY_FORWARD_HOOK_DESIGN.md §3/§4): seed the new
+        # instance's data/ from the prior run's state files — after config staging
+        # (the staged controller YAMLs drive the copy set) and strictly before
+        # containers.run. With resume_mode "off" the hook is not invoked and the
+        # deploy path is identical to pre-hook behavior. On any ResumeError the hook
+        # logs bot_resume_failed, removes the just-created instance dir, and
+        # re-raises — the container below never starts on a failed or partial seed.
+        if config.resume_mode != "off":
+            await seed_resume_state(
+                deployment=config,
+                new_instance_dir=Path(instance_dir),
+                bots_path=Path("bots"),
+                docker_client=self.client,
+                db_manager=self.db_manager,
+            )
 
         # Set up Docker volumes
         instance_conf = os.path.abspath(os.path.join(bots_path, instance_dir, 'conf'))
