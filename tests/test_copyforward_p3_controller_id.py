@@ -373,15 +373,36 @@ class TestCanonicalIdIsUsedDownstream:
         """Canonicalizing must not turn the OWNER_MISMATCH guard into a
         rubber stamp: a genuinely different id still fails closed.
 
-        This is also the guard against the PROHIBITED ``str(owner_id) !=
-        str(controller_id)`` fix — under that comparison a mismatch of two
-        distinct ids would still abort, but this test pins the behavior C2
-        specifies rather than that one.
+        This covers the ORDINARY mismatch only. Two distinct strings are
+        unequal under any comparison, so this test cannot see the prohibited
+        ``str(owner_id) != str(controller_id)`` fix — that is
+        ``test_numerically_typed_owner_id_is_a_mismatch``'s job.
         """
         src = make_source(tmp_path)
         write_ledger(src, "range_inventory_ladder_ctrl_pad.json", owner_id="somebody_else")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="  ctrl_pad  ")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+
+        assert exc.value.reason is ResumeAbortReason.OWNER_MISMATCH
+
+    def test_numerically_typed_owner_id_is_a_mismatch(self, tmp_path):
+        """A sidecar whose ``controller_id`` is the JSON number ``123`` does NOT
+        own the ledger of the controller whose canonical id is the string
+        ``"123"``.
+
+        C2 admits only ``str`` ids, so a non-str sidecar id is an identity that
+        cannot be verified -> fail closed. This is the one test that can see the
+        PROHIBITED ``str(owner_id) != str(controller_id)`` fix: under coercion
+        ``str(123) == str("123")``, the guard passes, and a ledger of
+        unverifiable provenance is copied into a live trading instance.
+        """
+        src = make_source(tmp_path)
+        write_ledger(src, "range_inventory_ladder_123.json", owner_id=123)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="123")
 
         with pytest.raises(ResumeError) as exc:
             compute_copy_plan(new, src, make_dep())
