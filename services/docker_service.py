@@ -19,6 +19,7 @@ from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
     guard_target_available,
+    resolve_deploy_target,
     seed_resume_state,
 )
 from utils.file_system import fs_util
@@ -49,6 +50,59 @@ _deploy_lock_users: Dict[str, int] = {}
 # How many times to re-roll a staging suffix on the (vanishingly unlikely)
 # chance the random name already exists.
 _STAGING_NAME_ATTEMPTS = 5
+
+# ---------------------------------------------------------------------------
+# No-replace promote (CDX-R01)
+# ---------------------------------------------------------------------------
+#
+# Windows ``os.rename`` is natively no-replace: MoveFileW without
+# MOVEFILE_REPLACE_EXISTING fails when the destination exists at all. POSIX
+# ``rename(2)`` is NOT — SUSv4 says that if the destination is an existing EMPTY
+# directory it "shall be removed" and the source renamed onto it. An
+# ``exists()``-then-``rename()`` promote therefore has a real window on the
+# production platform: a target that appears after the check is silently
+# absorbed rather than refused (CDX-R01).
+#
+# ``_rename`` is a seam so the POSIX branch — the production-Linux code path —
+# can be exercised from a Windows dev box against a model of rename(2)'s
+# documented directory semantics. Production always binds it to ``os.rename``.
+_NATIVE_NOREPLACE_RENAME = os.name == "nt"
+_rename = os.rename
+
+
+def _rename_noreplace(src: str, dst: str) -> None:
+    """Rename ``src`` onto ``dst``, never replacing an existing ``dst``.
+
+    The promote primitive. Atomic (so an instance directory is never observable
+    half-built) AND exclusive (so a target that appeared while this attempt was
+    staging is refused, never merged into or absorbed).
+
+    On POSIX the exclusivity comes from ``os.mkdir``, not from a preceding
+    existence check: mkdir is itself the atomic no-replace primitive — it either
+    creates ``dst``, giving this attempt exclusive ownership of the name, or
+    raises ``FileExistsError``. There is no check-then-act window, which is
+    exactly what a bare ``rename`` over an empty directory would exploit. Once
+    the reservation is held, the only directory the rename can replace is our
+    own empty one.
+
+    Raises:
+        FileExistsError: ``dst`` already exists. Nothing was moved or removed.
+    """
+    if _NATIVE_NOREPLACE_RENAME:
+        _rename(src, dst)
+        return
+    os.mkdir(dst)  # atomic reservation — FileExistsError if the name is taken
+    try:
+        _rename(src, dst)
+    except OSError:
+        # Release the reservation so this name is not blocked by our own
+        # leftover. ``os.rmdir`` refuses a non-empty directory, so this can
+        # never destroy data: anything that landed inside is left for a human.
+        try:
+            os.rmdir(dst)
+        except OSError as rm_exc:
+            logger.error("Could not release promote reservation '%s': %s", dst, rm_exc)
+        raise
 
 
 @asynccontextmanager
@@ -276,8 +330,16 @@ class DockerService:
                 os.makedirs(staging_dir, exist_ok=False)
             except FileExistsError:
                 continue
-            os.makedirs(os.path.join(staging_dir, "data"))
-            os.makedirs(os.path.join(staging_dir, "logs"))
+            # The root is exclusively ours from here. If building it out fails,
+            # remove it right here: the caller's cleanup only arms once this
+            # returns, so an exception escaping now would leak a
+            # <target>.staging-* tree per failed attempt (CDX-R03).
+            try:
+                os.makedirs(os.path.join(staging_dir, "data"))
+                os.makedirs(os.path.join(staging_dir, "logs"))
+            except BaseException:
+                self._remove_staging_dir(staging_dir)
+                raise
             return staging_dir
         raise ResumeError(
             ResumeAbortReason.DEST_EXISTS,
@@ -289,23 +351,28 @@ class DockerService:
     def _promote_staging(staging_dir: str, instance_dir: str) -> None:
         """Publish the fully-built staging dir at its final path, atomically.
 
-        ``os.rename`` between siblings is atomic, so an instance directory never
-        exists in a half-built state: it appears complete or not at all. If the
-        target turned up while this attempt was building, the deploy is refused
-        rather than merged into it — on Windows the rename itself fails for any
-        existing target, on POSIX for any non-empty one. (A POSIX rename over an
-        EMPTY target dir succeeds; that loses no data, and no code path other
-        than a promote creates the target, so an empty one is not an instance.)
+        The rename is atomic between siblings, so an instance directory is never
+        observable half-built: it appears complete or not at all. It is also
+        no-replace (:func:`_rename_noreplace`), so a target that appeared while
+        this attempt was staging is refused rather than merged into.
+
+        There is deliberately NO ``exists()`` pre-check here. A check-then-rename
+        is not an exclusive promote on POSIX — ``rename(2)`` completes over an
+        empty destination directory that appeared in the window, which is the
+        CDX-R01 defect. The primitive is the gate; correctness must not rest on
+        an assumption about which other code paths can create the target.
         """
-        if os.path.exists(instance_dir):
+        try:
+            _rename_noreplace(staging_dir, instance_dir)
+        except FileExistsError as exc:
             raise ResumeError(
                 ResumeAbortReason.DEST_EXISTS,
                 f"Target instance directory '{instance_dir}' appeared while this "
                 f"deploy was staging — refusing to overwrite it.",
-            )
-        try:
-            os.rename(staging_dir, instance_dir)
+            ) from exc
         except OSError as exc:
+            # POSIX refuses a non-empty destination with ENOTEMPTY/EEXIST; any
+            # other OSError that leaves a target behind is the same refusal.
             if os.path.exists(instance_dir):
                 raise ResumeError(
                     ResumeAbortReason.DEST_EXISTS,
@@ -329,7 +396,10 @@ class DockerService:
     async def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
-        instance_dir = os.path.join("bots", 'instances', instance_name)
+        # The one resolver, shared with preview_resume (CDX-R02): if preview and
+        # deploy each joined the path themselves they could drift, and preview's
+        # whole job is to grade the path deploy will actually build.
+        instance_dir = str(resolve_deploy_target("bots", instance_name))
         # Defense in depth: ensure the resolved paths stay within their allowed base directories
         # before any filesystem mutation (makedirs/copytree) takes place.
         self._ensure_contained(instance_dir, os.path.join("bots", "instances"), "instance_name")

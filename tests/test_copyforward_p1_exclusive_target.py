@@ -24,6 +24,7 @@ implementation mutation it is built to catch.
 """
 
 import asyncio
+import errno
 import json
 import os
 import shutil
@@ -38,6 +39,7 @@ import yaml
 from docker.errors import NotFound
 
 from models import V2ControllerDeployment
+from services import docker_service
 from services.docker_service import DockerService
 from services.resume_service import (
     ResumeAbortReason,
@@ -741,3 +743,274 @@ class TestDeployLockRegistry:
 
         assert [k for k in _deploy_locks if k.startswith("EPHEMERAL_")] == []
         assert [k for k in _deploy_lock_users if k.startswith("EPHEMERAL_")] == []
+
+
+# ===========================================================================
+# CDX-R01: the promote primitive must be no-replace on POSIX too
+# ===========================================================================
+
+def _posix_rename(src, dst):
+    """``os.rename`` with POSIX ``rename(2)`` DIRECTORY semantics, modelled from
+    the spec (SUSv4 rename(): if the "new" argument points to an existing empty
+    directory, it shall be removed and "old" renamed to "new"; ENOTEMPTY
+    otherwise).
+
+    This models the kernel, not the unit under test. It is here because the
+    production platform is Linux while this suite runs on Windows, whose
+    ``os.rename`` is natively no-replace and would therefore mask the exact
+    defect CDX-R01 is about. The reservation logic being graded is real
+    production code; only rename(2)'s semantics are supplied.
+    """
+    if os.path.isdir(dst):
+        if os.listdir(dst):
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", dst)
+        os.rmdir(dst)
+    os.rename(src, dst)
+
+
+class TestPromoteIsNoReplace:
+    """CDX-R01: an ``exists()``-then-``rename()`` promote is not exclusive on
+    POSIX — rename(2) completes over an empty destination that appeared in the
+    window. The fix makes the primitive itself the gate (``os.mkdir`` reserves
+    atomically), so there is no window to lose.
+    """
+
+    @pytest.fixture
+    def posix_promote(self, monkeypatch):
+        """Force the POSIX branch and give it POSIX rename(2) semantics."""
+        monkeypatch.setattr(docker_service, "_NATIVE_NOREPLACE_RENAME", False)
+        monkeypatch.setattr(docker_service, "_rename", _posix_rename)
+
+    @staticmethod
+    def _staging(tmp_path):
+        staging = tmp_path / "INST.staging-deadbeef"
+        (staging / "data").mkdir(parents=True)
+        (staging / "data" / LEDGER_NAME).write_bytes(LEDGER_BYTES)
+        return staging
+
+    def test_rename_noreplace_refuses_an_empty_existing_target(self, tmp_path, posix_promote):
+        """The CDX-R01 case: a bare POSIX rename ABSORBS an empty destination
+        directory. The reservation must refuse it instead, moving nothing.
+
+        Catches (mutation): drop the ``os.mkdir(dst)`` reservation in
+        ``_rename_noreplace`` and call ``_rename(src, dst)`` directly — the
+        POSIX semantics above then remove the empty target and the promote
+        succeeds, so no FileExistsError is raised and this fails.
+        """
+        staging = self._staging(tmp_path)
+        target = tmp_path / "INST"
+        target.mkdir()  # the empty dir a bare POSIX rename would silently absorb
+
+        with pytest.raises(FileExistsError):
+            docker_service._rename_noreplace(str(staging), str(target))
+
+        # Nothing moved, nothing removed.
+        assert target.is_dir()
+        assert list(target.iterdir()) == []
+        assert (staging / "data" / LEDGER_NAME).read_bytes() == LEDGER_BYTES
+
+    def test_rename_noreplace_refuses_a_populated_existing_target(self, tmp_path, posix_promote):
+        """A populated target is refused with the same error and survives
+        byte-identical — the operator's data is never the thing that decides
+        whether the promote is safe."""
+        staging = self._staging(tmp_path)
+        target = tmp_path / "INST"
+        (target / "data").mkdir(parents=True)
+        (target / "data" / "sentinel.json").write_bytes(SENTINEL_DATA)
+
+        with pytest.raises(FileExistsError):
+            docker_service._rename_noreplace(str(staging), str(target))
+
+        assert (target / "data" / "sentinel.json").read_bytes() == SENTINEL_DATA
+
+    def test_rename_noreplace_promotes_onto_a_free_target(self, tmp_path, posix_promote):
+        """The reservation must not break the normal promote: a free target gets
+        the fully-built staging tree, and the staging path is gone."""
+        staging = self._staging(tmp_path)
+        target = tmp_path / "INST"
+
+        docker_service._rename_noreplace(str(staging), str(target))
+
+        assert (target / "data" / LEDGER_NAME).read_bytes() == LEDGER_BYTES
+        assert not staging.exists()
+
+    def test_rename_noreplace_releases_its_reservation_when_the_rename_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """An unrelated rename failure must not leave our empty reservation
+        squatting on the target name.
+
+        Catches (mutation): delete the ``os.rmdir(dst)`` release in the
+        ``except OSError`` arm — the target name stays occupied by an empty dir
+        and every later deploy of that name is refused DEST_EXISTS forever.
+        """
+        staging = self._staging(tmp_path)
+        target = tmp_path / "INST"
+
+        def boom(src, dst):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", src)
+
+        monkeypatch.setattr(docker_service, "_NATIVE_NOREPLACE_RENAME", False)
+        monkeypatch.setattr(docker_service, "_rename", boom)
+
+        with pytest.raises(OSError) as err:
+            docker_service._rename_noreplace(str(staging), str(target))
+
+        assert err.value.errno == errno.EXDEV  # the real cause surfaces, not a mask
+        assert not target.exists(), "the reservation was left squatting on the target name"
+
+    def test_promote_maps_a_racing_target_to_dest_exists(self, tmp_path, posix_promote):
+        """End of the chain: the primitive's refusal reaches the caller as the
+        DEST_EXISTS ResumeError the deploy path maps to 409, with both the
+        target and this attempt's staging dir intact for the caller to clean.
+        """
+        staging = self._staging(tmp_path)
+        target = tmp_path / "INST"
+        target.mkdir()
+
+        with pytest.raises(ResumeError) as err:
+            DockerService._promote_staging(str(staging), str(target))
+
+        assert err.value.reason is ResumeAbortReason.DEST_EXISTS
+        assert target.is_dir() and list(target.iterdir()) == []
+        assert (staging / "data" / LEDGER_NAME).read_bytes() == LEDGER_BYTES
+
+
+# ===========================================================================
+# CDX-R03: a failure building out the staging dir must not leak it
+# ===========================================================================
+
+class TestStagingConstructionFailure:
+    @pytest.mark.asyncio
+    async def test_failure_creating_staging_children_leaks_nothing(
+        self, bots_tree, patched_security, monkeypatch
+    ):
+        """Staging root created, then ``data/`` creation fails: the root must go.
+
+        The caller's ``except`` only arms once ``_create_staging_dir`` RETURNS,
+        so a failure inside the constructor bypasses it and every retry strands
+        another ``<target>.staging-*`` tree (CDX-R03).
+
+        Catches (mutation): remove the ``try/except BaseException`` around the
+        data/logs makedirs in ``_create_staging_dir`` — the root survives and
+        the glob below is non-empty.
+        """
+        service = make_service(make_docker_client())
+        real_makedirs = os.makedirs
+
+        def failing_makedirs(path, *args, **kwargs):
+            if os.path.basename(str(path)) == "data" and ".staging-" in str(path):
+                raise OSError(errno.EACCES, "forced staging setup failure", str(path))
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "makedirs", failing_makedirs)
+
+        with pytest.raises(OSError) as err:
+            await service.create_hummingbot_instance(make_deployment())
+
+        assert "forced staging setup failure" in str(err.value)
+        assert list((bots_tree / "instances").glob("*.staging-*")) == []
+        # And the failure did not conjure the target either.
+        assert not (bots_tree / "instances" / NEW_NAME).exists()
+
+
+# ===========================================================================
+# CDX-R02: deploy resolves its target through the SHARED resolver
+# ===========================================================================
+
+class TestDeployUsesSharedTargetResolver:
+    @pytest.mark.asyncio
+    async def test_deploy_builds_where_resolve_deploy_target_says(
+        self, bots_tree, patched_security, monkeypatch
+    ):
+        """``resolve_deploy_target`` is documented as the single source of truth
+        for the instance path, shared by preview and deploy. Deploy used to
+        re-join the path itself, so the two could drift and preview would be
+        grading a path deploy does not build (CDX-R02).
+
+        Redirecting the shared resolver must therefore move the deploy's output.
+
+        Catches (mutation): restore
+        ``instance_dir = os.path.join("bots", 'instances', instance_name)`` in
+        ``create_hummingbot_instance`` — the deploy ignores the redirect, builds
+        at the default path, and both assertions below fail.
+        """
+        service = make_service(make_docker_client())
+        redirected = Path("bots") / "instances" / "REDIRECTED_BY_RESOLVER"
+        monkeypatch.setattr(
+            docker_service, "resolve_deploy_target", lambda bots_path, name: redirected
+        )
+
+        result = await service.create_hummingbot_instance(make_deployment())
+
+        assert result["success"]
+        assert (bots_tree / "instances" / "REDIRECTED_BY_RESOLVER" / "data" / LEDGER_NAME).exists()
+        assert not (bots_tree / "instances" / NEW_NAME).exists()
+
+
+# ===========================================================================
+# CDX-R04: the per-name lock is actually held across the deploy
+# ===========================================================================
+
+class TestDeployLockIntegration:
+    @pytest.mark.asyncio
+    async def test_second_same_name_deploy_cannot_enter_staging_while_first_holds_lock(
+        self, bots_tree, patched_security, monkeypatch
+    ):
+        """CDX-R04 — the lock's own guarantee, proven on the deploy path.
+
+        ``TestConcurrentDeploys`` and ``TestDeployLockRegistry`` both pass with
+        the lock keyed uniquely per call (i.e. serialisation disabled): the
+        former is satisfied by exclusive-create + atomic promote alone, the
+        latter exercises the helper in isolation. Neither reaches
+        ``create_hummingbot_instance``'s use of it. This one hooks the real
+        staging step and asserts the second deploy never enters it.
+
+        Catches (mutation): key the lock uniquely per call, e.g.
+        ``_instance_deploy_lock(f"{instance_name}-{secrets.token_hex(4)}")`` in
+        ``create_hummingbot_instance`` — B then acquires immediately, passes the
+        target guard (A has not promoted yet) and enters staging while A is
+        parked, so ``stage_entries`` holds two names and this fails.
+        """
+        service = make_service(make_docker_client())
+
+        a_in_staging = asyncio.Event()
+        release_a = asyncio.Event()
+        stage_entries = []
+        real_stage = service._stage_instance
+
+        async def watched_stage(config, staging_dir, instance_name, source_credentials_dir):
+            stage_entries.append(instance_name)
+            if len(stage_entries) == 1:
+                a_in_staging.set()
+                await release_a.wait()
+            return await real_stage(config, staging_dir, instance_name, source_credentials_dir)
+
+        monkeypatch.setattr(service, "_stage_instance", watched_stage)
+
+        task_a = asyncio.create_task(service.create_hummingbot_instance(make_deployment()))
+        await asyncio.wait_for(a_in_staging.wait(), timeout=5.0)
+
+        task_b = asyncio.create_task(service.create_hummingbot_instance(make_deployment()))
+        # Give B every scheduling opportunity to get in. Serialised, it is parked
+        # at the name lock and has not run the guard, created staging, or staged.
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+        assert stage_entries == [NEW_NAME], (
+            "a second deploy of the same name entered staging while the first held "
+            f"the lock — create+seed+promote is not serialised: {stage_entries}"
+        )
+
+        release_a.set()
+        result_a = await asyncio.wait_for(task_a, timeout=5.0)
+        with pytest.raises(ResumeError) as err:
+            await asyncio.wait_for(task_b, timeout=5.0)
+
+        assert result_a["success"]
+        # B was refused at the target guard, downstream of the lock and upstream
+        # of any work: it never staged, and it left nothing behind.
+        assert err.value.reason is ResumeAbortReason.DEST_EXISTS
+        assert stage_entries == [NEW_NAME]
+        assert list((bots_tree / "instances").glob("*.staging-*")) == []
+        assert (bots_tree / "instances" / NEW_NAME / "data" / LEDGER_NAME).read_bytes() == LEDGER_BYTES
