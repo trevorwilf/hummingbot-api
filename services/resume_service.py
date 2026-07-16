@@ -752,17 +752,35 @@ def _assert_contained(candidate: Path, root: Path, label: str, controller_id) ->
     Not memoized, deliberately (same reasoning as the engine's): what is being
     checked is the path's resolution, and that is mutable.
 
+    If either path cannot be RESOLVED, this fails closed. There is no lexical
+    fallback: a lexical path proves only where the string points, and what is being
+    checked here is where the filesystem points — the two differ by exactly the
+    symlink this function exists to catch. Substituting the lexical path would let
+    an unresolvable candidate pass containment and be classified ``fresh_seed``,
+    i.e. deploy without prior state. Uncertainty is a refusal, not a pass.
+
     Returns:
         The resolved path.
 
     Raises:
-        ResumeError: ``STATE_FILE_PATH_INVALID`` if it escapes ``root``.
+        ResumeError: ``STATE_FILE_PATH_INVALID`` if it escapes ``root``, or if
+            either path cannot be resolved.
     """
-    root_resolved = Path(root).resolve()
-    try:
-        resolved = Path(candidate).resolve()
-    except OSError:  # pragma: no cover - defensive; resolve(strict=False) rarely raises
-        resolved = Path(candidate).absolute()
+    resolved_paths = []
+    for path, what in ((root, f"{label} containment root"), (candidate, label)):
+        try:
+            resolved_paths.append(Path(path).resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            # OSError: filesystem refused; RuntimeError: symlink loop;
+            # ValueError: embedded null byte. Any of them means "cannot prove
+            # containment" — the only safe answer is no.
+            raise ResumeError(
+                ResumeAbortReason.STATE_FILE_PATH_INVALID,
+                f"Controller '{controller_id}': the {what} '{path}' could not be "
+                f"resolved ({type(exc).__name__}: {exc}); CONTRACT C1 containment "
+                f"cannot be verified. Failing closed.",
+            )
+    root_resolved, resolved = resolved_paths
     if resolved == root_resolved or root_resolved not in resolved.parents:
         raise ResumeError(
             ResumeAbortReason.STATE_FILE_PATH_INVALID,

@@ -39,6 +39,42 @@ from services.resume_service import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def link_dir_out_of_tree(link: "os.PathLike", target: "os.PathLike") -> None:
+    """Create ``link`` as a directory link to ``target``, or FAIL the test.
+
+    The C1 runtime-containment tests are the only coverage of the symlink escape,
+    so they must never silently vanish. A ``pytest.skip`` here would mean the
+    security invariant is unproven on exactly the platform whose path semantics
+    make it interesting — a green suite that verified nothing.
+
+    Symlink creation on Windows needs SeCreateSymbolicLinkPrivilege (Developer
+    Mode or admin). Directory JUNCTIONS need no privilege and are resolved by
+    ``Path.resolve`` identically, so they exercise the same code path. We try a
+    symlink, fall back to a junction, and fail loudly if neither is available
+    rather than skipping.
+    """
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError) as symlink_exc:
+        if os.name != "nt":
+            pytest.fail(
+                f"Could not create the symlink this containment test requires "
+                f"({symlink_exc}). Refusing to skip: that would leave CONTRACT C1's "
+                f"runtime half unverified."
+            )
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        except Exception as junction_exc:
+            pytest.fail(
+                f"Could not create a symlink ({symlink_exc}) or a junction "
+                f"({junction_exc}) for this containment test. Refusing to skip: that "
+                f"would leave CONTRACT C1's runtime half unverified on this host."
+            )
+
+
 def make_dep(extra_paths=None, allow_absolute_state_file_name=False):
     """A minimal deploy stand-in — compute_copy_plan reads resume_extra_paths and
     the CONTRACT C1 opt-out.
@@ -422,10 +458,7 @@ class TestC1RuntimeContainment:
         outside.mkdir()
         new_data = new / "data"
         new_data.mkdir(parents=True)
-        try:
-            (new_data / "sub").symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            pytest.skip("symlink creation not permitted on this host")
+        link_dir_out_of_tree(new_data / "sub", outside)
 
         write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")
 
@@ -440,10 +473,7 @@ class TestC1RuntimeContainment:
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "x.json").write_text('{"seed_value_quote": 1}', encoding="utf-8")
-        try:
-            (src.data_dir / "sub").symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            pytest.skip("symlink creation not permitted on this host")
+        link_dir_out_of_tree(src.data_dir / "sub", outside)
 
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")

@@ -41,10 +41,15 @@ import pytest
 import yaml
 from docker.errors import NotFound
 
-from models.bot_orchestration import V2ControllerDeployment
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from models.bot_orchestration import V2ControllerDeployment, V2ScriptDeployment
 from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
+    _assert_contained,
     preview_resume,
 )
 from services.state_file_contract import (
@@ -344,3 +349,129 @@ class TestPreviewC1:
         assert result["warnings"] == []
         planned = {os.path.basename(f["dst"]) for f in result["files"]}
         assert custom in planned
+
+
+# ===========================================================================
+# 5.  CONTRACT C1: the opt-out is an EXPLICIT boolean (adjudication CDX-R01)
+# ===========================================================================
+
+def _valid_request(model, **overrides):
+    """Minimal VALID kwargs for a deployment request model, plus overrides.
+
+    Each model has its own required fields; supplying them is what makes a
+    rejection attributable to the opt-out field and nothing else.
+    """
+    kwargs = {"instance_name": "inst", "credentials_profile": "master_account"}
+    if model is V2ControllerDeployment:
+        kwargs["controllers_config"] = ["ctrl.yml"]
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestOptOutIsStrictlyBoolean:
+    """C1 words the opt-out as "an explicit opt-out boolean". Pydantic's lax
+    ``bool`` coerces "true"/"yes"/"on"/1 to ``True``; that would let a client
+    disarm a fail-closed money guard without ever sending a boolean. The field is
+    ``StrictBool``, so only literal JSON booleans are accepted.
+
+    Expected values come from the C1 spec text, not from the implementation.
+    """
+
+    # Values pydantic's LAX bool would happily coerce to True. Each must be a
+    # request-validation error instead: not-a-boolean is not an opt-out.
+    COERCIBLE_TRUTHY = ["true", "True", "yes", "on", "t", "y", 1, 1.0]
+    # The falsy mirror: these must ALSO be refused. A client that cannot spell
+    # `false` correctly is a client whose `true` we should not trust either.
+    COERCIBLE_FALSY = ["false", "no", "off", 0]
+
+    @pytest.mark.parametrize("model", [V2ScriptDeployment, V2ControllerDeployment])
+    @pytest.mark.parametrize("value", COERCIBLE_TRUTHY + COERCIBLE_FALSY)
+    def test_non_boolean_opt_out_is_rejected_by_the_request_model(self, model, value):
+        with pytest.raises(ValidationError) as exc:
+            model(**_valid_request(model, allow_absolute_state_file_name=value))
+        # Assert on the error LOCATION, not on str(exc): a substring match would
+        # also pass on an unrelated validation error whose input_value repr merely
+        # happens to echo the field name back.
+        locs = [err["loc"] for err in exc.value.errors()]
+        assert locs == [("allow_absolute_state_file_name",)], locs
+
+    @pytest.mark.parametrize("model", [V2ScriptDeployment, V2ControllerDeployment])
+    @pytest.mark.parametrize("value", [True, False])
+    def test_literal_booleans_are_accepted_verbatim(self, model, value):
+        dep = model(**_valid_request(model, allow_absolute_state_file_name=value))
+        assert dep.allow_absolute_state_file_name is value
+
+    @pytest.mark.parametrize("model", [V2ScriptDeployment, V2ControllerDeployment])
+    def test_default_is_false_when_the_field_is_omitted(self, model):
+        dep = model(**_valid_request(model))
+        assert dep.allow_absolute_state_file_name is False
+
+
+# ===========================================================================
+# 6.  CONTRACT C1 runtime half: unresolvable == refused (adjudication CDX-R02)
+# ===========================================================================
+
+class TestContainmentFailsClosedOnResolutionError:
+    """``_assert_contained`` proves containment by RESOLVING. If resolution
+    fails, containment is unproven, and C1 plus the batch-wide fail-closed rule
+    make unproven a refusal. There is no lexical fallback: a lexical path is
+    exactly the thing that cannot see the symlink this check exists to catch.
+    """
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            OSError("resolution unavailable"),
+            RuntimeError("symlink loop"),
+            ValueError("embedded null byte"),
+        ],
+    )
+    def test_candidate_resolution_failure_aborts(self, tmp_path, monkeypatch, exc):
+        root = tmp_path / "data"
+        root.mkdir()
+        candidate = root / "ledger.json"
+
+        real_resolve = Path.resolve
+
+        def fake_resolve(self, *args, **kwargs):
+            if self == candidate:
+                raise exc
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+        with pytest.raises(ResumeError) as err:
+            _assert_contained(candidate, root, "source ledger path", "ctrl_a")
+        assert err.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_root_resolution_failure_aborts_rather_than_raising_opaquely(
+        self, tmp_path, monkeypatch
+    ):
+        """The root is resolved too. A raw OSError escaping here would surface as
+        an opaque 500 instead of the structured C1 abort."""
+        root = tmp_path / "data"
+        root.mkdir()
+        candidate = root / "ledger.json"
+
+        real_resolve = Path.resolve
+
+        def fake_resolve(self, *args, **kwargs):
+            if self == root:
+                raise OSError("root unavailable")
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+        with pytest.raises(ResumeError) as err:
+            _assert_contained(candidate, root, "ledger destination", "ctrl_a")
+        assert err.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_resolvable_contained_path_still_passes(self, tmp_path):
+        """The guard rejects UNRESOLVABLE paths, not ordinary ones: a plain
+        contained path is unaffected."""
+        root = tmp_path / "data"
+        root.mkdir()
+        candidate = root / "sub" / "ledger.json"
+        assert _assert_contained(candidate, root, "ledger destination", "ctrl_a") == (
+            candidate.resolve()
+        )

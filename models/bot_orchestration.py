@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
 
 # Safe single path component names: prevents path traversal via '/', '\' or '..'.
 # Mirrors services.accounts_service.SAFE_NAME_PATTERN (replicated locally to avoid a
@@ -154,12 +154,17 @@ class V2ScriptDeployment(BaseModel):
     # controller whose state_file_name is absolute aborts the deploy. Setting this
     # accepts the skip deliberately and permits ABSOLUTE paths ONLY — traversal and
     # drive-/root-relative names are refused regardless (services/state_file_contract.py).
-    allow_absolute_state_file_name: bool = Field(
+    # StrictBool, not bool: CONTRACT C1 says the opt-out is an *explicit boolean*.
+    # Pydantic's lax bool coerces "true"/"yes"/"on"/1 to True, which would let a
+    # stringly-typed client disarm a fail-closed money guard without ever sending a
+    # boolean. Only literal JSON true/false is accepted.
+    allow_absolute_state_file_name: StrictBool = Field(
         default=False,
         description=(
             "Permit controllers whose state_file_name is an ABSOLUTE path. Their state "
             "is skipped by the resume hook (not copied) and a structured warning is "
-            "returned. Never permits '..' traversal. Default False aborts such a deploy."
+            "returned. Never permits '..' traversal. Default False aborts such a deploy. "
+            "Must be a literal boolean: strings and integers are rejected."
         ),
     )
 
@@ -227,12 +232,17 @@ class V2ControllerDeployment(BaseModel):
     # controller whose state_file_name is absolute aborts the deploy. Setting this
     # accepts the skip deliberately and permits ABSOLUTE paths ONLY — traversal and
     # drive-/root-relative names are refused regardless (services/state_file_contract.py).
-    allow_absolute_state_file_name: bool = Field(
+    # StrictBool, not bool: CONTRACT C1 says the opt-out is an *explicit boolean*.
+    # Pydantic's lax bool coerces "true"/"yes"/"on"/1 to True, which would let a
+    # stringly-typed client disarm a fail-closed money guard without ever sending a
+    # boolean. Only literal JSON true/false is accepted.
+    allow_absolute_state_file_name: StrictBool = Field(
         default=False,
         description=(
             "Permit controllers whose state_file_name is an ABSOLUTE path. Their state "
             "is skipped by the resume hook (not copied) and a structured warning is "
-            "returned. Never permits '..' traversal. Default False aborts such a deploy."
+            "returned. Never permits '..' traversal. Default False aborts such a deploy. "
+            "Must be a literal boolean: strings and integers are rejected."
         ),
     )
 
