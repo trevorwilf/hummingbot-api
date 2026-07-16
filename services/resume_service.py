@@ -33,6 +33,12 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from services.state_file_contract import (
+    ALLOW_ABSOLUTE_FIELD,
+    StateFileStatus,
+    classify_state_file_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +63,10 @@ class ResumeAbortReason(str, Enum):
     DEST_EXISTS = "DEST_EXISTS"
     DEST_NOT_EMPTY = "DEST_NOT_EMPTY"
     UNGRACEFUL_SOURCE = "UNGRACEFUL_SOURCE"
+    # CONTRACT C1 (CDX-007/CLA-004): a state_file_name outside the C1 accept set.
+    # Added after the up-front declaration below because the C1 api half had no
+    # abort reason at all — the violating deploy used to SUCCEED (skip-and-proceed).
+    STATE_FILE_PATH_INVALID = "STATE_FILE_PATH_INVALID"
     EXTRA_PATH_ESCAPE = "EXTRA_PATH_ESCAPE"
     EXTRA_PATH_MISSING = "EXTRA_PATH_MISSING"
     COPY_IO_ERROR = "COPY_IO_ERROR"
@@ -530,24 +540,6 @@ def _is_excluded(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in _EXCLUDE_PATTERNS)
 
 
-def _is_absolute_state_file(name: str) -> bool:
-    """True if a ``state_file_name`` escapes ``data/`` — i.e. it is absolute.
-
-    Detects BOTH POSIX (``/...``) and Windows drive-letter / UNC roots
-    regardless of the host OS, because prod is Linux and dev is Windows and
-    ``pathlib.Path.is_absolute()`` only recognises the *host's* flavour. Mirrors
-    the extra-paths guard in ``models/bot_orchestration.py``.
-    """
-    if not name:
-        return False
-    if name.startswith("/") or name.startswith("\\"):
-        return True
-    # Windows drive-letter absolute, e.g. ``C:\x`` or ``C:/x`` (or bare ``C:``).
-    if len(name) >= 2 and name[1] == ":" and (len(name) == 2 or name[2] in ("/", "\\")):
-        return True
-    return Path(name).is_absolute()
-
-
 @dataclass
 class CopyItem:
     """One entry in a :class:`CopyPlan`.
@@ -583,11 +575,16 @@ class CopyPlan:
         items: Every planned item (copyable files + audit markers).
         decisions: ``controller_id -> "copied" | "fresh_seed" | "skipped"``.
         warnings: Loud, operator-facing warning strings (also logged at WARNING).
+        structured_warnings: The machine-readable half of ``warnings`` — the
+            entries an API caller can branch on instead of grepping prose. A log
+            line is invisible to whoever posted the deploy; C1's opt-out is only
+            honest if the resulting skip comes back in the response.
     """
 
     items: List[CopyItem] = field(default_factory=list)
     decisions: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    structured_warnings: List[dict] = field(default_factory=list)
 
     @property
     def files_to_copy(self) -> List[CopyItem]:
@@ -597,6 +594,14 @@ class CopyPlan:
     def _warn(self, message: str) -> None:
         logger.warning(message)
         self.warnings.append(message)
+
+    def _warn_structured(self, code: str, message: str, **fields) -> None:
+        """Record a warning in BOTH channels: the human string list and the
+        structured list that reaches the deploy/preview response body."""
+        self._warn(message)
+        entry = {"code": code, "message": message}
+        entry.update(fields)
+        self.structured_warnings.append(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -662,16 +667,21 @@ def _is_sqlite_deployment(new_instance_dir: Path) -> bool:
 # Per-controller ledger resolution
 # ---------------------------------------------------------------------------
 
-def _expected_ledger_name(config: dict) -> Optional[str]:
-    """Return the expected state-file name for a controller config, or ``None``
-    if ``state_file_name`` is absolute (escapes ``data/``, §6.2).
+def _expected_ledger_name(config: dict, canonical_state_file_name: Optional[str]) -> str:
+    """Return the expected state-file name for a controller config.
 
-    Mirrors ``range_inventory_ladder.py:1471`` — ``state_file_name`` if set,
-    else ``range_inventory_ladder_<id>.json``.
+    Mirrors ``range_inventory_ladder.py:1624`` — the state file name if set, else
+    ``range_inventory_ladder_<id>.json``.
+
+    Args:
+        config: The staged controller config.
+        canonical_state_file_name: The C1-CANONICAL (stripped) value from
+            :func:`classify_state_file_name`, or ``None`` when unset. Taken as a
+            parameter rather than re-read from ``config`` so this cannot silently
+            use the raw value: only a C1-classified name ever reaches a path here.
     """
-    state_file_name = config.get("state_file_name")
-    if state_file_name:
-        return str(state_file_name)
+    if canonical_state_file_name:
+        return canonical_state_file_name
     controller_id = config.get("id")
     return f"range_inventory_ladder_{controller_id}.json"
 
@@ -728,31 +738,147 @@ def _read_owner_controller_id(owner_path: Path) -> str:
     return owner_id
 
 
-def _plan_controller(config: dict, source: "ResolvedSource", new_data_dir: Path, plan: CopyPlan) -> Optional[str]:
+def _assert_contained(candidate: Path, root: Path, label: str, controller_id) -> Path:
+    """Runtime half of CONTRACT C1: resolve ``candidate`` and assert it is a
+    STRICT descendant of ``root``, aborting rather than proceeding on violation.
+
+    Mirrors ``_assert_path_contained`` (range_inventory_ladder.py:116). The
+    lexical classifier cannot see the filesystem, so it cannot see a symlink: a
+    perfectly C1-clean ``sub/ledger.json`` still escapes if ``sub`` is a symlink
+    to ``/etc``. Resolving is the only check that catches it, so it runs at plan
+    time — before any copy, and on the preview path too, which never copies at all
+    and would otherwise never be checked.
+
+    Not memoized, deliberately (same reasoning as the engine's): what is being
+    checked is the path's resolution, and that is mutable.
+
+    If either path cannot be RESOLVED, this fails closed. There is no lexical
+    fallback: a lexical path proves only where the string points, and what is being
+    checked here is where the filesystem points — the two differ by exactly the
+    symlink this function exists to catch. Substituting the lexical path would let
+    an unresolvable candidate pass containment and be classified ``fresh_seed``,
+    i.e. deploy without prior state. Uncertainty is a refusal, not a pass.
+
+    Returns:
+        The resolved path.
+
+    Raises:
+        ResumeError: ``STATE_FILE_PATH_INVALID`` if it escapes ``root``, or if
+            either path cannot be resolved.
+    """
+    resolved_paths = []
+    for path, what in ((root, f"{label} containment root"), (candidate, label)):
+        try:
+            resolved_paths.append(Path(path).resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            # OSError: filesystem refused; RuntimeError: symlink loop;
+            # ValueError: embedded null byte. Any of them means "cannot prove
+            # containment" — the only safe answer is no.
+            raise ResumeError(
+                ResumeAbortReason.STATE_FILE_PATH_INVALID,
+                f"Controller '{controller_id}': the {what} '{path}' could not be "
+                f"resolved ({type(exc).__name__}: {exc}); CONTRACT C1 containment "
+                f"cannot be verified. Failing closed.",
+            )
+    root_resolved, resolved = resolved_paths
+    if resolved == root_resolved or root_resolved not in resolved.parents:
+        raise ResumeError(
+            ResumeAbortReason.STATE_FILE_PATH_INVALID,
+            f"Controller '{controller_id}': the {label} '{candidate}' resolves to "
+            f"'{resolved}', which is not contained in '{root_resolved}' — CONTRACT C1 "
+            f"containment violation (a symlink escape resolves here even when the "
+            f"configured name is lexically clean). Failing closed.",
+        )
+    return resolved
+
+
+def _plan_controller(
+    config: dict,
+    source: "ResolvedSource",
+    new_data_dir: Path,
+    plan: CopyPlan,
+    allow_absolute_state_file_name: bool = False,
+) -> Optional[str]:
     """Plan the copy for one range-ladder controller; mutate ``plan`` in place.
 
-    Returns the expected ledger *filename* handled for this controller (so the
-    reverse scan can skip it), or ``None`` when nothing on disk was named
-    (absolute-skip or fresh-seed).
+    CONTRACT C1 (CDX-007/CLA-004) is enforced here, on the raw
+    ``state_file_name``, BEFORE it is ever joined to a path. The old code asked
+    only "is this absolute?" and, when the answer was yes, SKIPPED the controller
+    and let the deploy succeed — a bot resumed with no ledger and re-seeded from
+    the wallet, which is the insufficient-funds bug this hook exists to prevent.
+    A skip is not a safe default for a path we cannot honour; an abort is.
+
+    Args:
+        allow_absolute_state_file_name: The deploy request's explicit C1 opt-out.
+            Rescues ABSOLUTE names ONLY (they take the old skip path, with a
+            structured warning in the response) — never traversal, never
+            drive-/root-relative forms.
+
+    Returns:
+        The expected ledger *filename* handled for this controller (so the
+        reverse scan can skip it), or ``None`` when nothing on disk was named
+        (opt-out skip).
+
+    Raises:
+        ResumeError: ``STATE_FILE_PATH_INVALID`` on any C1 violation.
     """
     controller_id = config.get("id")
-    state_file_name = config.get("state_file_name")
+    raw_state_file_name = config.get("state_file_name")
+    verdict = classify_state_file_name(raw_state_file_name)
 
-    # §6.2 — absolute state_file_name escapes data/: skip + loud warning.
-    if state_file_name and _is_absolute_state_file(str(state_file_name)):
+    # C1 REJECT: traversal, drive-/root-relative, `.`, non-str, non-descendant.
+    # The opt-out cannot reach this branch — it permits absolute paths, never these.
+    if verdict.status is StateFileStatus.INVALID:
+        raise ResumeError(
+            ResumeAbortReason.STATE_FILE_PATH_INVALID,
+            f"Controller '{controller_id}': {verdict.reason} Refusing to deploy "
+            f"(CONTRACT C1, fail-closed).",
+        )
+
+    if verdict.status is StateFileStatus.ABSOLUTE:
+        if not allow_absolute_state_file_name:
+            raise ResumeError(
+                ResumeAbortReason.STATE_FILE_PATH_INVALID,
+                f"Controller '{controller_id}': {verdict.reason} The resume hook cannot "
+                f"carry it forward, and silently deploying without this controller's "
+                f"ledger would re-seed it from the wallet. Refusing to deploy "
+                f"(CONTRACT C1, fail-closed). Set '{ALLOW_ABSOLUTE_FIELD}: true' on the "
+                f"deploy request to accept the skip deliberately.",
+            )
+        # Opt-out taken: the old skip path, but now an explicitly requested one
+        # that is reported back to the caller rather than buried in a log line.
         plan.items.append(
-            CopyItem(src=Path(str(state_file_name)), dst=None, controller_id=controller_id, kind="absolute_skipped")
+            CopyItem(
+                src=Path(verdict.canonical),
+                dst=None,
+                controller_id=controller_id,
+                kind="absolute_skipped",
+            )
         )
         plan.decisions[controller_id] = "skipped"
-        plan._warn(
-            f"Controller '{controller_id}': state_file_name '{state_file_name}' is an absolute path — "
-            f"it escapes data/ and is not the resume hook's to manage (shared-mount scheme assumed). Skipping."
+        plan._warn_structured(
+            "STATE_FILE_ABSOLUTE_SKIPPED",
+            f"Controller '{controller_id}': state_file_name '{verdict.canonical}' is an "
+            f"absolute path — it escapes data/ and is not the resume hook's to manage "
+            f"(shared-mount scheme assumed). Skipping this controller's state because "
+            f"'{ALLOW_ABSOLUTE_FIELD}' was set on the deploy request: it will start from "
+            f"whatever is at that absolute path, or re-seed from the wallet if nothing is.",
+            controller_id=controller_id,
+            state_file_name=verdict.canonical,
         )
         return None
 
-    ledger_name = _expected_ledger_name(config)
+    # UNSET -> the engine's default name; RELATIVE_OK -> the canonical (stripped) value.
+    ledger_name = _expected_ledger_name(config, verdict.canonical)
     src_ledger = source.data_dir / ledger_name
     src_owner = source.data_dir / f"{ledger_name}.owner"
+
+    # Runtime containment (C1's belt-and-braces half): the concrete source and
+    # destination must resolve strictly inside their data/ roots. Lexically clean
+    # names still escape through symlinks, and the destination is where a bad name
+    # would have us WRITE.
+    _assert_contained(src_ledger, source.data_dir, "source ledger path", controller_id)
+    _assert_contained(new_data_dir / ledger_name, new_data_dir, "ledger destination", controller_id)
 
     # No ledger in source -> warn + fresh seed for THIS controller only (§6 table).
     if not src_ledger.exists():
@@ -782,7 +908,12 @@ def _plan_controller(config: dict, source: "ResolvedSource", new_data_dir: Path,
         # No sidecar. A custom state_file_name carries no id in its name, so
         # identity is unverifiable -> fail closed. A default-named ledger embeds
         # the id in its filename -> warn + copy.
-        if state_file_name:
+        #
+        # Keyed off the C1-CANONICAL value, not the raw one: a whitespace-only
+        # state_file_name is UNSET by contract, so it takes the default-named
+        # branch (whose filename does carry the id) rather than being treated as a
+        # custom name of "   ".
+        if verdict.canonical is not None:
             raise ResumeError(
                 ResumeAbortReason.OWNER_MISMATCH,
                 f"Ledger '{src_ledger}' has a custom state_file_name but no '.owner' sidecar; "
@@ -908,18 +1039,25 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
         new_instance_dir: The new instance's root dir (its ``conf/`` is already
             staged; its ``data/`` is where files will land).
         source: The :class:`ResolvedSource` from :func:`resolve_source` (P2).
-        deployment: The deploy model (reads ``resume_extra_paths``).
+        deployment: The deploy model (reads ``resume_extra_paths`` and the
+            CONTRACT C1 opt-out ``allow_absolute_state_file_name``).
 
     Returns:
         A :class:`CopyPlan` (items, per-controller decisions, warnings).
 
     Raises:
         ResumeError: fail-closed on ``LEDGER_INVALID`` / ``OWNER_MISMATCH`` /
-            ``EXTRA_PATH_ESCAPE`` / ``EXTRA_PATH_MISSING`` (§11).
+            ``STATE_FILE_PATH_INVALID`` / ``EXTRA_PATH_ESCAPE`` /
+            ``EXTRA_PATH_MISSING`` (§11).
     """
     new_instance_dir = Path(new_instance_dir)
     new_data_dir = new_instance_dir / "data"
     plan = CopyPlan()
+
+    # CONTRACT C1 opt-out. ``getattr`` default False is the fail-closed default:
+    # a deploy model that never heard of the field, or a caller that omitted it,
+    # gets the rejection — the opt-out is only ever reachable by asking for it.
+    allow_absolute = getattr(deployment, ALLOW_ABSOLUTE_FIELD, False) is True
 
     deployed_ids: set = set()
     handled_names: set = set()
@@ -933,7 +1071,7 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
             logger.warning("Staged range-ladder controller with no 'id' — skipping.")
             continue
         deployed_ids.add(controller_id)
-        handled = _plan_controller(config, source, new_data_dir, plan)
+        handled = _plan_controller(config, source, new_data_dir, plan, allow_absolute)
         if handled:
             handled_names.add(handled)
             handled_names.add(f"{handled}.owner")
@@ -1584,6 +1722,10 @@ async def _seed(
         "mode": deployment.resume_mode,
         "files": files,
         "decisions": dict(plan.decisions),
+        # The structured half of plan.warnings — C1's opt-out skip has to reach
+        # whoever posted the deploy, not just the log (see _warn_structured).
+        # ``create_hummingbot_instance`` lifts these onto the response.
+        "warnings": list(plan.structured_warnings),
         "drift": drift,
         "guard_report": guard_report.to_dict(),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1928,6 +2070,10 @@ async def preview_resume(
             },
             "files": files,
             "decisions": dict(plan.decisions),
+            # Structured, machine-readable warnings (C1 opt-out skips land here).
+            # The preview is a pre-deploy check: a skip the deploy would perform is
+            # exactly what an operator needs to see BEFORE deploying.
+            "warnings": list(plan.structured_warnings),
             "guard_report": guard_report.to_dict(),
             "would_succeed": True,
         }

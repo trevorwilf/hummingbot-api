@@ -418,7 +418,7 @@ class DockerService:
 
             staging_dir = self._create_staging_dir(instance_name)
             try:
-                gateway_certs_host_dir = await self._stage_instance(
+                gateway_certs_host_dir, resume_manifest = await self._stage_instance(
                     config, staging_dir, instance_name, source_credentials_dir
                 )
                 self._promote_staging(staging_dir, instance_dir)
@@ -428,9 +428,18 @@ class DockerService:
                 self._remove_staging_dir(staging_dir)
                 raise
 
-        return self._run_instance_container(
+        response = self._run_instance_container(
             config, bots_path, instance_name, instance_dir, gateway_certs_host_dir
         )
+
+        # Surface the resume hook's structured warnings (CONTRACT C1's opt-out skip
+        # is the first of them) on the deploy response. A skipped controller means a
+        # bot came up without its ledger; the operator who asked for that is entitled
+        # to see it in the reply rather than find it in a log later.
+        resume_warnings = (resume_manifest or {}).get("warnings") or []
+        if resume_warnings:
+            response["resume_warnings"] = resume_warnings
+        return response
 
     async def _stage_instance(
         self,
@@ -441,7 +450,13 @@ class DockerService:
     ):
         """Build the complete instance inside ``staging_dir``: conf, client
         config, and the seeded ``data/``. Nothing here touches the target path,
-        so a failure at any point leaves the bot tree exactly as it was."""
+        so a failure at any point leaves the bot tree exactly as it was.
+
+        Returns:
+            ``(gateway_certs_host_dir, resume_manifest)``. ``resume_manifest`` is
+            ``None`` when the resume hook did not run (``resume_mode == "off"``);
+            the caller reads its ``warnings`` onto the deploy response.
+        """
         # ``fs_util`` paths are relative to its base ("bots"); the instance is
         # still under its staging name at this point.
         staging_fs_rel = f"instances/{os.path.basename(staging_dir)}"
@@ -530,8 +545,9 @@ class DockerService:
         # logs bot_resume_failed, removes the staging dir it was told this attempt
         # created, and re-raises — the container never starts on a failed or
         # partial seed, and the promote never happens.
+        resume_manifest = None
         if config.resume_mode != "off":
-            await seed_resume_state(
+            resume_manifest = await seed_resume_state(
                 deployment=config,
                 new_instance_dir=Path(staging_dir),
                 bots_path=Path("bots"),
@@ -543,7 +559,7 @@ class DockerService:
                 created_by_this_attempt=True,
             )
 
-        return gateway_certs_host_dir
+        return gateway_certs_host_dir, resume_manifest
 
     def _run_instance_container(
         self,

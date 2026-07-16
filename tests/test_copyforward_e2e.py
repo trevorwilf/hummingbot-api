@@ -311,12 +311,19 @@ class TestE2EHappyPath:
 # ===========================================================================
 #
 # Each entry is (row_id, expected_reason). ``expected_reason is None`` marks the
-# two §11 rows whose action is NOT an abort (per-controller semantics, §6): an
+# §11 rows whose action is NOT an abort (per-controller semantics, §6): an
 # expected-ledger-missing controller fresh-seeds, and an absolute
-# ``state_file_name`` is skipped+warned — both proceed to containers.run. No §11
-# row is skipped. ARCHIVE_NESTED / EXTRA_PATH_MISSING are not distinct §11 rows
-# (they are resolution/extra-path sub-cases folded into the "not found" and
-# "escape" rows) and are covered in the P2/P3 unit suites.
+# ``state_file_name`` is skipped+warned ONLY when the deploy explicitly opted out
+# under CONTRACT C1 — both proceed to containers.run. No §11 row is skipped.
+# ARCHIVE_NESTED / EXTRA_PATH_MISSING are not distinct §11 rows (they are
+# resolution/extra-path sub-cases folded into the "not found" and "escape" rows)
+# and are covered in the P2/P3 unit suites.
+#
+# CDX-007/CLA-004 (CONTRACT C1) — SPEC CHANGE: ``state_file_absolute_skip`` used
+# to sit here as a non-abort row, because an absolute ``state_file_name`` was
+# skipped and the deploy SUCCEEDED without that controller's ledger. That is the
+# fail-open this phase closes: the row is now an abort, and the skip survives only
+# behind the explicit ``allow_absolute_state_file_name`` opt-out (its own row).
 
 _MATRIX = [
     ("source_not_found", ResumeAbortReason.SOURCE_NOT_FOUND),
@@ -325,7 +332,9 @@ _MATRIX = [
     ("ledger_missing_fresh_seed", None),        # §11 "expected ledger missing" -> warn+fresh seed
     ("ledger_invalid", ResumeAbortReason.LEDGER_INVALID),
     ("owner_mismatch", ResumeAbortReason.OWNER_MISMATCH),
-    ("state_file_absolute_skip", None),         # §11 "state_file_name absolute" -> skip+warn
+    # C1: absolute state_file_name -> abort by default, skip+warn only on opt-out.
+    ("state_file_absolute_abort", ResumeAbortReason.STATE_FILE_PATH_INVALID),
+    ("state_file_absolute_optout", None),
     ("dest_exists", ResumeAbortReason.DEST_EXISTS),
     ("ungraceful_source", ResumeAbortReason.UNGRACEFUL_SOURCE),
     ("extra_path_escape", ResumeAbortReason.EXTRA_PATH_ESCAPE),
@@ -381,16 +390,30 @@ def _prepare_row(row_id, bots_tree):
         deployment = make_deployment()
         client = make_docker_client()
 
-    elif row_id == "state_file_absolute_skip":
-        # An absolute state_file_name escapes data/ -> skip+warn (POSIX abs works
-        # cross-platform via the service's own is-absolute check).
+    elif row_id == "state_file_absolute_abort":
+        # CONTRACT C1: an absolute state_file_name escapes data/. The hook cannot
+        # carry that state forward, so the deploy is REFUSED rather than quietly
+        # launching a bot that will re-seed from the wallet.
         abs_cfg = dict(TEMPLATE_CFG, state_file_name="/var/lib/hummingbot/ladder.json")
         (bots_tree / "conf" / "controllers" / CONTROLLER_FILE).write_text(
             yaml.safe_dump(abs_cfg), encoding="utf-8"
         )
         deployment = make_deployment()
         client = make_docker_client()
+
+    elif row_id == "state_file_absolute_optout":
+        # Same config, but the deploy asks for the skip explicitly. C1 permits the
+        # opt-out for ABSOLUTE paths only, and the resulting skip must come back on
+        # the response — an operator who accepted a wallet re-seed is entitled to be
+        # told it happened.
+        abs_cfg = dict(TEMPLATE_CFG, state_file_name="/var/lib/hummingbot/ladder.json")
+        (bots_tree / "conf" / "controllers" / CONTROLLER_FILE).write_text(
+            yaml.safe_dump(abs_cfg), encoding="utf-8"
+        )
+        deployment = make_deployment(allow_absolute_state_file_name=True)
+        client = make_docker_client()
         extra["decision"] = "skipped"
+        extra["warning_code"] = "STATE_FILE_ABSOLUTE_SKIPPED"
 
     elif row_id == "dest_exists":
         # CDX-001: a pre-existing target instance dir is refused outright
@@ -484,6 +507,13 @@ class TestE2EFailClosedMatrix:
             assert manifest["decisions"] == {CONTROLLER_ID: extra["decision"]}
             # The fresh-seeded / skipped controller copied no ledger.
             assert not (new_instance_dir(bots_tree) / "data" / LEDGER_NAME).exists()
+            if extra.get("warning_code"):
+                # C1 opt-out: the skip is reported on the RESPONSE, not just logged.
+                codes = [w["code"] for w in response.get("resume_warnings", [])]
+                assert extra["warning_code"] in codes, (
+                    f"[{row_id}] expected warning {extra['warning_code']!r} on the deploy "
+                    f"response, got {response.get('resume_warnings')!r}"
+                )
 
 
 # ===========================================================================

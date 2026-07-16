@@ -30,7 +30,6 @@ from services.resume_service import (
     ResolvedSource,
     ResumeAbortReason,
     ResumeError,
-    _is_absolute_state_file,
     _is_excluded,
     compute_copy_plan,
 )
@@ -40,14 +39,54 @@ from services.resume_service import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_dep(extra_paths=None):
-    """A minimal deploy stand-in — compute_copy_plan only reads resume_extra_paths.
+def link_dir_out_of_tree(link: "os.PathLike", target: "os.PathLike") -> None:
+    """Create ``link`` as a directory link to ``target``, or FAIL the test.
+
+    The C1 runtime-containment tests are the only coverage of the symlink escape,
+    so they must never silently vanish. A ``pytest.skip`` here would mean the
+    security invariant is unproven on exactly the platform whose path semantics
+    make it interesting — a green suite that verified nothing.
+
+    Symlink creation on Windows needs SeCreateSymbolicLinkPrivilege (Developer
+    Mode or admin). Directory JUNCTIONS need no privilege and are resolved by
+    ``Path.resolve`` identically, so they exercise the same code path. We try a
+    symlink, fall back to a junction, and fail loudly if neither is available
+    rather than skipping.
+    """
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError) as symlink_exc:
+        if os.name != "nt":
+            pytest.fail(
+                f"Could not create the symlink this containment test requires "
+                f"({symlink_exc}). Refusing to skip: that would leave CONTRACT C1's "
+                f"runtime half unverified."
+            )
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        except Exception as junction_exc:
+            pytest.fail(
+                f"Could not create a symlink ({symlink_exc}) or a junction "
+                f"({junction_exc}) for this containment test. Refusing to skip: that "
+                f"would leave CONTRACT C1's runtime half unverified on this host."
+            )
+
+
+def make_dep(extra_paths=None, allow_absolute_state_file_name=False):
+    """A minimal deploy stand-in — compute_copy_plan reads resume_extra_paths and
+    the CONTRACT C1 opt-out.
 
     A SimpleNamespace (not the pydantic model) is used deliberately so the
     escape test can pass a ``..`` path that the model layer would reject — the
     point is to prove the *service* guard fails closed independently.
     """
-    return SimpleNamespace(resume_extra_paths=extra_paths)
+    return SimpleNamespace(
+        resume_extra_paths=extra_paths,
+        allow_absolute_state_file_name=allow_absolute_state_file_name,
+    )
 
 
 def make_source(tmp_path, name="SRC"):
@@ -117,17 +156,6 @@ def kinds(plan, kind):
 # ---------------------------------------------------------------------------
 
 class TestUnitHelpers:
-    def test_is_absolute_posix(self):
-        assert _is_absolute_state_file("/abs/ledger.json")
-
-    def test_is_absolute_windows_drive(self):
-        assert _is_absolute_state_file("C:/abs/ledger.json")
-        assert _is_absolute_state_file("C:\\abs\\ledger.json")
-
-    def test_is_absolute_relative_is_false(self):
-        assert not _is_absolute_state_file("ledger.json")
-        assert not _is_absolute_state_file("sub/ledger.json")
-
     def test_exclusions(self):
         assert _is_excluded("range_inventory_ladder_x.diagnostic_20260101-000000.jsonl")
         assert _is_excluded("something.tmp")
@@ -179,24 +207,280 @@ class TestNames:
 
 
 # ---------------------------------------------------------------------------
-# Absolute state_file_name
+# CONTRACT C1 — state_file_name path contract (CDX-007 / CLA-004)
 # ---------------------------------------------------------------------------
+#
+# SPEC CHANGE (this phase): an absolute ``state_file_name`` used to be SKIPPED and
+# the deploy allowed to succeed — the fail-open CDX-007 names. It now aborts, and
+# the skip is reachable only behind the explicit ``allow_absolute_state_file_name``
+# opt-out, which permits ABSOLUTE paths and never traversal.
+#
+# Every expected value below is derived from CONTRACT C1 as written in the batch
+# prompt (and mirrored in services/state_file_contract.py), not from running the
+# implementation.
 
-class TestAbsolute:
-    def test_absolute_skipped_with_warning(self, tmp_path):
+class TestC1PathContract:
+    """The C1 reject set: every one of these must ABORT the deploy."""
+
+    def test_posix_absolute_aborts(self, tmp_path):
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="/tmp/x.json")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_windows_drive_absolute_aborts(self, tmp_path):
+        """``C:\\x.json`` is a single RELATIVE component to PurePosixPath and
+        normalizes to a strict descendant of data/ — a POSIX-only check accepts it.
+        C1 requires both flavors, so it is refused on the Linux host too."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="C:\\x.json")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_unc_path_aborts(self, tmp_path):
+        """Same blindness as the drive case: ``\\\\share\\x`` is one relative
+        component under PurePosixPath."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="\\\\share\\x")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_traversal_aborts(self, tmp_path):
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="../conf/x.yml")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_traversal_aborts_even_with_optout(self, tmp_path):
+        """C1: the opt-out permits ABSOLUTE paths only, never traversal."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="../conf/x.yml")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep(allow_absolute_state_file_name=True))
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_absolute_traversal_aborts_even_with_optout(self, tmp_path):
+        """``/tmp/../etc/x.json`` is absolute AND traversing. C1 checks traversal
+        FIRST, so the opt-out must not rescue it."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(
+            new, "c.yml", controller_id="ctrl_c", state_file_name="/tmp/../etc/x.json"
+        )
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep(allow_absolute_state_file_name=True))
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_backslash_traversal_aborts(self, tmp_path):
+        """``sub\\..\\..\\x.json`` hides its '..' from PurePosixPath entirely (one
+        opaque component). Only the Windows flavor sees the traversal."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(
+            new, "c.yml", controller_id="ctrl_c", state_file_name="sub\\..\\..\\x.json"
+        )
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_dot_aborts(self, tmp_path):
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name=".")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_non_string_aborts(self, tmp_path):
+        """C1 accepts unset or a str. A YAML ``state_file_name: 5`` is neither, and
+        the old code would have str()'d it into a filename."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name=5)
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_drive_relative_aborts_even_with_optout(self, tmp_path):
+        """``C:`` has a drive but is_absolute() is False, so it is NOT an absolute
+        path and the opt-out (absolute paths only) must not admit it. Mirrors the
+        engine rejecting it after its own opt-out early-return."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="C:")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep(allow_absolute_state_file_name=True))
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_root_relative_aborts_even_with_optout(self, tmp_path):
+        """``\\x.json`` is rooted under the Windows flavor but not absolute (no
+        drive) — same reasoning as the drive-relative case."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="\\x.json")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep(allow_absolute_state_file_name=True))
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_nothing_planned_when_c1_aborts(self, tmp_path):
+        """The abort must leave no plan behind: a controller with a valid ledger
+        earlier in the same deploy must not end up half-planned."""
+        src = make_source(tmp_path)
+        write_ledger(src, "range_inventory_ladder_ctrl_a.json", owner_id="ctrl_a")
+        new = new_instance(tmp_path)
+        write_controller(new, "a.yml", controller_id="ctrl_a")
+        write_controller(new, "b.yml", controller_id="ctrl_b", state_file_name="/tmp/x.json")
+
+        with pytest.raises(ResumeError):
+            compute_copy_plan(new, src, make_dep())
+        # Nothing was copied: compute_copy_plan is read-only and the deploy aborts
+        # before _execute_copy_plan ever runs.
+        assert not (new / "data").exists()
+
+
+class TestC1Accepted:
+    """The C1 accept set."""
+
+    def test_relative_subdir_planned_normally(self, tmp_path):
+        src = make_source(tmp_path)
+        (src.data_dir / "sub").mkdir()
+        write_ledger(src, "sub/x.json", owner_id="ctrl_c")
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")
+
+        plan = compute_copy_plan(new, src, make_dep())
+
+        assert plan.decisions == {"ctrl_c": "copied"}
+        ledger = kinds(plan, "ledger")[0]
+        assert ledger.src == src.data_dir / "sub" / "x.json"
+        assert ledger.dst == new / "data" / "sub" / "x.json"
+
+    def test_whitespace_is_stripped_to_canonical(self, tmp_path):
+        """C1: the canonical value is the STRIPPED string."""
+        src = make_source(tmp_path)
+        write_ledger(src, "my_ledger.json", owner_id="ctrl_c")
+        new = new_instance(tmp_path)
+        write_controller(
+            new, "c.yml", controller_id="ctrl_c", state_file_name="  my_ledger.json  "
+        )
+
+        plan = compute_copy_plan(new, src, make_dep())
+
+        assert plan.decisions == {"ctrl_c": "copied"}
+        assert kinds(plan, "ledger")[0].dst == new / "data" / "my_ledger.json"
+
+    def test_empty_after_strip_uses_default_name(self, tmp_path):
+        """C1: empty-after-strip maps to unset, which selects the engine's DEFAULT
+        state file name. Not fail-open — the controller still resumes."""
+        src = make_source(tmp_path)
+        write_ledger(src, "range_inventory_ladder_ctrl_c.json", owner_id="ctrl_c")
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="   ")
+
+        plan = compute_copy_plan(new, src, make_dep())
+
+        assert plan.decisions == {"ctrl_c": "copied"}
+        assert kinds(plan, "ledger")[0].dst == (
+            new / "data" / "range_inventory_ladder_ctrl_c.json"
+        )
+
+
+class TestC1OptOut:
+    def test_absolute_skipped_with_structured_warning(self, tmp_path):
         src = make_source(tmp_path)
         new = new_instance(tmp_path)
         write_controller(
             new, "c.yml", controller_id="ctrl_c", state_file_name="/mnt/shared/ledger.json"
         )
 
-        plan = compute_copy_plan(new, src, make_dep())
+        plan = compute_copy_plan(new, src, make_dep(allow_absolute_state_file_name=True))
 
         assert plan.decisions == {"ctrl_c": "skipped"}
         assert plan.files_to_copy == []  # nothing physically copied
         markers = kinds(plan, "absolute_skipped")
         assert len(markers) == 1 and markers[0].dst is None
-        assert any("absolute" in w.lower() for w in plan.warnings)
+        # Structured, not just prose: this is what reaches the response body.
+        entries = [
+            w for w in plan.structured_warnings
+            if w["code"] == "STATE_FILE_ABSOLUTE_SKIPPED"
+        ]
+        assert len(entries) == 1
+        assert entries[0]["controller_id"] == "ctrl_c"
+        assert entries[0]["state_file_name"] == "/mnt/shared/ledger.json"
+
+    def test_optout_default_is_off(self, tmp_path):
+        """A deploy stand-in with NO opt-out attribute at all must still abort —
+        the getattr default is the fail-closed one."""
+        src = make_source(tmp_path)
+        new = new_instance(tmp_path)
+        write_controller(
+            new, "c.yml", controller_id="ctrl_c", state_file_name="/mnt/shared/ledger.json"
+        )
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, SimpleNamespace(resume_extra_paths=None))
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+
+class TestC1RuntimeContainment:
+    """The runtime half: lexically-clean names that escape via a symlink."""
+
+    def test_symlink_escape_in_destination_aborts(self, tmp_path):
+        """``sub/x.json`` is C1-clean lexically, but if the new instance's
+        ``data/sub`` is a symlink out of data/, the ledger would be WRITTEN
+        outside. Only resolving catches this."""
+        src = make_source(tmp_path)
+        (src.data_dir / "sub").mkdir()
+        write_ledger(src, "sub/x.json", owner_id="ctrl_c")
+
+        new = new_instance(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        new_data = new / "data"
+        new_data.mkdir(parents=True)
+        link_dir_out_of_tree(new_data / "sub", outside)
+
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
+
+    def test_symlink_escape_in_source_aborts(self, tmp_path):
+        """The mirror case: reading the ledger THROUGH a symlink that leaves the
+        source data/ would copy an arbitrary file forward as this controller's state."""
+        src = make_source(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "x.json").write_text('{"seed_value_quote": 1}', encoding="utf-8")
+        link_dir_out_of_tree(src.data_dir / "sub", outside)
+
+        new = new_instance(tmp_path)
+        write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.STATE_FILE_PATH_INVALID
 
 
 # ---------------------------------------------------------------------------
