@@ -326,7 +326,7 @@ _MATRIX = [
     ("ledger_invalid", ResumeAbortReason.LEDGER_INVALID),
     ("owner_mismatch", ResumeAbortReason.OWNER_MISMATCH),
     ("state_file_absolute_skip", None),         # §11 "state_file_name absolute" -> skip+warn
-    ("dest_not_empty", ResumeAbortReason.DEST_NOT_EMPTY),
+    ("dest_exists", ResumeAbortReason.DEST_EXISTS),
     ("ungraceful_source", ResumeAbortReason.UNGRACEFUL_SOURCE),
     ("extra_path_escape", ResumeAbortReason.EXTRA_PATH_ESCAPE),
     ("copy_io_error", ResumeAbortReason.COPY_IO_ERROR),
@@ -392,14 +392,20 @@ def _prepare_row(row_id, bots_tree):
         client = make_docker_client()
         extra["decision"] = "skipped"
 
-    elif row_id == "dest_not_empty":
-        # Pre-create the destination instance dir with a stray state file so the
-        # deploy's makedirs is skipped and the DEST_NOT_EMPTY guard trips.
+    elif row_id == "dest_exists":
+        # CDX-001: a pre-existing target instance dir is refused outright
+        # (DEST_EXISTS) by the exclusive-creation guard, before the deploy stages
+        # anything. This row used to assert DEST_NOT_EMPTY, which was only
+        # reachable because the deploy REUSED an existing directory and let the
+        # seed guard catch the leftovers — the reuse is what deleted operator
+        # data on the failure path. The destination-empty guard keeps its direct
+        # coverage in tests/test_copyforward_guards.py:177.
         dest_data = new_instance_dir(bots_tree) / "data"
         dest_data.mkdir(parents=True)
         (dest_data / "stray.json").write_text("{}", encoding="utf-8")
         deployment = make_deployment()
         client = make_docker_client()
+        extra["target_must_survive"] = True
 
     elif row_id == "ungraceful_source":
         # No DB wired -> unknown history is not graceful; no override.
@@ -454,9 +460,19 @@ class TestE2EFailClosedMatrix:
             assert exc.value.reason is expected_reason
             # The core invariant: a failed resume never launches a container...
             client.containers.run.assert_not_called()
-            # ...and leaves no half-seeded instance dir behind (§5 cleanup).
-            assert not new_instance_dir(bots_tree).exists(), (
-                f"[{row_id}] half-created instance dir was not cleaned up"
+            if extra.get("target_must_survive"):
+                # CDX-001: the target this deploy refused to touch is still there.
+                assert new_instance_dir(bots_tree).exists(), (
+                    f"[{row_id}] a pre-existing target instance dir was destroyed"
+                )
+            else:
+                # ...and leaves no half-seeded instance dir behind (§5 cleanup).
+                assert not new_instance_dir(bots_tree).exists(), (
+                    f"[{row_id}] half-created instance dir was not cleaned up"
+                )
+            # No row may leak the staging sibling it built in (CDX-001).
+            assert list((bots_tree / "instances").glob("*.staging-*")) == [], (
+                f"[{row_id}] staging dir leaked after abort"
             )
         else:
             # Non-abort §11 rows proceed to a real (mocked) launch.

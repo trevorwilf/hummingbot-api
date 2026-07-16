@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import shutil
 from dataclasses import dataclass, field
 from enum import Enum
@@ -53,6 +54,7 @@ class ResumeAbortReason(str, Enum):
     SOURCE_RUNNING = "SOURCE_RUNNING"
     LEDGER_INVALID = "LEDGER_INVALID"
     OWNER_MISMATCH = "OWNER_MISMATCH"
+    DEST_EXISTS = "DEST_EXISTS"
     DEST_NOT_EMPTY = "DEST_NOT_EMPTY"
     UNGRACEFUL_SOURCE = "UNGRACEFUL_SOURCE"
     EXTRA_PATH_ESCAPE = "EXTRA_PATH_ESCAPE"
@@ -100,13 +102,60 @@ class ResolvedSource:
 # Base-name / timestamp parsing (§5 latest rules)
 # ---------------------------------------------------------------------------
 
-# The API's own instance-name suffix: "<name>-YYYYMMDD-HHMMSS"
-# (routers/bot_orchestration.py:501 — datetime.strftime("%Y%m%d-%H%M%S")).
-# Anchored at the END and applied exactly ONCE, so operator names that embed
-# their own timestamp-like tokens (e.g. "KRAKEN_LADDER_V1-20260712-2302") are
-# never double-stripped.
-_API_SUFFIX_RE = re.compile(r"-(\d{8}-\d{6})$")
+# The API's own instance-name suffix, in two generations:
+#
+#   legacy   "<base>-YYYYMMDD-HHMMSS"                     (pre-CDX-001)
+#   current  "<base>-YYYYMMDD-HHMMSS-<micros>-<rand>"     (CDX-001)
+#
+# The sub-second + random components exist because the second-granular stamp let
+# two deploys of the same base name inside one wall-clock second generate the
+# SAME instance name and collide on the target directory (CDX-001). The trailing
+# pair is OPTIONAL here so legacy-named instances — already on disk and already
+# in ``bot_runs`` — keep parsing, and therefore keep resolving as ``latest``
+# lineage. Still anchored at the END and applied exactly ONCE, so operator names
+# that embed their own timestamp-like tokens (e.g. "KRAKEN_LADDER_V1-20260712-2302")
+# are never double-stripped.
+#
+# INVARIANT: this regex and :func:`generate_instance_name` are a matched pair —
+# every name the generator emits must parse back to (base, timestamp), or
+# ``latest`` resolution silently stops finding lineage (the generator's output
+# would no longer match its own base). The round-trip is asserted in
+# tests/test_copyforward_p1_exclusive_target.py. Never change one alone.
+_API_SUFFIX_RE = re.compile(r"-(\d{8}-\d{6})(?:-(\d{6})-([0-9a-f]{6}))?$")
 _API_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
+# Bytes of entropy in the name suffix; 3 bytes -> the 6 hex chars matched above.
+_API_NAME_RANDOM_BYTES = 3
+
+
+def generate_instance_name(base_name: str, now=None) -> str:
+    """Build the unique instance name a deploy of ``base_name`` runs under.
+
+    ``<base>-YYYYMMDD-HHMMSS-<micros>-<rand>``: the wall-clock stamp keeps names
+    sortable and human-readable, while the microseconds and 6 hex chars of
+    entropy make the name collision-free (CDX-001 — two deploys of one base name
+    within the same second used to produce the same name, and the loser silently
+    reused the winner's directory).
+
+    Uniqueness must not rest on the clock alone: two API workers can read the
+    same microsecond, and a clock can step backwards over NTP. The random
+    component is what actually guarantees distinctness; the timestamp is for
+    humans and for ``latest`` ordering.
+
+    Args:
+        base_name: The operator-supplied name (already model-validated).
+        now: Injectable clock (tests). Defaults to ``datetime.now()``.
+
+    Returns:
+        The unique name, which :func:`_strip_api_suffix` maps back to
+        ``base_name`` and :func:`_parse_api_timestamp` maps back to ``now``.
+    """
+    from datetime import datetime
+
+    stamp = now if now is not None else datetime.now()
+    return (
+        f"{base_name}-{stamp.strftime(_API_TIMESTAMP_FORMAT)}"
+        f"-{stamp.microsecond:06d}-{secrets.token_hex(_API_NAME_RANDOM_BYTES)}"
+    )
 
 
 def _strip_api_suffix(instance_name: str) -> str:
@@ -121,6 +170,11 @@ def _parse_api_timestamp(instance_name: str):
     Uses ``datetime.strptime`` (not mtime — archiving/backup perturbs mtime).
     Import is local so the module has no import-time ``datetime`` dependency
     beyond what it uses, and to keep the top of the file about types only.
+
+    The current name format carries microseconds (CDX-001); when present they
+    are folded into the returned datetime so two instances deployed inside the
+    same second still order strictly. Legacy names lack them and parse to a
+    whole second, exactly as before.
     """
     from datetime import datetime
 
@@ -128,9 +182,13 @@ def _parse_api_timestamp(instance_name: str):
     if match is None:
         return None
     try:
-        return datetime.strptime(match.group(1), _API_TIMESTAMP_FORMAT)
+        parsed = datetime.strptime(match.group(1), _API_TIMESTAMP_FORMAT)
     except ValueError:
         return None
+    micros = match.group(2)
+    if micros is not None:
+        parsed = parsed.replace(microsecond=int(micros))
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1101,59 @@ def _guard_source_container(source: "ResolvedSource", docker_client, report: Gua
     )
 
 
+def resolve_deploy_target(bots_path, instance_name: str) -> Path:
+    """The instance directory a deploy of ``instance_name`` will create.
+
+    The single source of truth for "where does this instance live", shared by
+    the deploy path (``docker_service.create_hummingbot_instance``) and
+    :func:`preview_resume`. The preview validating a path the deploy does not
+    actually use is precisely the CLA-008 P1 defect, so both sides derive the
+    target here rather than each re-joining the components themselves.
+    """
+    return Path(bots_path) / "instances" / instance_name
+
+
+def guard_target_available(target_dir, report: Optional[GuardReport] = None) -> GuardReport:
+    """§7.0 / CDX-001 — the target instance directory must not already exist.
+
+    The exclusive-creation guard. A pre-existing target is NEVER reused and
+    NEVER deleted: it may be a live instance, an archive, or an operator's tree,
+    and its ``data/`` may hold the only copy of a ladder ledger. The deploy path
+    runs this BEFORE it stages anything (so a colliding deploy does no work and
+    touches nothing); :func:`preview_resume` runs the SAME function against real
+    filesystem state so its answer is the deploy's answer.
+
+    Args:
+        target_dir: The instance directory from :func:`resolve_deploy_target`.
+        report: The report to record into; a fresh one is created when the
+            caller has none (the deploy path, which guards before any resume
+            machinery exists — and runs even with ``resume_mode="off"``).
+
+    Returns:
+        The report, with ``target_available`` recorded as passed.
+
+    Raises:
+        ResumeError: ``DEST_EXISTS`` when the target already exists.
+    """
+    report = report if report is not None else GuardReport()
+    target_dir = Path(target_dir)
+    if target_dir.exists():
+        _abort_guard(
+            ResumeAbortReason.DEST_EXISTS,
+            f"Target instance directory '{target_dir}' already exists — refusing "
+            f"to reuse, overwrite or delete it. Deploy under a different instance "
+            f"name; the existing directory is left exactly as it is.",
+            report,
+        )
+    report._record(
+        "target_available",
+        True,
+        f"Target '{target_dir}' does not exist — it will be created exclusively "
+        f"by this deploy.",
+    )
+    return report
+
+
 def _guard_destination_empty(new_data_dir: Path, report: GuardReport) -> None:
     """§7.4 — the destination ``data/`` must contain no state files.
 
@@ -1157,6 +1268,7 @@ async def run_guards(
     deployment,
     docker_client,
     bot_run_repo,
+    target_dir=None,
 ) -> GuardReport:
     """Run the §7 preconditions, fail-closed, before any copy or container start.
 
@@ -1165,6 +1277,8 @@ async def run_guards(
     ``err.guard_report``); returns a passing report when every guard clears.
 
     Guards:
+        0. Target instance dir does not exist (§7.0 / CDX-001) — only when
+           ``target_dir`` is given (see the arg).
         1. Source container exited (§7.1) — Docker state only.
         2. Ledger validity (§7.2) — enforced in the P3 copy plan; recorded here.
         3. Destination ``data/`` empty (§7.4).
@@ -1176,6 +1290,13 @@ async def run_guards(
         deployment: The deploy model (reads ``resume_accept_ungraceful``).
         docker_client: The Docker SDK client (``client.containers.get``).
         bot_run_repo: The existing ``BotRunRepository`` (or a compatible mock).
+        target_dir: The instance directory the deploy would create. When given,
+            the §7.0 exclusive-creation guard runs first and lands in this
+            report. Only :func:`preview_resume` passes it: on the real deploy
+            path the guard has already run in ``create_hummingbot_instance``,
+            before any staging, so re-running it here would be redundant (and
+            would pass trivially — the deploy builds in a staging sibling, not
+            at the target).
 
     Returns:
         A passing :class:`GuardReport`.
@@ -1184,6 +1305,10 @@ async def run_guards(
         ResumeError: on the first hard guard failure (§11).
     """
     report = GuardReport()
+
+    # 0. Target instance dir is free (§7.0 / CDX-001) — preview only; see arg.
+    if target_dir is not None:
+        guard_target_available(target_dir, report)
 
     # 1. Source container has exited (§7.1).
     _guard_source_container(source, docker_client, report)
@@ -1365,11 +1490,29 @@ def _resume_one_liner(new_name: str, source_name: str, files: List[dict], plan: 
     )
 
 
-def _cleanup_failed_instance(new_instance_dir: Path) -> None:
-    """Best-effort removal of the just-created instance dir after a failed
+def _cleanup_failed_instance(new_instance_dir: Path, created_by_this_attempt: bool) -> None:
+    """Best-effort removal of the dir THIS ATTEMPT created, after a failed
     resume, so no half-seeded instance is left behind for a later deploy (or
     operator) to trip over. A cleanup failure is logged, never raised — the
-    original ``ResumeError`` is what must surface."""
+    original ``ResumeError`` is what must surface.
+
+    ``created_by_this_attempt`` is the CDX-001 interlock. This function used to
+    ``rmtree`` whatever directory it was handed; combined with the old
+    reuse-an-existing-instance-dir path in ``create_hummingbot_instance``, a
+    failed resume onto an existing name deleted the operator's existing
+    instance — ledger, sqlite and all. It may now only remove a directory the
+    caller exclusively created for this attempt (the staging sibling). Default-
+    deny: without an explicit ownership assertion nothing is deleted, because a
+    directory this process did not create may be the only copy of a ledger.
+    """
+    if not created_by_this_attempt:
+        logger.warning(
+            "Not removing instance dir '%s' after resume failure: this attempt "
+            "did not create it, and a directory we did not create is never "
+            "deleted (CDX-001). Remove it by hand if it is a leftover.",
+            new_instance_dir,
+        )
+        return
     try:
         if new_instance_dir.exists():
             shutil.rmtree(new_instance_dir)
@@ -1384,28 +1527,42 @@ def _cleanup_failed_instance(new_instance_dir: Path) -> None:
         )
 
 
-def _log_resume_failed(new_instance_dir: Path, reason: str, detail: str) -> None:
+def _log_resume_failed(instance_name: str, reason: str, detail: str) -> None:
     logger.error(
         "bot_resume_failed: instance=%s reason=%s — %s",
-        new_instance_dir.name,
+        instance_name,
         reason,
         detail,
         extra={
             "event": "bot_resume_failed",
             "resume_abort_reason": reason,
-            "resume_instance": new_instance_dir.name,
+            "resume_instance": instance_name,
         },
     )
 
 
-async def _seed(deployment, new_instance_dir: Path, bots_path: Path, docker_client, bot_run_repo) -> dict:
-    """The hook body: resolve → guards → plan → copy → drift → manifest → events."""
+async def _seed(
+    deployment,
+    new_instance_dir: Path,
+    bots_path: Path,
+    docker_client,
+    bot_run_repo,
+    new_instance_name: str,
+) -> dict:
+    """The hook body: resolve → guards → plan → copy → drift → manifest → events.
+
+    ``new_instance_name`` is the instance's LOGICAL name and is deliberately not
+    derived from ``new_instance_dir.name``: the deploy path builds in a staging
+    sibling (``<name>.staging-<rand>``, CDX-001), so the directory name is not
+    the instance name. Using the directory name for identity would make
+    ``latest`` strip the wrong base and find no lineage at all.
+    """
     from datetime import datetime, timezone
 
     new_data_dir = new_instance_dir / "data"
 
     # 1. Which prior instance to copy from (P2, §5).
-    source = await resolve_source(deployment, new_instance_dir.name, bots_path, bot_run_repo)
+    source = await resolve_source(deployment, new_instance_name, bots_path, bot_run_repo)
 
     # 2. Fail-closed preconditions (P4, §7).
     guard_report = await run_guards(source, new_data_dir, deployment, docker_client, bot_run_repo)
@@ -1443,19 +1600,19 @@ async def _seed(deployment, new_instance_dir: Path, bots_path: Path, docker_clie
     }
     logger.info(
         "bot_resume_seeded: instance=%s source=%s files=%d decisions=%s",
-        new_instance_dir.name,
+        new_instance_name,
         source.instance_name,
         len(files),
         decision_summary,
         extra={
             "event": "bot_resume_seeded",
-            "resume_instance": new_instance_dir.name,
+            "resume_instance": new_instance_name,
             "resume_source": source.instance_name,
             "resume_file_count": len(files),
             "resume_decisions": decision_summary,
         },
     )
-    logger.info(_resume_one_liner(new_instance_dir.name, source.instance_name, files, plan, drift))
+    logger.info(_resume_one_liner(new_instance_name, source.instance_name, files, plan, drift))
     return manifest
 
 
@@ -1466,6 +1623,8 @@ async def seed_resume_state(
     docker_client,
     db_manager=None,
     bot_run_repo=None,
+    new_instance_name: Optional[str] = None,
+    created_by_this_attempt: bool = False,
 ) -> dict:
     """Seed a new instance's ``data/`` from a prior run — the copy-forward hook.
 
@@ -1488,17 +1647,31 @@ async def seed_resume_state(
         bot_run_repo: A ready-made repository (tests / preview flows). ``None``
             with no ``db_manager`` degrades per design: ``latest`` falls back
             to directory listing, source history counts as ungraceful.
+        new_instance_name: The instance's LOGICAL name. Defaults to
+            ``new_instance_dir.name``, which is correct only when the directory
+            is named after the instance. The deploy path builds in a staging
+            sibling (CDX-001) and so passes the real name explicitly — identity
+            (``latest`` base-stripping, exclude-self, the manifest, the events)
+            must never come from the staging directory's name.
+        created_by_this_attempt: Whether the CALLER exclusively created
+            ``new_instance_dir`` for this deploy. Only then may a failure clean
+            it up. Defaults to ``False`` — a directory this attempt did not
+            create is never deleted (CDX-001), because its ``data/`` may be the
+            operator's only copy of a ledger.
 
     Returns:
         The resume manifest dict (also written to ``data/resume.manifest.json``).
 
     Raises:
         ResumeError: fail-closed on any §11 condition — after logging
-            ``bot_resume_failed`` and best-effort removing the instance dir, so
-            the deploy aborts loudly and no container ever starts.
+            ``bot_resume_failed`` and (when this attempt created it) removing
+            the instance dir, so the deploy aborts loudly and no container ever
+            starts.
     """
     new_instance_dir = Path(new_instance_dir)
     bots_path = Path(bots_path)
+    if new_instance_name is None:
+        new_instance_name = new_instance_dir.name
     try:
         if bot_run_repo is None and db_manager is not None:
             from database import BotRunRepository
@@ -1506,18 +1679,21 @@ async def seed_resume_state(
             async with db_manager.get_session_context() as session:
                 return await _seed(
                     deployment, new_instance_dir, bots_path, docker_client,
-                    BotRunRepository(session),
+                    BotRunRepository(session), new_instance_name,
                 )
-        return await _seed(deployment, new_instance_dir, bots_path, docker_client, bot_run_repo)
+        return await _seed(
+            deployment, new_instance_dir, bots_path, docker_client, bot_run_repo,
+            new_instance_name,
+        )
     except ResumeError as err:
-        _log_resume_failed(new_instance_dir, err.reason.value, err.message)
-        _cleanup_failed_instance(new_instance_dir)
+        _log_resume_failed(new_instance_name, err.reason.value, err.message)
+        _cleanup_failed_instance(new_instance_dir, created_by_this_attempt)
         raise
     except Exception as exc:
         # Unexpected failures get the same fail-closed treatment: event,
         # cleanup, re-raise — the deploy must never continue to containers.run.
-        _log_resume_failed(new_instance_dir, f"UNEXPECTED:{type(exc).__name__}", str(exc))
-        _cleanup_failed_instance(new_instance_dir)
+        _log_resume_failed(new_instance_name, f"UNEXPECTED:{type(exc).__name__}", str(exc))
+        _cleanup_failed_instance(new_instance_dir, created_by_this_attempt)
         raise
 
 
@@ -1532,6 +1708,43 @@ async def seed_resume_state(
 # any files, or touching Docker beyond the single container-state read done by
 # the source-container guard. The returned dict is what the router serialises
 # as the 200 response.
+#
+# CLA-008 P1: the preview used to run its guards against that temporary
+# directory, so the destination checks graded a path the deploy would never
+# write to — an empty temp dir always looks clean, so DEST_NOT_EMPTY could not
+# fail and the preview reported a PASS it had not earned. The destination guards
+# now run against the real ``bots/instances/<target>`` path, resolved with the
+# deploy's own helpers. The temp dir survives for one honest reason: computing
+# the copy plan requires the staged controller YAMLs somewhere, and the preview
+# must not create anything in the bot tree.
+
+
+def _reroot(path, old_root: Path, new_root: Path) -> Path:
+    """Re-express ``path`` (under ``old_root``) as the same relative path under
+    ``new_root`` — used to report the preview's planned destinations at their
+    real target paths instead of the temp dir the plan was computed in."""
+    return Path(new_root) / Path(path).relative_to(Path(old_root))
+
+
+def _preview_base_name_collision(bots_path: Path, base_name: str, report: GuardReport) -> None:
+    """Report — never abort on — an existing instance dir at the operator's bare
+    base name.
+
+    The deploy endpoint appends a unique suffix, so this can NOT make that
+    deploy collide, and treating it as fatal would refuse perfectly good
+    redeploys of a familiar name. It is still real, observable state that the
+    preview is uniquely placed to surface: a caller that deploys this exact name
+    directly (bypassing the router's name generation) is the one case that
+    would be refused ``DEST_EXISTS``.
+    """
+    base_dir = resolve_deploy_target(bots_path, base_name)
+    if base_dir.exists():
+        report._warn(
+            f"An instance directory already exists at '{base_dir}' for the bare "
+            f"base name '{base_name}'. The deploy endpoint appends a unique "
+            f"suffix, so this deploy will NOT collide with it; a deploy of this "
+            f"exact name would be refused (DEST_EXISTS). Nothing was touched."
+        )
 
 
 async def preview_resume(
@@ -1549,9 +1762,26 @@ async def preview_resume(
     No directories are created in the bot tree; no files are copied; Docker is
     touched only for the container-state guard (a single read-only API call).
 
-    The new-instance name used for ``latest`` exclude-self logic is
-    ``deployment.instance_name`` as-is (the preview occurs before the API
-    timestamps the name, so no existing run can match it exactly).
+    CLA-008 P1 — what makes this a genuine pre-deploy check rather than a
+    plausible-looking one:
+
+    * The candidate target is minted with the deploy's own
+      :func:`generate_instance_name` and located with the deploy's own
+      :func:`resolve_deploy_target`, so preview and deploy cannot disagree
+      about where the instance goes.
+    * The destination guards (§7.0 ``DEST_EXISTS``, §7.4 ``DEST_NOT_EMPTY``)
+      run against that REAL path via the same :func:`run_guards` /
+      :func:`guard_target_available` the deploy runs — not a reimplementation,
+      and not against the temp dir, which was always empty and therefore always
+      passed.
+    * ``latest`` resolution uses the fully-stamped candidate name, so it strips
+      the same base the deploy will.
+
+    What it still cannot do, and does not claim: reserve the name. The deploy
+    mints a fresh one (new stamp, new entropy) when it runs. The response's
+    ``target`` block says so via ``name_is_representative``. A live dry-run
+    against a real stopped instance remains the only thing that closes the
+    mock/reality gap.
 
     Args:
         deployment: The deploy model (``V2ControllerDeployment`` /
@@ -1567,8 +1797,10 @@ async def preview_resume(
             hold a session). Takes precedence over ``db_manager``.
 
     Returns:
-        Dict with keys: ``resolved_source``, ``files``, ``decisions``,
-        ``guard_report``, ``would_succeed`` (always ``True`` — failures raise).
+        Dict with keys: ``resolved_source``, ``target`` (the resolved target
+        path + the representative name it was checked under), ``files`` (with
+        ``dst`` at real target paths), ``decisions``, ``guard_report``,
+        ``would_succeed`` (always ``True`` — failures raise).
 
     Raises:
         ResumeError: fail-closed on any §11 condition (caller maps to HTTP 409).
@@ -1576,6 +1808,18 @@ async def preview_resume(
     import tempfile
 
     bots_path = Path(bots_path)
+
+    # CLA-008 P1 — the target the DEPLOY would use, derived with the deploy's own
+    # helpers (``generate_instance_name`` + ``resolve_deploy_target``), not a
+    # lookalike. The name carries a fresh stamp + entropy exactly as a deploy
+    # launched right now would: it is representative, not predictive (see the
+    # ``target`` block of the response). What matters is that everything below
+    # this line is measured against the REAL bots/instances/ tree instead of the
+    # temp directory the preview used to validate — which always looked clean and
+    # so could never surface a collision.
+    base_name = deployment.instance_name
+    candidate_name = generate_instance_name(base_name)
+    target_dir = resolve_deploy_target(bots_path, candidate_name)
 
     # Normalise controller filenames: the model stores them without ``.yml``
     # but the template files on disk have ``.yml``.
@@ -1609,21 +1853,26 @@ async def preview_resume(
             if src_client.is_file():
                 shutil.copy2(src_client, tmp_instance_dir / "conf" / "conf_client.yml")
 
-        # Run the pipeline.  The "new instance name" is the pre-timestamp name —
-        # no existing DB row can match it so exclude-self is a no-op here.
-        new_name = deployment.instance_name
-
+        # Run the pipeline against the REAL target. ``candidate_name`` is the
+        # fully-stamped name (what the deploy resolves lineage with), so
+        # ``latest`` strips the same base and excludes self exactly as the deploy
+        # will — the old code passed the pre-stamp name here, which stripped a
+        # DIFFERENT base whenever the operator's name itself ended in a stamp.
         async def _preview_run(repo):
-            source = await resolve_source(deployment, new_name, bots_path, repo)
-            # The preview's ``data/`` dir is virtual (doesn't exist on disk);
-            # DEST_NOT_EMPTY treats a missing dir as clean — no false abort.
+            source = await resolve_source(deployment, candidate_name, bots_path, repo)
+            # Guards run against the real target dir and its real ``data/``:
+            # ``target_dir`` adds the §7.0 exclusive-creation check (DEST_EXISTS),
+            # and DEST_NOT_EMPTY now inspects the path the deploy would actually
+            # write to. Neither creates anything — both are read-only stats.
             guard_report = await run_guards(
                 source,
-                tmp_instance_dir / "data",
+                target_dir / "data",
                 deployment,
                 docker_client,
                 repo,
+                target_dir=target_dir,
             )
+            _preview_base_name_collision(bots_path, base_name, guard_report)
             plan = compute_copy_plan(tmp_instance_dir, source, deployment)
             return source, guard_report, plan
 
@@ -1637,9 +1886,16 @@ async def preview_resume(
 
         # Build the files list from the planned (not executed) copy set.
         # Sizes and sha256 are computed from the SOURCE files — no copy occurs.
+        # ``dst`` is re-rooted from the throwaway staging temp dir onto the real
+        # target, so the operator reads the path the file would land at rather
+        # than a temp path that will not exist a millisecond from now.
         files = []
         for item in plan.files_to_copy:
-            entry: dict = {"src": str(item.src), "dst": str(item.dst), "kind": item.kind}
+            entry: dict = {
+                "src": str(item.src),
+                "dst": str(_reroot(item.dst, tmp_instance_dir, target_dir)),
+                "kind": item.kind,
+            }
             try:
                 raw = Path(item.src).read_bytes()
                 entry["size"] = len(raw)
@@ -1653,6 +1909,22 @@ async def preview_resume(
                 "instance_name": source.instance_name,
                 "data_dir": str(source.data_dir),
                 "origin": source.origin,
+            },
+            "target": {
+                "base_name": base_name,
+                "instance_name": candidate_name,
+                "path": str(target_dir),
+                # Honesty, not a disclaimer: the deploy mints its own name (with
+                # fresh entropy) when it runs, so this exact name is not the one
+                # that will exist. The guards above ran against the real tree
+                # under this name's real path; what they cannot do is reserve it.
+                "name_is_representative": True,
+                "note": (
+                    "The deploy generates a fresh unique instance name at deploy "
+                    "time, so the final name will differ in its timestamp and "
+                    "random suffix. Guards above were evaluated against the real "
+                    "bots/instances/ tree."
+                ),
             },
             "files": files,
             "decisions": dict(plan.decisions),
