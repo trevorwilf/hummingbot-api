@@ -150,6 +150,18 @@ class V2ScriptDeployment(BaseModel):
     resume_from_archive: bool = Field(default=False, description="Allow sourcing from bots/archived/ (local-move archives only)")
     resume_extra_paths: Optional[List[str]] = Field(default=None, description="Additional relative paths to copy from source data/")
     resume_accept_ungraceful: bool = Field(default=False, description="Override the ungraceful-source guard")
+    # CONTRACT C1 (CDX-007/CLA-004) opt-out. Default False = fail closed: a
+    # controller whose state_file_name is absolute aborts the deploy. Setting this
+    # accepts the skip deliberately and permits ABSOLUTE paths ONLY — traversal and
+    # drive-/root-relative names are refused regardless (services/state_file_contract.py).
+    allow_absolute_state_file_name: bool = Field(
+        default=False,
+        description=(
+            "Permit controllers whose state_file_name is an ABSOLUTE path. Their state "
+            "is skipped by the resume hook (not copied) and a structured warning is "
+            "returned. Never permits '..' traversal. Default False aborts such a deploy."
+        ),
+    )
 
     @field_validator("instance_name")
     @classmethod
@@ -211,6 +223,18 @@ class V2ControllerDeployment(BaseModel):
     resume_from_archive: bool = Field(default=False, description="Allow sourcing from bots/archived/ (local-move archives only)")
     resume_extra_paths: Optional[List[str]] = Field(default=None, description="Additional relative paths to copy from source data/")
     resume_accept_ungraceful: bool = Field(default=False, description="Override the ungraceful-source guard")
+    # CONTRACT C1 (CDX-007/CLA-004) opt-out. Default False = fail closed: a
+    # controller whose state_file_name is absolute aborts the deploy. Setting this
+    # accepts the skip deliberately and permits ABSOLUTE paths ONLY — traversal and
+    # drive-/root-relative names are refused regardless (services/state_file_contract.py).
+    allow_absolute_state_file_name: bool = Field(
+        default=False,
+        description=(
+            "Permit controllers whose state_file_name is an ABSOLUTE path. Their state "
+            "is skipped by the resume hook (not copied) and a structured warning is "
+            "returned. Never permits '..' traversal. Default False aborts such a deploy."
+        ),
+    )
 
     @field_validator("instance_name")
     @classmethod
