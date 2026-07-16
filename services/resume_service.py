@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from services.controller_id_contract import classify_controller_id
 from services.state_file_contract import (
     ALLOW_ABSOLUTE_FIELD,
     StateFileStatus,
@@ -67,6 +68,11 @@ class ResumeAbortReason(str, Enum):
     # Added after the up-front declaration below because the C1 api half had no
     # abort reason at all — the violating deploy used to SUCCEED (skip-and-proceed).
     STATE_FILE_PATH_INVALID = "STATE_FILE_PATH_INVALID"
+    # CONTRACT C2 (CDX-008/CLA-002): a staged range-ladder controller id outside
+    # the C2 accept set. Added for the same reason as C1's above — the violating
+    # deploy used to SUCCEED, skipping the controller whose ledger it could not
+    # name and letting the bot re-seed from the wallet.
+    CONTROLLER_ID_INVALID = "CONTROLLER_ID_INVALID"
     EXTRA_PATH_ESCAPE = "EXTRA_PATH_ESCAPE"
     EXTRA_PATH_MISSING = "EXTRA_PATH_MISSING"
     COPY_IO_ERROR = "COPY_IO_ERROR"
@@ -640,6 +646,49 @@ def _iter_staged_controllers(new_instance_dir: Path):
             yield yaml_path, config
 
 
+def _validate_staged_controller_ids(new_instance_dir: Path) -> List[tuple]:
+    """CONTRACT C2 (CDX-008/CLA-002), API half: validate EVERY staged range-ladder
+    controller's ``id`` before any of them is planned.
+
+    This is a whole-pass gate, not a per-controller check inside the planning
+    loop, and that is the point. C2 says a violation aborts the deploy; an abort
+    that happens on the third controller after the first two are already in
+    ``deployed_ids`` and ``plan.items`` has produced a partial plan, and a partial
+    plan is precisely the half-resumed state the hook exists to prevent. Failing
+    the whole pass first makes "abort" mean nothing was planned at all.
+
+    The configs are returned rather than re-read by the caller so the YAMLs are
+    parsed exactly once: a second pass could read a different file than the one
+    validated here.
+
+    Args:
+        new_instance_dir: The staged instance directory.
+
+    Returns:
+        ``[(config, canonical_id), ...]`` for the range-ladder controllers only,
+        in staging order, each id C2-canonical (stripped).
+
+    Raises:
+        ResumeError: ``CONTROLLER_ID_INVALID`` on the first C2 violation. The
+            old code used ``continue`` here instead, which let the deploy succeed
+            while silently leaving that controller's ledger behind.
+    """
+    staged: List[tuple] = []
+    for yaml_path, config in _iter_staged_controllers(new_instance_dir):
+        if config.get("controller_name") != RANGE_LADDER_CONTROLLER_NAME:
+            continue
+        verdict = classify_controller_id(config.get("id"))
+        if not verdict.is_valid:
+            raise ResumeError(
+                ResumeAbortReason.CONTROLLER_ID_INVALID,
+                f"Staged controller '{yaml_path.name}': {verdict.reason} Refusing to "
+                f"deploy (CONTRACT C2, fail-closed). Deploying without this "
+                f"controller's ledger would re-seed it from the wallet.",
+            )
+        staged.append((config, verdict.canonical))
+    return staged
+
+
 def _is_sqlite_deployment(new_instance_dir: Path) -> bool:
     """Parse the staged ``conf_client.yml`` and decide if the engine DB is sqlite.
 
@@ -667,23 +716,30 @@ def _is_sqlite_deployment(new_instance_dir: Path) -> bool:
 # Per-controller ledger resolution
 # ---------------------------------------------------------------------------
 
-def _expected_ledger_name(config: dict, canonical_state_file_name: Optional[str]) -> str:
-    """Return the expected state-file name for a controller config.
+def _expected_ledger_name(
+    canonical_controller_id: str, canonical_state_file_name: Optional[str]
+) -> str:
+    """Return the expected state-file name for a controller.
 
     Mirrors ``range_inventory_ladder.py:1624`` — the state file name if set, else
     ``range_inventory_ladder_<id>.json``.
 
+    Both arguments are CANONICAL values, taken as parameters rather than re-read
+    from the config, so neither contract can be bypassed by a caller reaching
+    around it: only a C1-classified name and a C2-classified id ever reach a path
+    here. Passing the raw ``id`` would have named the ledger of a whitespace-only
+    controller ``range_inventory_ladder_   .json`` — which is exactly what the
+    old code did.
+
     Args:
-        config: The staged controller config.
+        canonical_controller_id: The C2-CANONICAL (stripped) id from
+            :func:`classify_controller_id`.
         canonical_state_file_name: The C1-CANONICAL (stripped) value from
-            :func:`classify_state_file_name`, or ``None`` when unset. Taken as a
-            parameter rather than re-read from ``config`` so this cannot silently
-            use the raw value: only a C1-classified name ever reaches a path here.
+            :func:`classify_state_file_name`, or ``None`` when unset.
     """
     if canonical_state_file_name:
         return canonical_state_file_name
-    controller_id = config.get("id")
-    return f"range_inventory_ladder_{controller_id}.json"
+    return f"range_inventory_ladder_{canonical_controller_id}.json"
 
 
 def _validate_ledger(src_ledger: Path) -> None:
@@ -794,6 +850,7 @@ def _assert_contained(candidate: Path, root: Path, label: str, controller_id) ->
 
 def _plan_controller(
     config: dict,
+    controller_id: str,
     source: "ResolvedSource",
     new_data_dir: Path,
     plan: CopyPlan,
@@ -809,6 +866,14 @@ def _plan_controller(
     A skip is not a safe default for a path we cannot honour; an abort is.
 
     Args:
+        config: The staged controller config.
+        controller_id: The C2-CANONICAL (stripped) id from
+            :func:`classify_controller_id`, already validated by
+            :func:`_validate_staged_controller_ids`. Taken as a parameter rather
+            than re-read from ``config`` so this function cannot see a raw or
+            invalid id: CONTRACT C2 is enforced before any planning begins, and
+            re-reading ``config["id"]`` here would quietly reintroduce the raw
+            value into the ledger filename and the ``.owner`` match.
         allow_absolute_state_file_name: The deploy request's explicit C1 opt-out.
             Rescues ABSOLUTE names ONLY (they take the old skip path, with a
             structured warning in the response) — never traversal, never
@@ -822,7 +887,6 @@ def _plan_controller(
     Raises:
         ResumeError: ``STATE_FILE_PATH_INVALID`` on any C1 violation.
     """
-    controller_id = config.get("id")
     raw_state_file_name = config.get("state_file_name")
     verdict = classify_state_file_name(raw_state_file_name)
 
@@ -869,7 +933,7 @@ def _plan_controller(
         return None
 
     # UNSET -> the engine's default name; RELATIVE_OK -> the canonical (stripped) value.
-    ledger_name = _expected_ledger_name(config, verdict.canonical)
+    ledger_name = _expected_ledger_name(controller_id, verdict.canonical)
     src_ledger = source.data_dir / ledger_name
     src_owner = source.data_dir / f"{ledger_name}.owner"
 
@@ -1047,8 +1111,8 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
 
     Raises:
         ResumeError: fail-closed on ``LEDGER_INVALID`` / ``OWNER_MISMATCH`` /
-            ``STATE_FILE_PATH_INVALID`` / ``EXTRA_PATH_ESCAPE`` /
-            ``EXTRA_PATH_MISSING`` (§11).
+            ``STATE_FILE_PATH_INVALID`` / ``CONTROLLER_ID_INVALID`` /
+            ``EXTRA_PATH_ESCAPE`` / ``EXTRA_PATH_MISSING`` (§11).
     """
     new_instance_dir = Path(new_instance_dir)
     new_data_dir = new_instance_dir / "data"
@@ -1062,16 +1126,17 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
     deployed_ids: set = set()
     handled_names: set = set()
 
+    # CONTRACT C2 gate: every staged range-ladder id is validated BEFORE the first
+    # one is planned, so a violation aborts with an empty plan rather than a
+    # partial one. Raises CONTROLLER_ID_INVALID; nothing below has run yet.
+    staged_controllers = _validate_staged_controller_ids(new_instance_dir)
+
     # Per-controller: range-ladder controllers in the new deploy (staged YAMLs).
-    for _yaml_path, config in _iter_staged_controllers(new_instance_dir):
-        if config.get("controller_name") != RANGE_LADDER_CONTROLLER_NAME:
-            continue
-        controller_id = config.get("id")
-        if not controller_id:
-            logger.warning("Staged range-ladder controller with no 'id' — skipping.")
-            continue
+    # ``controller_id`` is C2-canonical and drives every identity derivation from
+    # here down — deployed_ids, the ledger filename, the '.owner' match.
+    for config, controller_id in staged_controllers:
         deployed_ids.add(controller_id)
-        handled = _plan_controller(config, source, new_data_dir, plan, allow_absolute)
+        handled = _plan_controller(config, controller_id, source, new_data_dir, plan, allow_absolute)
         if handled:
             handled_names.add(handled)
             handled_names.add(f"{handled}.owner")
