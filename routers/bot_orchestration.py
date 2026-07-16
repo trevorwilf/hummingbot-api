@@ -9,7 +9,7 @@ from deps import get_bot_archiver, get_bots_orchestrator, get_docker_service
 from models import StartBotAction, StopBotAction, V2ControllerDeployment, V2ScriptDeployment
 from services.bots_orchestrator import BotsOrchestrator
 from services.docker_service import DockerService
-from services.resume_service import ResumeError, preview_resume
+from services.resume_service import ResumeError, generate_instance_name, preview_resume
 from utils.bot_archiver import BotArchiver
 from utils.file_system import fs_util
 
@@ -499,11 +499,12 @@ async def deploy_v2_controllers(
         HTTPException: 500 if deployment fails
     """
     try:
-        # Generate unique script config filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        script_config_filename = f"{deployment.instance_name}-{timestamp}.yml"
-        # Use the same name with timestamp for the instance to ensure uniqueness
-        unique_instance_name = f"{deployment.instance_name}-{timestamp}"
+        # Unique instance name: timestamp + sub-second + entropy (CDX-001 — a
+        # second-granular stamp alone let two deploys of one base name in the
+        # same second generate the same name and collide on the directory).
+        unique_instance_name = generate_instance_name(deployment.instance_name)
+        # The script config keeps its 1:1 naming with the instance it configures.
+        script_config_filename = f"{unique_instance_name}.yml"
 
         # Ensure controller config names have .yml extension
         controllers_with_extension = []
@@ -593,9 +594,8 @@ async def deploy_v2_script(
         HTTPException: 500 if deployment fails
     """
     try:
-        # Generate unique instance name with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        unique_instance_name = f"{deployment.instance_name}-{timestamp}"
+        # Unique instance name: timestamp + sub-second + entropy (CDX-001).
+        unique_instance_name = generate_instance_name(deployment.instance_name)
 
         # Update deployment with unique name
         deployment.instance_name = unique_instance_name
@@ -642,11 +642,19 @@ async def preview_v2_controllers_resume(
     container. Docker is contacted only for the container-state guard (one
     read-only API call).
 
+    The guards run against the REAL bots/instances/ target path the deploy would
+    build (CLA-008 P1), using the deploy's own name generation and guard code,
+    so a collision or a dirty destination surfaces here instead of at deploy
+    time. The deploy still mints a fresh unique name when it runs, so the
+    reported target.instance_name is representative, not reserved — see
+    target.name_is_representative.
+
     Args:
         deployment: V2ControllerDeployment with resume_mode set (explicit or latest).
 
     Returns:
-        Dict with resolved_source, files (planned, not yet copied), decisions,
+        Dict with resolved_source, target (resolved path + representative name),
+        files (planned, not yet copied — dst at real target paths), decisions,
         guard_report, and would_succeed.
 
     Raises:

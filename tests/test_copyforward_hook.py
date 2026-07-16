@@ -474,6 +474,9 @@ class TestSeedResumeStateDirect:
 
     @pytest.mark.asyncio
     async def test_unexpected_error_cleans_up_and_reraises(self, bots_tree, patched_security, caplog):
+        # created_by_this_attempt=True: this caller made the dir, so the hook may
+        # remove it (CDX-001 — cleanup is now opt-in per attempt; see
+        # test_copyforward_p1_exclusive_target.py for the default-deny half).
         inst = new_instance_dir(bots_tree)
         (inst / "data").mkdir(parents=True)
 
@@ -489,6 +492,7 @@ class TestSeedResumeStateDirect:
                     bots_path=bots_tree,
                     docker_client=client,
                     bot_run_repo=graceful_repo(),
+                    created_by_this_attempt=True,
                 )
         assert not inst.exists()
         assert any("UNEXPECTED:RuntimeError" in r.getMessage() for r in caplog.records)
