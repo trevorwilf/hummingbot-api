@@ -33,7 +33,13 @@ COPY --from=builder /opt/conda/envs/hummingbot-api /opt/conda/envs/hummingbot-ap
 WORKDIR /hummingbot-api
 
 # Copy only necessary application files
-COPY main.py config.py deps.py ./
+# alembic.ini + alembic/ MUST ship in the image (CDX-013/CDX-R01): the migrate
+# service runs `cd /hummingbot-api && [ -f alembic.ini ] && alembic upgrade head`
+# and SKIPS silently when alembic.ini is absent, and the API's own startup
+# schema check imports the scaffold — without these the whole migration
+# mechanism is inert in production.
+COPY main.py config.py deps.py alembic.ini ./
+COPY alembic ./alembic
 COPY models ./models
 COPY routers ./routers
 COPY services ./services

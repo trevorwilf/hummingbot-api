@@ -1,4 +1,15 @@
-from sqlalchemy import TIMESTAMP, Column, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    TIMESTAMP,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
@@ -79,10 +90,18 @@ class Trade(Base):
     # exchange_trade_id rows (fills the exchange gave no id for, plus legacy
     # rows predating these columns) never collide — NULLs are distinct in both
     # sqlite and postgres; those fills dedup via the global trade_id instead.
+    # Declared as a unique INDEX rather than a UniqueConstraint (CDX-013): it
+    # enforces the identical dedup, but it is the one form that is native,
+    # non-table-rewriting and identically reflected on BOTH sqlite and
+    # postgres, so the alembic baseline/delta and this metadata agree and
+    # autogenerate stays quiet (an ALTER-added UNIQUE constraint cannot be
+    # expressed on sqlite without a table rewrite). It is also exactly what
+    # migration 0002 installs on the live, pre-existing trades table.
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_trade_scoped_exchange_trade_id",
             "account_name", "connector_name", "exchange_trade_id",
-            name="uq_trade_scoped_exchange_trade_id"
+            unique=True,
         ),
     )
 

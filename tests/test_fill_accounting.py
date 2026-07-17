@@ -18,12 +18,12 @@ Covers:
   * Transactionality: a forced failure between the trade insert and the
     aggregate update rolls back BOTH (no trade-without-aggregate, no
     aggregate-without-trade), and a later re-delivery of that fill succeeds.
-  * The startup migration (database.connection.STARTUP_MIGRATIONS +
-    STARTUP_UNIQUE_INDEXES via the real _run_migrations routine) upgrades a
-    PRE-migration trades table: columns added, scoped unique index enforced —
-    exercised BOTH through the helpers directly and through the real startup
-    entrypoint (AsyncDatabaseManager.create_tables), so unwiring the helper
-    from startup fails a test (CDX-R03).
+  * The schema migration (phase 9 / CDX-013 replaced this phase's ad-hoc
+    startup ALTERs with alembic revision 0002) upgrades the DEPLOYED trades
+    table: columns added, scoped unique index enforced. Startup no longer
+    installs the index, so CDX-R03's guarantee is now that the real startup
+    entrypoint (AsyncDatabaseManager.verify_schema_at_head) REFUSES to serve
+    against a database that has not been migrated.
   * The scoped constraint's CONNECTOR axis: the same (account,
     exchange_trade_id) under two different connectors is two legitimate
     fills — both recorded, on the app path and on the migrated-legacy-table
@@ -50,7 +50,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -59,11 +59,7 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.event.events import OrderFilledEvent
 
-from database.connection import (
-    STARTUP_MIGRATIONS,
-    STARTUP_UNIQUE_INDEXES,
-    AsyncDatabaseManager,
-)
+from database.connection import AsyncDatabaseManager
 from database.models import Base, Order, Trade
 from database.repositories.order_repository import OrderRepository
 from database.repositories.trade_repository import TradeRepository
@@ -479,46 +475,38 @@ class TestConcurrentDistinctFills:
 
 class TestStartupMigration:
 
-    @pytest.mark.asyncio
-    async def test_legacy_trades_table_gains_scoped_unique_index(self):
-        """Run the REAL production migration routine
-        (AsyncDatabaseManager._run_migrations, executing STARTUP_MIGRATIONS +
-        STARTUP_UNIQUE_INDEXES) against a PRE-migration trades table: the new
-        columns appear, the scoped unique index actually rejects a duplicate
-        triple, and NULL-id rows (legacy + id-less fills) never collide."""
+    def test_legacy_trades_table_gains_scoped_unique_index(self, tmp_path):
+        """Run the REAL production migration path against the trades table as
+        it exists on the DEPLOYED database (the alembic baseline, which has no
+        scoped identity columns): the new columns appear, the scoped unique
+        index actually rejects a duplicate triple, and NULL-id rows (legacy +
+        id-less fills) never collide.
 
-        class SyncConnAdapter:
-            def __init__(self, conn):
-                self._conn = conn
+        Phase 9 (CDX-013) replaced this phase's ad-hoc startup ALTERs +
+        CREATE UNIQUE INDEX with alembic revision 0002, so the migration under
+        test is now that revision — same guarantee, versioned.
+        """
+        from alembic import command
 
-            async def execute(self, stmt, params=None):
-                if params is not None:
-                    return self._conn.execute(stmt, params)
-                return self._conn.execute(stmt)
+        from database.migration_state import BASELINE_REVISION, alembic_config
 
-        engine = create_engine(
-            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
-        )
+        url = f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}"
+        command.upgrade(alembic_config(url), BASELINE_REVISION)
+        engine = create_engine(url)
+
         with engine.begin() as conn:
-            # The trades schema as it existed BEFORE this phase.
-            conn.execute(text(
-                "CREATE TABLE trades ("
-                "id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, "
-                "trade_id TEXT NOT NULL UNIQUE, timestamp TIMESTAMP NOT NULL, "
-                "trading_pair TEXT NOT NULL, trade_type TEXT NOT NULL, "
-                "amount NUMERIC NOT NULL, price NUMERIC NOT NULL, "
-                "fee_paid NUMERIC NOT NULL DEFAULT 0, fee_currency TEXT)"
-            ))
+            # The deployed trades table genuinely lacks the scoped identity.
+            cols = {c["name"] for c in inspect(engine).get_columns("trades")}
+            assert not ({"account_name", "connector_name", "exchange_trade_id"} & cols)
             conn.execute(text(
                 "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                " trade_type, amount, price) "
-                "VALUES (1, 'legacy-1', '2026-01-01 00:00:00', 'XMR-USDT', 'BUY', 1, 100)"
+                " trade_type, amount, price, fee_paid) "
+                "VALUES (1, 'legacy-1', '2026-01-01 00:00:00', 'XMR-USDT', 'BUY', 1, 100, 0)"
             ))
 
-            mgr = AsyncDatabaseManager.__new__(AsyncDatabaseManager)  # migrations only
-            await AsyncDatabaseManager._run_migrations(mgr, SyncConnAdapter(conn))
-            await AsyncDatabaseManager._create_unique_indexes(mgr, SyncConnAdapter(conn))
+        command.upgrade(alembic_config(url), "head")
 
+        with engine.begin() as conn:
             # Legacy row survived with NULL scoped identity.
             row = conn.execute(text(
                 "SELECT account_name, connector_name, exchange_trade_id "
@@ -529,9 +517,9 @@ class TestStartupMigration:
             # The scoped unique index exists on the migrated table.
             conn.execute(text(
                 "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                " trade_type, amount, price, account_name, connector_name,"
+                " trade_type, amount, price, fee_paid, account_name, connector_name,"
                 " exchange_trade_id) "
-                "VALUES (1, 'n-1', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                "VALUES (1, 'n-1', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100, 0,"
                 " 'acct-1', 'nonkyc', 'T1')"
             ))
 
@@ -541,9 +529,9 @@ class TestStartupMigration:
             # index would reject it here).
             conn.execute(text(
                 "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                " trade_type, amount, price, account_name, connector_name,"
+                " trade_type, amount, price, fee_paid, account_name, connector_name,"
                 " exchange_trade_id) "
-                "VALUES (1, 'n-1b', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                "VALUES (1, 'n-1b', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100, 0,"
                 " 'acct-1', 'other-dex', 'T1')"
             ))
 
@@ -553,9 +541,9 @@ class TestStartupMigration:
             with engine.begin() as conn:
                 conn.execute(text(
                     "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                    " trade_type, amount, price, account_name, connector_name,"
+                    " trade_type, amount, price, fee_paid, account_name, connector_name,"
                     " exchange_trade_id) "
-                    "VALUES (1, 'n-2', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                    "VALUES (1, 'n-2', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100, 0,"
                     " 'acct-1', 'nonkyc', 'T1')"
                 ))
 
@@ -564,36 +552,34 @@ class TestStartupMigration:
         with engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                " trade_type, amount, price) "
-                "VALUES (1, 'legacy-2', '2026-01-02 00:00:00', 'XMR-USDT', 'BUY', 1, 100)"
+                " trade_type, amount, price, fee_paid) "
+                "VALUES (1, 'legacy-2', '2026-01-02 00:00:00', 'XMR-USDT', 'BUY', 1, 100, 0)"
             ))
 
-        # And the constants actually carry this phase's migration at all.
-        assert any(t == "trades" and c == "exchange_trade_id" for t, c, _ in STARTUP_MIGRATIONS)
-        assert any("uq_trade_scoped_exchange_trade_id" in sql for sql in STARTUP_UNIQUE_INDEXES)
-
     @pytest.mark.asyncio
-    async def test_real_startup_path_installs_scoped_index_on_legacy_db(self):
-        """CDX-R03: the direct-helper test above proves the helpers work but
-        not that startup CALLS them. This one runs the REAL production startup
-        entrypoint (AsyncDatabaseManager.create_tables — create_all +
-        _run_migrations + _create_unique_indexes + _drop_hummingbot_tables)
-        against a legacy database whose trades table predates this phase, then
-        proves the scoped dedup index is actually enforced. Unwiring
-        _create_unique_indexes from create_tables fails this test: create_all
-        skips the pre-existing trades table, so ONLY the startup call installs
-        the index there. The engine is a thin awaitable facade over a real
-        sync sqlite engine (no async sqlite driver in this env) — every
-        statement create_tables issues executes for real."""
+    async def test_real_startup_path_refuses_db_without_the_scoped_index(self, tmp_path):
+        """CDX-R03 under the phase 9 design: startup no longer installs the
+        index (alembic does), so the guarantee that startup cannot serve
+        WITHOUT it is now enforced by refusing to start on a database that has
+        not been migrated. This runs the REAL production startup entrypoint
+        (AsyncDatabaseManager.verify_schema_at_head) against a database at the
+        deployed baseline — i.e. one whose trades table has no dedup index —
+        and proves it refuses. Deleting the fatal check makes this fail.
+
+        The engine is a thin awaitable facade over a real sync sqlite engine
+        (no async sqlite driver in this env) — the real check runs for real.
+        """
+        from alembic import command
+
+        from database.migration_state import (
+            BASELINE_REVISION,
+            MigrationStateError,
+            alembic_config,
+        )
 
         class RunSyncConnAdapter:
             def __init__(self, conn):
                 self._conn = conn
-
-            async def execute(self, stmt, params=None):
-                if params is not None:
-                    return self._conn.execute(stmt, params)
-                return self._conn.execute(stmt)
 
             async def run_sync(self, fn, *args, **kwargs):
                 return fn(self._conn, *args, **kwargs)
@@ -603,44 +589,40 @@ class TestStartupMigration:
                 self._engine = engine
 
             @asynccontextmanager
-            async def begin(self):
-                with self._engine.begin() as conn:
+            async def connect(self):
+                with self._engine.connect() as conn:
                     yield RunSyncConnAdapter(conn)
 
-        engine = create_engine(
-            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
-        )
-        with engine.begin() as conn:
-            # The trades schema as it existed BEFORE this phase.
-            conn.execute(text(
-                "CREATE TABLE trades ("
-                "id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, "
-                "trade_id TEXT NOT NULL UNIQUE, timestamp TIMESTAMP NOT NULL, "
-                "trading_pair TEXT NOT NULL, trade_type TEXT NOT NULL, "
-                "amount NUMERIC NOT NULL, price NUMERIC NOT NULL, "
-                "fee_paid NUMERIC NOT NULL DEFAULT 0, fee_currency TEXT)"
-            ))
+        url = f"sqlite:///{(tmp_path / 'unmigrated.db').as_posix()}"
+        command.upgrade(alembic_config(url), BASELINE_REVISION)
+        engine = create_engine(url)
+        assert "uq_trade_scoped_exchange_trade_id" not in {
+            i["name"] for i in inspect(engine).get_indexes("trades")
+        }
 
         mgr = AsyncDatabaseManager.__new__(AsyncDatabaseManager)  # skip asyncpg-only __init__
         mgr.engine = SyncEngineAdapter(engine)
-        await mgr.create_tables()  # the REAL startup entrypoint
+        with pytest.raises(MigrationStateError):
+            await mgr.verify_schema_at_head()  # the REAL startup entrypoint
 
+        # After the migration the same startup accepts the database, and the
+        # dedup index it was refusing to serve without is now enforced.
+        command.upgrade(alembic_config(url), "head")
+        await mgr.verify_schema_at_head()
         with engine.begin() as conn:
             conn.execute(text(
                 "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                " trade_type, amount, price, account_name, connector_name,"
+                " trade_type, amount, price, fee_paid, account_name, connector_name,"
                 " exchange_trade_id) "
-                "VALUES (1, 's-1', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                "VALUES (1, 's-1', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100, 0,"
                 " 'acct-1', 'nonkyc', 'T1')"
             ))
-        # Enforced: the same scoped triple under a different synthetic
-        # trade_id is rejected by the index startup just installed.
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(text(
                     "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
-                    " trade_type, amount, price, account_name, connector_name,"
+                    " trade_type, amount, price, fee_paid, account_name, connector_name,"
                     " exchange_trade_id) "
-                    "VALUES (1, 's-2', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                    "VALUES (1, 's-2', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100, 0,"
                     " 'acct-1', 'nonkyc', 'T1')"
                 ))
