@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from ledger_fixtures import valid_ledger_payload
 from services.resume_service import (
     CopyItem,
     CopyPlan,
@@ -117,6 +118,13 @@ def write_controller(
         "id": controller_id,
         "controller_name": controller_name,
         "controller_type": "market_making",
+        # Match the ledger fixture's identity. The engine compares these against
+        # its RESOLVED config, falling back to its model defaults (binance /
+        # ETH-USDT) for anything the YAML omits — so a staged config without them
+        # would rightly abort the copy (CDX-M02/CDX-R02) and mask what these
+        # tests are actually about.
+        "connector_name": "nonkyc",
+        "trading_pair": "XMR-USDT",
     }
     if state_file_name is not None:
         doc["state_file_name"] = state_file_name
@@ -132,10 +140,30 @@ def write_conf_client(new_instance_dir, db_engine="sqlite"):
     (cdir / "conf_client.yml").write_text(yaml.safe_dump(doc), encoding="utf-8")
 
 
-def write_ledger(source, filename, content='{"seed_value_quote": 100}', owner_id=...):
+def write_ledger(
+    source, filename, content=None, owner_id=..., ledger_controller_id="ctrl_a"
+):
     """Write a ledger file in the source data/. ``owner_id=...`` (sentinel)
-    means "no .owner sidecar"; ``owner_id=None`` writes a sidecar with no id."""
+    means "no .owner sidecar"; ``owner_id=None`` writes a sidecar with no id.
+
+    The body defaults to a VALID engine envelope (CDX-M02). It used to be
+    ``{"seed_value_quote": 100}``, which the old length+JSON validator accepted —
+    but it was never a ledger the engine would load, so every "copied" assertion
+    below was really asserting that a file the bot quarantines got copied. The
+    envelope validator makes that fixture a LEDGER_INVALID abort, so it is now
+    built from the engine's contract (see ``tests/ledger_fixtures``).
+
+    ``ledger_controller_id`` is the ledger's INTERNAL controller_id and must equal
+    the canonical id of the controller under test — it is deliberately separate
+    from ``owner_id`` so the owner-mismatch tests still isolate the SIDECAR as the
+    only thing that disagrees.
+
+    ``content`` (an explicit string) still writes bytes verbatim, which is what
+    the zero-length and bad-JSON syntax tests need.
+    """
     p = source.data_dir / filename
+    if content is None:
+        content = json.dumps(valid_ledger_payload(ledger_controller_id))
     p.write_text(content, encoding="utf-8")
     if owner_id is not ...:
         marker = {"pid": 1, "started_at": 1.0}
@@ -186,7 +214,7 @@ class TestNames:
 
     def test_custom_state_file_name(self, tmp_path):
         src = make_source(tmp_path)
-        write_ledger(src, "my_ledger.json", owner_id="ctrl_b")
+        write_ledger(src, "my_ledger.json", owner_id="ctrl_b", ledger_controller_id="ctrl_b")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="ctrl_b", state_file_name="my_ledger.json")
 
@@ -364,7 +392,7 @@ class TestC1Accepted:
     def test_relative_subdir_planned_normally(self, tmp_path):
         src = make_source(tmp_path)
         (src.data_dir / "sub").mkdir()
-        write_ledger(src, "sub/x.json", owner_id="ctrl_c")
+        write_ledger(src, "sub/x.json", owner_id="ctrl_c", ledger_controller_id="ctrl_c")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="sub/x.json")
 
@@ -378,7 +406,7 @@ class TestC1Accepted:
     def test_whitespace_is_stripped_to_canonical(self, tmp_path):
         """C1: the canonical value is the STRIPPED string."""
         src = make_source(tmp_path)
-        write_ledger(src, "my_ledger.json", owner_id="ctrl_c")
+        write_ledger(src, "my_ledger.json", owner_id="ctrl_c", ledger_controller_id="ctrl_c")
         new = new_instance(tmp_path)
         write_controller(
             new, "c.yml", controller_id="ctrl_c", state_file_name="  my_ledger.json  "
@@ -393,7 +421,7 @@ class TestC1Accepted:
         """C1: empty-after-strip maps to unset, which selects the engine's DEFAULT
         state file name. Not fail-open — the controller still resumes."""
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_c.json", owner_id="ctrl_c")
+        write_ledger(src, "range_inventory_ladder_ctrl_c.json", owner_id="ctrl_c", ledger_controller_id="ctrl_c")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="ctrl_c", state_file_name="   ")
 
@@ -451,7 +479,7 @@ class TestC1RuntimeContainment:
         outside. Only resolving catches this."""
         src = make_source(tmp_path)
         (src.data_dir / "sub").mkdir()
-        write_ledger(src, "sub/x.json", owner_id="ctrl_c")
+        write_ledger(src, "sub/x.json", owner_id="ctrl_c", ledger_controller_id="ctrl_c")
 
         new = new_instance(tmp_path)
         outside = tmp_path / "outside"
@@ -583,7 +611,7 @@ class TestFreshSeedAndSkip:
         # Deployed controller with a valid ledger.
         write_ledger(src, "range_inventory_ladder_ctrl_a.json", owner_id="ctrl_a")
         # Orphan ledger for a controller NOT in the deploy.
-        write_ledger(src, "range_inventory_ladder_ctrl_z.json", owner_id="ctrl_z")
+        write_ledger(src, "range_inventory_ladder_ctrl_z.json", owner_id="ctrl_z", ledger_controller_id="ctrl_z")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="ctrl_a")
 

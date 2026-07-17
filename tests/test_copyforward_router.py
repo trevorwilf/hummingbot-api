@@ -44,6 +44,7 @@ if _GATEWAY_MOD not in sys.modules:
 # Module-level imports that are SAFE (no hummingbot chain)
 # ---------------------------------------------------------------------------
 
+from ledger_fixtures import valid_ledger_payload
 from services.resume_service import (
     CopyPlan,
     GuardReport,
@@ -460,7 +461,8 @@ class TestPreviewNoWrites:
         # Template controller
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_xmr.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         # Credentials (for sqlite-mode check)
@@ -474,7 +476,7 @@ class TestPreviewNoWrites:
         src_dir = bots / "instances" / "SRC-20260710-101010"
         src_data = src_dir / "data"
         src_data.mkdir(parents=True)
-        ledger = json.dumps({"seq": 1}).encode()
+        ledger = json.dumps(valid_ledger_payload("ctrl_xmr")).encode()
         (src_data / "range_inventory_ladder_ctrl_xmr.json").write_bytes(ledger)
         (src_data / "range_inventory_ladder_ctrl_xmr.json.owner").write_text(
             json.dumps({"controller_id": "ctrl_xmr"}), encoding="utf-8"
@@ -550,7 +552,8 @@ class TestPreviewResumeService:
 
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_xmr.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         creds = bots / "credentials" / "master_account"
@@ -562,7 +565,7 @@ class TestPreviewResumeService:
         src_dir = bots / "instances" / "SRC-20260710-101010"
         src_data = src_dir / "data"
         src_data.mkdir(parents=True)
-        ledger_bytes = json.dumps({"seq": 7, "version": 3}).encode()
+        ledger_bytes = json.dumps(valid_ledger_payload("ctrl_xmr")).encode()
         (src_data / "range_inventory_ladder_ctrl_xmr.json").write_bytes(ledger_bytes)
         (src_data / "range_inventory_ladder_ctrl_xmr.json.owner").write_text(
             json.dumps({"controller_id": "ctrl_xmr"}), encoding="utf-8"
@@ -614,7 +617,8 @@ class TestPreviewResumeService:
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
         (ctrl_dir / "ctrl_xmr.yml").write_text(
-            yaml.safe_dump({"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}),
+            yaml.safe_dump({"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}),
             encoding="utf-8",
         )
 
@@ -657,13 +661,14 @@ class TestPreviewResumeService:
 
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_no_ext"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_no_ext",
+                       "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_no_ext.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         src_data = bots / "instances" / "SRC-20260710-101010" / "data"
         src_data.mkdir(parents=True)
         (src_data / "range_inventory_ladder_ctrl_no_ext.json").write_bytes(
-            json.dumps({"seq": 1}).encode()
+            json.dumps(valid_ledger_payload("ctrl_no_ext")).encode()
         )
         (src_data / "range_inventory_ladder_ctrl_no_ext.json.owner").write_text(
             json.dumps({"controller_id": "ctrl_no_ext"}), encoding="utf-8"
