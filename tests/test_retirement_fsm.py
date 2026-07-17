@@ -18,8 +18,9 @@ Covers:
     stage's evidence already persisted (CDX-R06),
     skip_order_cancellation recorded + independently verifiable to VERIFIED
     through the terminal write (CDX-R08).
-  * The startup migration (database.connection.STARTUP_MIGRATIONS via the real
-    _run_migrations routine) — legacy STOPPED rows land UNVERIFIED (CDX-R09).
+  * The schema migration (the real alembic baseline->head upgrade, which
+    replaced the ad-hoc startup ALTERs in phase 9) — legacy STOPPED rows land
+    UNVERIFIED (CDX-R09).
   * resume_service._guard_ungraceful_source (via run_guards) — legacy STOPPED
     rows, UNVERIFIED retirements, and VERIFIED markers with absent/malformed/
     incomplete evidence all refuse (CDX-R04); a fully-evidenced VERIFIED row
@@ -51,11 +52,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database.connection import STARTUP_MIGRATIONS, AsyncDatabaseManager
 from database.models import Base, BotRun, Order
 from database.repositories.bot_run_repository import (
     REQUIRED_RETIREMENT_EVIDENCE,
@@ -331,50 +331,47 @@ class TestFinalizeRetirementGates:
         assert run.retirement_status == RETIREMENT_UNVERIFIED
         assert run.retirement_evidence is None
 
-    @pytest.mark.asyncio
-    async def test_legacy_rows_migrate_to_unverified(self):
-        """CDX-R09: run the REAL startup migration routine (the production
-        ALTER statements in database.connection.STARTUP_MIGRATIONS, executed
-        by the real AsyncDatabaseManager._run_migrations) against a
-        PRE-migration bot_runs table holding a legacy STOPPED row. The
-        migration must leave that row UNVERIFIED with no fabricated evidence —
-        a DEFAULT of 'VERIFIED' in the ALTER would silently bless every
-        legacy stop."""
+    def test_legacy_rows_migrate_to_unverified(self, tmp_path):
+        """CDX-R09: a legacy STOPPED row must land UNVERIFIED with no
+        fabricated evidence — a server_default of 'VERIFIED' in the migration
+        would silently bless every legacy stop.
 
-        class SyncConnAdapter:
-            """Awaitable facade over a sync Connection for _run_migrations."""
+        Phase 9 (CDX-013) replaced the ad-hoc startup ALTERs with versioned
+        alembic migrations, so this now runs the REAL production migration
+        path: a database at the deployed baseline (0001, which has no
+        retirement columns — exactly production today) holding a legacy
+        STOPPED row, then `alembic upgrade head`.
+        """
+        from alembic import command
 
-            def __init__(self, conn):
-                self._conn = conn
+        from database.migration_state import BASELINE_REVISION, alembic_config
 
-            async def execute(self, stmt, params=None):
-                if params is not None:
-                    return self._conn.execute(stmt, params)
-                return self._conn.execute(stmt)
+        url = f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}"
+        command.upgrade(alembic_config(url), BASELINE_REVISION)
 
-        engine = create_engine(
-            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
-        )
+        engine = create_engine(url)
         with engine.begin() as conn:
+            # The baseline has no retirement columns at all: that is what makes
+            # this row genuinely legacy.
+            cols = {c["name"] for c in inspect(engine).get_columns("bot_runs")}
+            assert "retirement_status" not in cols
             conn.execute(text(
-                "CREATE TABLE bot_runs ("
-                "id INTEGER PRIMARY KEY, bot_name TEXT, run_status TEXT, "
-                "stopped_at TIMESTAMP)"
+                "INSERT INTO bot_runs (bot_name, instance_name, deployed_at,"
+                " strategy_type, strategy_name, run_status, deployment_status,"
+                " account_name, stopped_at) "
+                "VALUES ('legacy', 'inst-1', '2026-01-01', 'script', 's',"
+                " 'STOPPED', 'DEPLOYED', 'acct-1', '2026-01-01 00:00:00')"
             ))
-            conn.execute(text(
-                "INSERT INTO bot_runs (bot_name, run_status, stopped_at) "
-                "VALUES ('legacy', 'STOPPED', '2026-01-01 00:00:00')"
-            ))
-            mgr = AsyncDatabaseManager.__new__(AsyncDatabaseManager)  # migrations only
-            await AsyncDatabaseManager._run_migrations(mgr, SyncConnAdapter(conn))
+
+        command.upgrade(alembic_config(url), "head")
+
+        with engine.begin() as conn:
             row = conn.execute(text(
                 "SELECT retirement_status, retirement_evidence FROM bot_runs "
                 "WHERE bot_name='legacy'"
             )).fetchone()
         assert row[0] == RETIREMENT_UNVERIFIED
         assert row[1] is None
-        # And the constant actually contains the bot_runs migration at all.
-        assert any(t == "bot_runs" and c == "retirement_status" for t, c, _ in STARTUP_MIGRATIONS)
 
     @pytest.mark.asyncio
     async def test_progressive_evidence_write_changes_no_status(self, db):

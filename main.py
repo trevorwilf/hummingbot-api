@@ -139,7 +139,10 @@ async def lifespan(app: FastAPI):
     # Initialize secrets manager and database
     secrets_manager = ETHKeyFileSecretManger(password=settings.security.config_password)
     db_manager = AsyncDatabaseManager(settings.database.url)
-    await db_manager.create_tables()
+    # CDX-013: schema is built by versioned alembic migrations, not by this
+    # process. Startup only verifies the database is at head and refuses to
+    # serve otherwise (MigrationStateError carries the runbook commands).
+    await db_manager.verify_schema_at_head()
     logging.info("Database initialized")
 
     # Read the global quote token (the currency everything is valued in) from conf_client.yml.

@@ -5,69 +5,9 @@ from typing import AsyncGenerator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from .models import Base
+from .migration_state import MigrationStateError, check_schema_at_head
 
 logger = logging.getLogger(__name__)
-
-# Lightweight startup migrations: (table, column, ALTER SQL). Module-level so
-# tests can execute the EXACT production statements (and the routine itself)
-# against a real database — tests/test_retirement_fsm.py runs the bot_runs
-# ALTERs on a pre-migration schema to prove legacy rows land UNVERIFIED.
-STARTUP_MIGRATIONS = [
-    # Add controller_id to executors table (default "main" for existing rows)
-    (
-        "executors", "controller_id",
-        "ALTER TABLE executors ADD COLUMN controller_id TEXT NOT NULL DEFAULT 'main'"
-    ),
-    # Add error_log to executors table for storing errors on failed executors
-    (
-        "executors", "error_log",
-        "ALTER TABLE executors ADD COLUMN error_log TEXT"
-    ),
-    # Add cum_fees_quote to position_holds table for tracking fees
-    (
-        "position_holds", "cum_fees_quote",
-        "ALTER TABLE position_holds ADD COLUMN cum_fees_quote NUMERIC(30,18) NOT NULL DEFAULT 0"
-    ),
-    # CDX-005: acknowledged-retirement state machine evidence on bot_runs.
-    # Legacy rows get the UNVERIFIED default — existing STOPPED rows are
-    # unverified by definition.
-    (
-        "bot_runs", "retirement_status",
-        "ALTER TABLE bot_runs ADD COLUMN retirement_status TEXT NOT NULL DEFAULT 'UNVERIFIED'"
-    ),
-    (
-        "bot_runs", "retirement_evidence",
-        "ALTER TABLE bot_runs ADD COLUMN retirement_evidence TEXT"
-    ),
-    # CDX-006: scoped fill identity on trades — dedup key for insert-first
-    # fill accounting. Legacy rows keep NULLs (never collide; NULLs are
-    # distinct in the unique index on both sqlite and postgres).
-    (
-        "trades", "account_name",
-        "ALTER TABLE trades ADD COLUMN account_name TEXT"
-    ),
-    (
-        "trades", "connector_name",
-        "ALTER TABLE trades ADD COLUMN connector_name TEXT"
-    ),
-    (
-        "trades", "exchange_trade_id",
-        "ALTER TABLE trades ADD COLUMN exchange_trade_id TEXT"
-    ),
-]
-
-# Unique indexes that back money-critical dedup constraints on PRE-EXISTING
-# tables (create_all already builds them into fresh tables via __table_args__).
-# CREATE UNIQUE INDEX IF NOT EXISTS is idempotent on both sqlite and postgres;
-# on a fresh sqlite DB this adds a (harmless) second index next to the
-# table-level constraint's autoindex. Errors here must NOT be swallowed:
-# without this index duplicate fill deliveries would silently double-count
-# order aggregates (fail closed — refuse to start instead).
-STARTUP_UNIQUE_INDEXES = [
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_scoped_exchange_trade_id "
-    "ON trades (account_name, connector_name, exchange_trade_id)",
-]
 
 
 class AsyncDatabaseManager:
@@ -99,82 +39,35 @@ class AsyncDatabaseManager:
             expire_on_commit=False
         )
 
-    async def create_tables(self):
-        """Create all tables defined in the models."""
-        try:
-            async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+    async def verify_schema_at_head(self) -> str:
+        """Refuse to serve unless the database is at the alembic head (CDX-013).
 
-                # Run lightweight migrations for existing tables
-                await self._run_migrations(conn)
+        Replaces the old create_tables(): the API no longer creates or alters
+        any schema at startup. Migrations are versioned, transactional and
+        applied out-of-band (the stacks' hummingbot-api-migrate service runs
+        `alembic upgrade head` before this process starts); startup only
+        verifies the result.
 
-                # Enforce money-critical dedup indexes on pre-existing tables
-                await self._create_unique_indexes(conn)
-
-                # Drop Hummingbot's native tables since we use our custom orders/trades tables
-                await self._drop_hummingbot_tables(conn)
-
-            logger.info("Database tables created successfully")
-        except Exception as e:
-            logger.error(f"Failed to create database tables: {e}")
-            raise
-
-    async def _run_migrations(self, conn):
-        """Run lightweight schema migrations for existing tables."""
-        for table, column, sql in STARTUP_MIGRATIONS:
-            try:
-                # Check if column already exists
-                result = await conn.execute(
-                    text(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_name = :table AND column_name = :column"
-                    ),
-                    {"table": table, "column": column}
-                )
-                column_missing = result.fetchone() is None
-            except Exception as e:
-                # No information_schema (e.g. sqlite): attempt the ALTER anyway;
-                # the duplicate-column swallow below handles repeat startups.
-                logger.debug(f"Migration existence probe failed for {table}.{column}: {e}")
-                column_missing = True
-            if not column_missing:
-                continue
-            try:
-                await conn.execute(text(sql))
-                logger.info(f"Migration: added {column} to {table}")
-            except Exception as e:
-                # Column-already-exists is expected on repeat startups
-                err_msg = str(e).lower()
-                if "already exists" in err_msg or "duplicate column" in err_msg:
-                    logger.debug(f"Migration check for {table}.{column}: {e}")
-                else:
-                    logger.warning(f"Unexpected migration error for {table}.{column}: {e}")
-
-    async def _create_unique_indexes(self, conn):
-        """Create money-critical unique dedup indexes (idempotent).
-
-        Called after create_all + column migrations, so the tables exist. A
-        failure here propagates (startup aborts) — running without the trades
-        dedup constraint would let duplicate fill deliveries double-count
-        order aggregates (fail closed: refuse to serve instead).
+        Fatal on: no alembic_version table, a revision behind head, or any
+        failure to perform the check at all. All three mean "the schema is not
+        known to match this code", and the previous fail-open behaviour
+        (log the error, serve anyway) is exactly what CDX-013 reported.
         """
-        for index_sql in STARTUP_UNIQUE_INDEXES:
-            await conn.execute(text(index_sql))
+        try:
+            async with self.engine.connect() as conn:
+                revision = await conn.run_sync(check_schema_at_head)
+        except MigrationStateError:
+            raise
+        except Exception as e:
+            # Could not even ask (connection refused, permissions, broken
+            # scaffold, ...). Unknown schema state -> refuse, never assume.
+            raise MigrationStateError(
+                f"Could not verify the database schema version: {e}. Refusing to "
+                "start rather than serve against an unverified schema."
+            ) from e
 
-    async def _drop_hummingbot_tables(self, conn):
-        """Drop Hummingbot's native database tables since we use custom ones."""
-        hummingbot_tables = [
-            "hummingbot_orders",
-            "hummingbot_trade_fills",
-            "hummingbot_order_status"
-        ]
-
-        for table_name in hummingbot_tables:
-            try:
-                await conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
-                logger.info(f"Dropped Hummingbot table: {table_name}")
-            except Exception as e:
-                logger.debug(f"Could not drop table {table_name}: {e}")  # Use debug since table might not exist
+        logger.info(f"Database schema verified at alembic head revision '{revision}'")
+        return revision
 
     async def close(self):
         """Close all database connections."""
