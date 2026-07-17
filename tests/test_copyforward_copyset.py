@@ -118,6 +118,13 @@ def write_controller(
         "id": controller_id,
         "controller_name": controller_name,
         "controller_type": "market_making",
+        # Match the ledger fixture's identity. The engine compares these against
+        # its RESOLVED config, falling back to its model defaults (binance /
+        # ETH-USDT) for anything the YAML omits — so a staged config without them
+        # would rightly abort the copy (CDX-M02/CDX-R02) and mask what these
+        # tests are actually about.
+        "connector_name": "nonkyc",
+        "trading_pair": "XMR-USDT",
     }
     if state_file_name is not None:
         doc["state_file_name"] = state_file_name

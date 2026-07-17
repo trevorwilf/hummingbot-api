@@ -26,6 +26,7 @@ import logging
 import re
 import secrets
 import shutil
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -762,9 +763,10 @@ def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: st
 
     Args:
         src_ledger: The source ledger path (already containment-checked).
-        config: The staged controller config, read for the identity fields the
-            engine will compare the ledger against at load. Fields it does not
-            carry are passed as None (unknowable, not assumed).
+        config: The staged controller config, passed whole to the contract, which
+            resolves the identity fields the engine will compare the ledger
+            against — falling back to the engine's own model defaults for fields
+            the YAML omits, never skipping a comparison (CDX-R02).
         canonical_controller_id: The C2-CANONICAL (stripped) staged id. Passed in
             rather than re-read from ``config`` so no unvalidated id reaches an
             identity comparison — the same reasoning as :func:`_plan_controller`'s.
@@ -792,14 +794,24 @@ def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: st
             ResumeAbortReason.LEDGER_INVALID,
             f"Expected ledger '{src_ledger}' is not valid JSON ({exc}) — refusing to seed garbage.",
         )
+    except RecursionError as exc:
+        # CDX-R03: json.loads recurses per nesting level, so a ledger nested past
+        # the interpreter's recursion limit raises RecursionError — a RuntimeError,
+        # NOT a ValueError, so it slipped the handler above and surfaced as an
+        # opaque 500 instead of this contract's structured 409. The deploy was
+        # still refused (the exception propagated), but a fail-closed abort that
+        # cannot say why is a broken contract, not a safe one.
+        raise ResumeError(
+            ResumeAbortReason.LEDGER_INVALID,
+            f"Expected ledger '{src_ledger}' is nested too deeply to parse ({exc}) — "
+            f"refusing to seed garbage.",
+        )
 
     verdict = classify_ledger_envelope(
         payload,
         canonical_controller_id=canonical_controller_id,
-        expected_controller_name=_expected_identity(config, "controller_name"),
-        expected_controller_type=_expected_identity(config, "controller_type"),
-        expected_connector_name=_expected_identity(config, "connector_name"),
-        expected_trading_pair=_expected_identity(config, "trading_pair"),
+        staged_config=config,
+        now_timestamp=time.time(),
     )
     if not verdict.is_valid:
         raise ResumeError(
@@ -808,22 +820,6 @@ def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: st
             f"Copying it forward would deploy a bot that quarantines this state on load and "
             f"re-seeds from the wallet. Refusing to deploy (CDX-M02, fail-closed).",
         )
-
-
-def _expected_identity(config: dict, field_name: str) -> Optional[str]:
-    """Return a staged-config identity value for the envelope comparison, or None.
-
-    None means "the staged config did not carry a usable value", and the contract
-    module SKIPS that comparison rather than inventing the engine's Pydantic model
-    default. A non-str (or blank) staged value is deliberately reported as
-    unknowable too: comparing the ledger against a value the engine would itself
-    reject or coerce would abort on the wrong evidence. The ledger's own field is
-    still type- and presence-checked by the contract either way.
-    """
-    value = config.get(field_name)
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
 
 
 def _read_owner_controller_id(owner_path: Path) -> str:

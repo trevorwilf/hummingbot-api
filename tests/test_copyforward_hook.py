@@ -62,6 +62,11 @@ TEMPLATE_CFG = {
     "controller_name": "range_inventory_ladder",
     "id": CONTROLLER_ID,
     "connector_name": "kraken",
+    # The ledger fixture's pair. Absent, the engine would resolve its model
+    # default (ETH-USDT, range_inventory_ladder.py:203) and compare the ledger
+    # against THAT -> a correct LEDGER_INVALID abort that has nothing to do with
+    # what this file tests (CDX-M02/CDX-R02).
+    "trading_pair": "XMR-USDT",
     "buy_spread": 0.1,
 }
 

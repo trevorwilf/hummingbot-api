@@ -461,7 +461,8 @@ class TestPreviewNoWrites:
         # Template controller
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_xmr.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         # Credentials (for sqlite-mode check)
@@ -551,7 +552,8 @@ class TestPreviewResumeService:
 
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_xmr.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         creds = bots / "credentials" / "master_account"
@@ -615,7 +617,8 @@ class TestPreviewResumeService:
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
         (ctrl_dir / "ctrl_xmr.yml").write_text(
-            yaml.safe_dump({"controller_name": "range_inventory_ladder", "id": "ctrl_xmr"}),
+            yaml.safe_dump({"controller_name": "range_inventory_ladder", "id": "ctrl_xmr",
+                     "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}),
             encoding="utf-8",
         )
 
@@ -658,7 +661,8 @@ class TestPreviewResumeService:
 
         ctrl_dir = bots / "conf" / "controllers"
         ctrl_dir.mkdir(parents=True)
-        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_no_ext"}
+        ctrl_cfg = {"controller_name": "range_inventory_ladder", "id": "ctrl_no_ext",
+                       "connector_name": "nonkyc", "trading_pair": "XMR-USDT"}
         (ctrl_dir / "ctrl_no_ext.yml").write_text(yaml.safe_dump(ctrl_cfg), encoding="utf-8")
 
         src_data = bots / "instances" / "SRC-20260710-101010" / "data"

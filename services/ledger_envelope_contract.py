@@ -13,7 +13,10 @@ module mirrors. Every rule below is transcribed from
   * ``RangeInventoryLadder._validate_loaded_state``  :1962 — the load-time gate
   * ``STATE_SCHEMA_VERSION = 10``                    :1385
   * ``SUPPORTED_STATE_SCHEMA_VERSIONS = {6..10}``    :1386
+  * ``STATE_MAX_FUTURE_SKEW_SECONDS = 86400``        :1387
   * ``_safe_decimal``                                :165 — numeric field parsing
+  * ``RangeInventoryLadderConfig`` identity defaults :192-206
+  * ``split_hb_trading_pair``  hummingbot/connector/utils.py:29
   * the state WRITER                                 :2329 — ``schema_version`` is
     written as an ``int``
 
@@ -60,23 +63,51 @@ Deliberate DIVERGENCES from the engine (both strictly stricter)
    ledger the engine is guaranteed to reject: fail-open, and precisely the class
    of bug CDX-M02 was filed for. See :func:`_check_identity`.
 
+Identity resolution: mirror the engine's defaults, never skip (CDX-R02)
+-----------------------------------------------------------------------
+The engine compares the ledger against a RESOLVED Pydantic config, while the API
+holds only the staged YAML. An earlier revision of this module treated a field the
+staged YAML omitted as "unknowable" and SKIPPED that comparison. That was
+fail-open on exactly the axis this validator exists to close: the engine does not
+skip anything — it resolves its model default and compares. A staged config with
+no ``connector_name`` resolves to ``"binance"`` engine-side (:196), so a ledger
+carrying ``"nonkyc"`` is a guaranteed engine-side mismatch → quarantine → wallet
+re-seed, and the skip blessed it.
+
+The defaults are not a guess: they are read from the engine's config model exactly
+as :data:`REQUIRED_LEDGER_KEYS` and :data:`SUPPORTED_LEDGER_SCHEMA_VERSIONS` are
+read from its validator, and they carry the same sync obligation. See
+:data:`ENGINE_IDENTITY_DEFAULTS`. Resolution is therefore TOTAL — every identity
+field yields an expected value, and every comparison runs:
+
+  * key absent from the staged YAML  -> the engine's model default
+  * present, non-blank ``str``       -> that value, compared VERBATIM
+  * present but non-``str`` or blank -> ``LEDGER_INVALID`` (uncertainty). Pydantic
+    v2 rejects ``None``/non-``str`` for a ``str`` field, so such a config never
+    resolves engine-side at all; a blank can never match a valid ledger's
+    non-empty field. Either way the deploy is already doomed — refuse it here,
+    where refusing is still free.
+
 What this module deliberately does NOT check (honest limits)
 -------------------------------------------------------------
 The API cannot fully replicate the engine's gate, and pretending otherwise would
 be worse than the gap. This validator is NECESSARY, not SUFFICIENT: it proves a
-ledger is known-bad, never that it will load.
+ledger is known-bad, never that it will load. It does not run the v9->v10
+migration (:2059-2076), the post-migration ``owned_quote``/``owned_base``/
+``seed_value_quote`` re-validation (:2083-2092), or anything requiring live
+exchange/wallet state.
 
-  * ``base_asset``/``quote_asset`` vs ``trading_pair`` — the engine derives these
-    with ``split_hb_trading_pair`` (:1966), engine code the API cannot import.
-    Guessing its semantics ("split on the first '-'") would abort real deploys on
-    any pair whose format we guessed wrong. Presence and type are enforced; the
-    derivation is not re-implemented.
-  * ``initialized_timestamp`` future-skew (:2051) — needs the engine's
-    ``market_data_provider.time()``, i.e. the bot's clock, not the API's.
-  * Engine model DEFAULTS — the engine compares the ledger against a RESOLVED
-    Pydantic config; the API holds only the staged YAML. Where the staged config
-    omits a field, the comparison is skipped rather than guessed (see the
-    ``expected_*`` parameters).
+The clock is the caller's (:2049-2054)
+---------------------------------------
+The engine's future-skew check reads ``market_data_provider.time()`` — the BOT's
+clock, which the API does not have. It is mirrored anyway, against a clock the
+caller injects, because the engine's tolerance is a full day
+(``STATE_MAX_FUTURE_SKEW_SECONDS`` = 86400, :1387): a valid ledger's
+``initialized_timestamp`` lies in the PAST, so tripping this check on a real
+ledger would need the API's clock to run >24h BEHIND the bot's — implausible for
+two containers on one host, while the ledger it DOES catch (a timestamp far in the
+future) is one the engine is guaranteed to quarantine. An unsupplied or
+unparseable clock is uncertainty, and uncertainty is ``LEDGER_INVALID``.
 
 Keeping :data:`SUPPORTED_LEDGER_SCHEMA_VERSIONS` in sync with the engine is a
 recorded, permanent obligation of this mirror — it is listed in the batch's final
@@ -140,6 +171,43 @@ NUMERIC_LEDGER_FIELDS = (
     "initialized_timestamp",
 )
 
+# The engine's RESOLVED config defaults for the identity fields, mirrored from
+# ``RangeInventoryLadderConfig`` (range_inventory_ladder.py:192-206):
+#     controller_name: str = "range_inventory_ladder"   :192
+#     controller_type: str = "market_making"            :193
+#     connector_name:  str = Field(default="binance")   :196
+#     trading_pair:    str = Field(default="ETH-USDT")  :203
+# A staged YAML that omits one of these is NOT "unknowable" — the engine resolves
+# exactly these values and compares the ledger against them. MUST be kept in sync
+# with the engine, the same standing obligation as the version set above.
+ENGINE_IDENTITY_DEFAULTS = {
+    "controller_name": "range_inventory_ladder",
+    "controller_type": "market_making",
+    "connector_name": "binance",
+    "trading_pair": "ETH-USDT",
+}
+
+# Mirrors range_inventory_ladder.py:1387 — the engine's future-skew tolerance for
+# ``initialized_timestamp`` (:2049-2054). One day.
+STATE_MAX_FUTURE_SKEW_SECONDS = Decimal("86400")
+
+
+def _split_hb_trading_pair(trading_pair: str):
+    """Mirror of ``split_hb_trading_pair`` (hummingbot/connector/utils.py:29).
+
+    The engine's body is ``base, quote = trading_pair.split("-")`` — a split on
+    EVERY hyphen, unpacked into exactly two names. So "XMR-USDT" splits, while
+    "XMRUSDT" (0 hyphens) and "A-B-C" (2) raise ValueError at the unpack. That
+    ValueError is raised at :1966, inside ``_validate_loaded_state`` and before any
+    ledger key is read — i.e. it quarantines the state just like every other
+    rejection here, which is why this mirror maps it to LEDGER_INVALID.
+
+    Raises:
+        ValueError: exactly where the engine's unpack does.
+    """
+    base, quote = trading_pair.split("-")
+    return base, quote
+
 
 @dataclass(frozen=True)
 class LedgerVerdict:
@@ -182,20 +250,51 @@ def _mirror_safe_decimal(value, field_name: str) -> Decimal:
     return parsed
 
 
+def _resolve_expected_identity(staged_config: dict, field_name: str):
+    """Resolve what the ENGINE's config will hold for ``field_name``.
+
+    Total by construction — there is no "skip this comparison" outcome, because the
+    engine has none (see the module docstring's identity-resolution section).
+
+    Returns:
+        ``(value, None)`` with the value the engine will compare against, or
+        ``(None, verdict)`` when the staged value is one the engine could never
+        resolve (non-``str``, blank) — uncertainty, hence ``LEDGER_INVALID``.
+    """
+    if field_name not in staged_config:
+        # Absent -> the engine resolves its model default and compares against it.
+        return ENGINE_IDENTITY_DEFAULTS[field_name], None
+
+    value = staged_config[field_name]
+    if not isinstance(value, str) or not value.strip():
+        return None, _invalid(
+            f"staged controller's {field_name} is {value!r}, which is not a usable "
+            f"identity value: the engine's config model types this field as a bare "
+            f"`str` (range_inventory_ladder.py:192-206), so Pydantic v2 rejects "
+            f"None/non-str outright and a blank could never match a valid ledger's "
+            f"non-empty {field_name}. The ledger's identity cannot be established "
+            f"against this config — refusing on uncertainty rather than skipping the "
+            f"comparison (CDX-M02/CDX-R02, fail-closed)."
+        )
+    # Present -> compared VERBATIM. The engine applies no strip to these fields
+    # (unlike C2's `id`), so staged " binance " genuinely mismatches ledger
+    # "binance" engine-side, and this mirror must say so rather than tidy it up.
+    return value, None
+
+
 def _check_identity(
     payload: dict,
     canonical_controller_id: str,
-    expected: dict,
+    staged_config: dict,
 ) -> Optional[LedgerVerdict]:
-    """The engine's identity comparisons (:2005-2024), minus what we cannot know.
+    """The engine's identity comparisons (:2005-2028), all of them.
 
     ``controller_id`` is compared EXACTLY against the C2-canonical staged id —
     the ledger's copy is never stripped. See the module docstring's DIVERGENCES:
     stripping here would bless a ledger the engine quarantines.
 
-    The remaining fields are compared only where the caller supplied an expected
-    value (i.e. the staged config carried the field). Skipping an unknowable
-    comparison is honest; inventing the engine's model default is not.
+    Every other identity field is resolved against the staged config or the
+    engine's model default and then compared; nothing is skipped.
     """
     ledger_id = payload.get("controller_id")
     if ledger_id != canonical_controller_id:
@@ -208,15 +307,44 @@ def _check_identity(
             f"not strip it either, so a padded id is a genuine mismatch, not a formatting nit."
         )
 
-    for field_name, expected_value in expected.items():
-        if expected_value is None:
-            continue  # staged config did not carry it -> unknowable, not assumed
+    # Engine order: controller_name (:2005), controller_type (:2009), connector_name
+    # (:2017), trading_pair (:2021).
+    for field_name in ("controller_name", "controller_type", "connector_name", "trading_pair"):
+        expected_value, failure = _resolve_expected_identity(staged_config, field_name)
+        if failure is not None:
+            return failure
         if payload.get(field_name) != expected_value:
             return _invalid(
                 f"ledger's {field_name} {payload.get(field_name)!r} does not match the staged "
                 f"controller's {expected_value!r}; the engine rejects this mismatch at load "
-                f"(range_inventory_ladder.py:2005-2020) and quarantines the state."
+                f"(range_inventory_ladder.py:2005-2024) and quarantines the state."
             )
+
+    # base_asset / quote_asset vs the trading pair (:2025-2028). The engine derives
+    # these from its CONFIG's pair (:1966) — not the ledger's — so this mirror
+    # derives from the resolved expected pair too. The ledger's own trading_pair
+    # already had to equal it to get here, so the two are the same string by now.
+    expected_pair, failure = _resolve_expected_identity(staged_config, "trading_pair")
+    if failure is not None:
+        return failure
+    try:
+        expected_base, expected_quote = _split_hb_trading_pair(expected_pair)
+    except ValueError:
+        return _invalid(
+            f"staged controller's trading_pair {expected_pair!r} cannot be split into a "
+            f"base and a quote asset; the engine's split_hb_trading_pair "
+            f"(hummingbot/connector/utils.py:29) raises on it at "
+            f"range_inventory_ladder.py:1966, quarantining the state before it reads a "
+            f"single ledger key."
+        )
+    if payload.get("base_asset") != expected_base or payload.get("quote_asset") != expected_quote:
+        return _invalid(
+            f"ledger's assets {payload.get('base_asset')!r}-{payload.get('quote_asset')!r} do "
+            f"not match {expected_base!r}-{expected_quote!r} as split from the trading pair "
+            f"{expected_pair!r}; the engine rejects this at range_inventory_ladder.py:2025-2028 "
+            f"and quarantines the state. A ledger whose assets contradict its own pair is "
+            f"not this controller's ledger."
+        )
     return None
 
 
@@ -224,10 +352,8 @@ def classify_ledger_envelope(
     payload,
     *,
     canonical_controller_id: str,
-    expected_controller_name: Optional[str] = None,
-    expected_controller_type: Optional[str] = None,
-    expected_connector_name: Optional[str] = None,
-    expected_trading_pair: Optional[str] = None,
+    staged_config: dict,
+    now_timestamp,
 ) -> LedgerVerdict:
     """Classify a PARSED ledger payload against the engine's envelope contract.
 
@@ -243,16 +369,28 @@ def classify_ledger_envelope(
             ``classify_controller_id``. Taken as a parameter rather than read from
             the ledger or a raw config so this function cannot see an
             unvalidated id — the same reasoning as ``_plan_controller``'s.
-        expected_controller_name: The staged config's ``controller_name``, or None
-            when unknown. Same for the other ``expected_*`` values: None means
-            "the staged config did not carry it", and the comparison is SKIPPED
-            rather than guessed.
+        staged_config: The staged controller's raw config dict (the YAML as read).
+            Its identity fields are resolved against :data:`ENGINE_IDENTITY_DEFAULTS`
+            and compared — never skipped. See the module docstring.
+        now_timestamp: The caller's clock, as seconds since the epoch (anything
+            ``Decimal(str(...))`` accepts). Injected rather than read here so the
+            skew check is deterministic under test. None/unparseable is
+            uncertainty -> invalid.
 
     Returns:
         A :class:`LedgerVerdict`. Never raises: callers map the verdict to their
         own fail-closed action, so a hostile ledger yields a structured 409 rather
         than an opaque 500.
     """
+    # 0. The staged config is the yardstick every identity comparison is measured
+    #    against. If it is not even a mapping we cannot establish identity at all.
+    if not isinstance(staged_config, dict):
+        return _invalid(
+            f"staged controller config must be a mapping (got "
+            f"{type(staged_config).__name__}); the ledger's identity cannot be "
+            f"established without it — refusing on uncertainty."
+        )
+
     # 1. Top-level shape. Mirrors :1963. Catches {}, [], null, scalars, and the
     #    old validator's blind spot: any JSON that parses is not an envelope.
     if not isinstance(payload, dict):
@@ -310,16 +448,7 @@ def classify_ledger_envelope(
                 f"against its resolved config (range_inventory_ladder.py:2005-2028)."
             )
 
-    identity_failure = _check_identity(
-        payload,
-        canonical_controller_id,
-        {
-            "controller_name": expected_controller_name,
-            "controller_type": expected_controller_type,
-            "connector_name": expected_connector_name,
-            "trading_pair": expected_trading_pair,
-        },
-    )
+    identity_failure = _check_identity(payload, canonical_controller_id, staged_config)
     if identity_failure is not None:
         return identity_failure
 
@@ -334,6 +463,7 @@ def classify_ledger_envelope(
         )
 
     # 6. Numeric fields: parseable, finite, non-negative. Mirrors :2033-2047.
+    parsed_numerics = {}
     for field_name in NUMERIC_LEDGER_FIELDS:
         try:
             parsed = _mirror_safe_decimal(payload.get(field_name), f"state field '{field_name}'")
@@ -347,5 +477,26 @@ def classify_ledger_envelope(
                 f"ledger's {field_name} must be non-negative (got {parsed}); the engine "
                 f"rejects it at range_inventory_ladder.py:2045-2046."
             )
+        parsed_numerics[field_name] = parsed
+
+    # 7. initialized_timestamp future-skew. Mirrors :2049-2054 against the caller's
+    #    clock — see the module docstring for why the API's clock is close enough
+    #    at a 1-day tolerance, and why an unusable clock is a refusal.
+    try:
+        now = _mirror_safe_decimal(now_timestamp, "now_timestamp")
+    except ValueError as exc:
+        return _invalid(
+            f"the current time could not be established to check the ledger's "
+            f"initialized_timestamp against the engine's future-skew limit ({exc}); "
+            f"refusing on uncertainty rather than skipping the check."
+        )
+    initialized_timestamp = parsed_numerics["initialized_timestamp"]
+    if initialized_timestamp > (now + STATE_MAX_FUTURE_SKEW_SECONDS):
+        return _invalid(
+            f"ledger's initialized_timestamp {initialized_timestamp} is unreasonably far in "
+            f"the future (more than {STATE_MAX_FUTURE_SKEW_SECONDS}s past the current "
+            f"{now}); the engine rejects it at range_inventory_ladder.py:2049-2054 "
+            f"(STATE_MAX_FUTURE_SKEW_SECONDS, :1387) and quarantines the state."
+        )
 
     return LedgerVerdict(True)

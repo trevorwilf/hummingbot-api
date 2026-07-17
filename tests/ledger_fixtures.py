@@ -47,9 +47,11 @@ def valid_ledger_payload(
             so tests that want a mismatch pass a differing value here.
         connector_name / trading_pair: Identity fields the engine compares against
             its resolved config (:2017, :2021). ``base_asset``/``quote_asset`` are
-            split from ``trading_pair`` the way the engine's
-            ``split_hb_trading_pair`` (:1966) would, so the fixture stays
-            self-consistent.
+            split from ``trading_pair`` exactly the way the engine's
+            ``split_hb_trading_pair`` (hummingbot/connector/utils.py:29, called at
+            :1966) does — ``split("-")`` unpacked into exactly two — so the fixture
+            stays self-consistent AND so a pair the engine could not split raises
+            here too, rather than being quietly papered over with a maxsplit.
         schema_version: Overridable so version-boundary tests (5 / 11) can build
             an otherwise-perfect envelope and vary ONE field.
         **overrides: Applied last — set a key to a bad value, or use
@@ -58,7 +60,7 @@ def valid_ledger_payload(
     Returns:
         A fresh dict (never a shared module-level object — callers mutate these).
     """
-    base_asset, quote_asset = trading_pair.split("-", 1)
+    base_asset, quote_asset = trading_pair.split("-")
     payload = {
         # range_inventory_ladder.py:1967-1983 — the required_keys set, in order.
         "schema_version": schema_version,
