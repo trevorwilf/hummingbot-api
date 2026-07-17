@@ -38,21 +38,34 @@ class OrderRepository:
         return order
 
     async def update_order_fill(self, client_order_id: str, filled_amount: Decimal,
-                              average_fill_price: Decimal, fee_paid: Decimal = None,
+                              fill_price: Decimal, fee_paid: Decimal = None,
                               fee_currency: str = None, exchange_order_id: str = None) -> Optional[Order]:
-        """Update order with fill information."""
+        """Apply ONE fill to the order's aggregates (CDX-006).
+
+        ``fill_price`` is this fill's execution price; ``average_fill_price``
+        becomes the incremental VWAP over all fills applied so far. Callers
+        must apply each fill exactly once — dedup is the trade insert's job
+        (TradeRepository.insert_trade_if_new), in the same transaction.
+        """
         result = await self.session.execute(
             select(Order).where(Order.client_order_id == client_order_id)
         )
         order = result.scalar_one_or_none()
         if order:
-            # Add to existing filled amount instead of replacing
-            previous_filled = Decimal(str(order.filled_amount or 0))
-            order.filled_amount = float(previous_filled + filled_amount)
-            
-            # Update average price (simplified - use latest fill price)
-            order.average_fill_price = float(average_fill_price)
-            
+            prev_filled = Decimal(str(order.filled_amount or 0))
+            prev_avg = (
+                Decimal(str(order.average_fill_price))
+                if order.average_fill_price is not None else Decimal(0)
+            )
+            new_filled = prev_filled + filled_amount
+            order.filled_amount = float(new_filled)
+
+            # Incremental VWAP in Decimal: weight the previous average by the
+            # previously filled amount and this fill by its own amount.
+            if new_filled > 0:
+                new_avg = (prev_avg * prev_filled + fill_price * filled_amount) / new_filled
+                order.average_fill_price = float(new_avg)
+
             # Add to existing fees
             if fee_paid is not None:
                 previous_fee = Decimal(str(order.fee_paid or 0))
@@ -61,14 +74,13 @@ class OrderRepository:
                 order.fee_currency = fee_currency
             if exchange_order_id:
                 order.exchange_order_id = exchange_order_id
-            
-            # Update status based on total filled amount
-            total_filled = Decimal(str(order.filled_amount))
-            if total_filled >= Decimal(str(order.amount)):
+
+            # Status derives from post-fill aggregates
+            if new_filled >= Decimal(str(order.amount)):
                 order.status = "FILLED"
-            elif total_filled > 0:
+            elif new_filled > 0:
                 order.status = "PARTIALLY_FILLED"
-            
+
             await self.session.flush()
         return order
 

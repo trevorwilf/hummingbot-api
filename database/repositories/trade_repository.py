@@ -12,27 +12,51 @@ class TradeRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def create_trade(self, trade_data: Dict) -> Optional[Trade]:
-        """Create a new trade record if it doesn't already exist.
+    async def insert_trade_if_new(self, trade_data: Dict) -> Optional[Trade]:
+        """Insert the immutable trade row FIRST, dedup enforced by the DB (CDX-006).
 
-        Returns the trade if created, or None if it already exists (idempotent).
-        Handles race conditions gracefully by catching IntegrityError.
+        Uses dialect-native ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` so a
+        duplicate delivery — same global ``trade_id`` or same scoped
+        ``(account_name, connector_name, exchange_trade_id)`` — inserts nothing
+        and returns None, WITHOUT poisoning or rolling back the enclosing
+        transaction. Callers must mutate order aggregates ONLY when this
+        returns a row, in the same session/transaction, so a later failure
+        rolls back the trade row and the aggregates together.
         """
-        # Check if trade already exists
-        trade_id = trade_data.get("trade_id")
-        if trade_id:
-            existing = await self.get_trade_by_id(trade_id)
-            if existing:
-                return None  # Already exists, skip silently
+        dialect = self.session.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:
+            dialect_insert = None
 
+        if dialect_insert is not None:
+            stmt = (
+                dialect_insert(Trade)
+                .values(**trade_data)
+                .on_conflict_do_nothing()
+                .returning(Trade.id)
+            )
+            result = await self.session.execute(stmt)
+            inserted_id = result.scalar_one_or_none()
+            if inserted_id is None:
+                return None  # duplicate — nothing inserted
+            fetched = await self.session.execute(
+                select(Trade).where(Trade.id == inserted_id)
+            )
+            return fetched.scalar_one()
+
+        # Other dialects: IntegrityError-safe insert under a SAVEPOINT so a
+        # duplicate rolls back only this insert, never the enclosing
+        # transaction (which may already carry unrelated work).
         trade = Trade(**trade_data)
-        self.session.add(trade)
         try:
-            await self.session.flush()  # Get the ID
+            async with self.session.begin_nested():
+                self.session.add(trade)
+                await self.session.flush()
             return trade
         except IntegrityError:
-            # Race condition: another concurrent insert succeeded first
-            await self.session.rollback()
             return None
 
     async def get_trade_by_id(self, trade_id: str) -> Optional[Trade]:
@@ -80,8 +104,8 @@ class TradeRepository:
         return {
             "trade_id": trade.trade_id,
             "order_id": order.client_order_id if order else None,
-            "account_name": order.account_name if order else None,
-            "connector_name": order.connector_name if order else None,
+            "account_name": trade.account_name or (order.account_name if order else None),
+            "connector_name": trade.connector_name or (order.connector_name if order else None),
             "trading_pair": trade.trading_pair,
             "trade_type": trade.trade_type,
             "amount": float(trade.amount),

@@ -40,6 +40,33 @@ STARTUP_MIGRATIONS = [
         "bot_runs", "retirement_evidence",
         "ALTER TABLE bot_runs ADD COLUMN retirement_evidence TEXT"
     ),
+    # CDX-006: scoped fill identity on trades — dedup key for insert-first
+    # fill accounting. Legacy rows keep NULLs (never collide; NULLs are
+    # distinct in the unique index on both sqlite and postgres).
+    (
+        "trades", "account_name",
+        "ALTER TABLE trades ADD COLUMN account_name TEXT"
+    ),
+    (
+        "trades", "connector_name",
+        "ALTER TABLE trades ADD COLUMN connector_name TEXT"
+    ),
+    (
+        "trades", "exchange_trade_id",
+        "ALTER TABLE trades ADD COLUMN exchange_trade_id TEXT"
+    ),
+]
+
+# Unique indexes that back money-critical dedup constraints on PRE-EXISTING
+# tables (create_all already builds them into fresh tables via __table_args__).
+# CREATE UNIQUE INDEX IF NOT EXISTS is idempotent on both sqlite and postgres;
+# on a fresh sqlite DB this adds a (harmless) second index next to the
+# table-level constraint's autoindex. Errors here must NOT be swallowed:
+# without this index duplicate fill deliveries would silently double-count
+# order aggregates (fail closed — refuse to start instead).
+STARTUP_UNIQUE_INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_scoped_exchange_trade_id "
+    "ON trades (account_name, connector_name, exchange_trade_id)",
 ]
 
 
@@ -81,6 +108,9 @@ class AsyncDatabaseManager:
                 # Run lightweight migrations for existing tables
                 await self._run_migrations(conn)
 
+                # Enforce money-critical dedup indexes on pre-existing tables
+                await self._create_unique_indexes(conn)
+
                 # Drop Hummingbot's native tables since we use our custom orders/trades tables
                 await self._drop_hummingbot_tables(conn)
 
@@ -119,6 +149,17 @@ class AsyncDatabaseManager:
                     logger.debug(f"Migration check for {table}.{column}: {e}")
                 else:
                     logger.warning(f"Unexpected migration error for {table}.{column}: {e}")
+
+    async def _create_unique_indexes(self, conn):
+        """Create money-critical unique dedup indexes (idempotent).
+
+        Called after create_all + column migrations, so the tables exist. A
+        failure here propagates (startup aborts) — running without the trades
+        dedup constraint would let duplicate fill deliveries double-count
+        order aggregates (fail closed: refuse to serve instead).
+        """
+        for index_sql in STARTUP_UNIQUE_INDEXES:
+            await conn.execute(text(index_sql))
 
     async def _drop_hummingbot_tables(self, conn):
         """Drop Hummingbot's native database tables since we use custom ones."""
