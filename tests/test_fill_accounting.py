@@ -20,7 +20,18 @@ Covers:
     aggregate-without-trade), and a later re-delivery of that fill succeeds.
   * The startup migration (database.connection.STARTUP_MIGRATIONS +
     STARTUP_UNIQUE_INDEXES via the real _run_migrations routine) upgrades a
-    PRE-migration trades table: columns added, scoped unique index enforced.
+    PRE-migration trades table: columns added, scoped unique index enforced —
+    exercised BOTH through the helpers directly and through the real startup
+    entrypoint (AsyncDatabaseManager.create_tables), so unwiring the helper
+    from startup fails a test (CDX-R03).
+  * The scoped constraint's CONNECTOR axis: the same (account,
+    exchange_trade_id) under two different connectors is two legitimate
+    fills — both recorded, on the app path and on the migrated-legacy-table
+    path (CDX-R02).
+  * Concurrency (CDX-R01): two DISTINCT fills for one order handled as
+    concurrent tasks are serialized by the per-order lock — the second
+    cannot enter the critical section while the first is mid-transaction,
+    and both fills land in the aggregates (no lost update).
 
 Test authenticity: everything runs the REAL OrdersRecorder fill handler and
 REAL repositories against a REAL sqlite database with real OrderFilledEvent
@@ -32,6 +43,7 @@ fault injection for the transactionality test. Expected values are derived
 from the phase spec (the VWAP formula), never from running the implementation.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
@@ -139,12 +151,12 @@ def fill_event(order_id, price, amount, exchange_trade_id="", ts=TS):
     )
 
 
-async def seed_order(db, client_order_id="ord-1", account=ACCOUNT, amount=2):
+async def seed_order(db, client_order_id="ord-1", account=ACCOUNT, amount=2, connector=CONNECTOR):
     async with db.get_session_context() as session:
         session.add(Order(
             client_order_id=client_order_id,
             account_name=account,
-            connector_name=CONNECTOR,
+            connector_name=connector,
             trading_pair=PAIR,
             trade_type="BUY",
             order_type="LIMIT",
@@ -316,6 +328,30 @@ class TestScoping:
             assert order.status == "FILLED"
 
     @pytest.mark.asyncio
+    async def test_same_exchange_trade_id_different_connector_both_recorded(self, db):
+        """CDX-R02: the connector axis of the scope. The same account seeing
+        the same exchange_trade_id on two DIFFERENT connectors is two
+        legitimate fills — a constraint reduced to (account,
+        exchange_trade_id) would wrongly discard the second one."""
+        await seed_order(db, client_order_id="ord-1", amount=1, connector="nonkyc")
+        await seed_order(db, client_order_id="ord-2", amount=1, connector="other-dex")
+        rec1 = make_recorder(db, connector="nonkyc")
+        rec2 = make_recorder(db, connector="other-dex")
+
+        await rec1._handle_order_filled(
+            fill_event("ord-1", price=100, amount=1, exchange_trade_id="T1"))
+        await rec2._handle_order_filled(
+            fill_event("ord-2", price=100, amount=1, exchange_trade_id="T1"))
+
+        trades = await fetch_trades(db)
+        assert len(trades) == 2
+        assert {t.connector_name for t in trades} == {"nonkyc", "other-dex"}
+        for cid in ("ord-1", "ord-2"):
+            order = await fetch_order(db, cid)
+            assert float(order.filled_amount) == 1.0
+            assert order.status == "FILLED"
+
+    @pytest.mark.asyncio
     async def test_idless_fills_never_falsely_collide(self, db):
         """Two DISTINCT fills without an exchange id (NULL scoped column) must
         both count — a non-null empty-string column would wrongly dedup the
@@ -373,6 +409,68 @@ class TestTransactionality:
         await recorder._handle_order_filled(
             fill_event("ghost-order", price=100, amount=1, exchange_trade_id="T1"))
         assert len(await fetch_trades(db)) == 0
+
+
+# ===========================================================================
+# Concurrency — distinct fills for one order must serialize (CDX-R01)
+# ===========================================================================
+
+class TestConcurrentDistinctFills:
+
+    @pytest.mark.asyncio
+    async def test_concurrent_distinct_fills_serialize_and_both_count(self, db):
+        """Two DIFFERENT fills for one order arrive as concurrent tasks (the
+        recorder spawns one task per event). Without per-order serialization
+        both read the same pre-fill aggregates and the last writer erases the
+        other fill (lost update). This pins the mutual-exclusion property
+        deterministically: the first fill is parked INSIDE its critical
+        section (trade inserted, aggregates not yet written) while the second
+        is launched — the second must not reach the aggregate update until
+        the first completes, and both fills must land in the final aggregates.
+        Removing the per-order lock in _handle_order_filled fails the
+        call-count assertion (the second fill runs to completion during the
+        pause). The real update logic still executes — the wrapper only
+        injects scheduling."""
+        await seed_order(db, amount=2)
+        recorder = make_recorder(db)
+
+        real_update = OrderRepository.update_order_fill
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = []
+
+        async def paused_update(repo_self, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                first_entered.set()
+                await release_first.wait()
+            return await real_update(repo_self, *args, **kwargs)
+
+        with patch.object(OrderRepository, "update_order_fill", new=paused_update):
+            t1 = asyncio.ensure_future(recorder._handle_order_filled(
+                fill_event("ord-1", price=100, amount=1, exchange_trade_id="T1")))
+            await asyncio.wait_for(first_entered.wait(), timeout=5)
+
+            # First fill is mid-critical-section. A second DISTINCT fill
+            # arrives now and gets ample opportunity to run.
+            t2 = asyncio.ensure_future(recorder._handle_order_filled(
+                fill_event("ord-1", price=200, amount=1, exchange_trade_id="T2")))
+            for _ in range(50):
+                await asyncio.sleep(0)
+
+            # Serialization property: the second fill must NOT have entered
+            # the critical section while the first holds the per-order lock.
+            assert len(calls) == 1
+
+            release_first.set()
+            await asyncio.gather(t1, t2)
+
+        # Both fills counted exactly once — no lost update.
+        order = await fetch_order(db)
+        assert float(order.filled_amount) == 2.0
+        assert float(order.average_fill_price) == 150.0  # VWAP, not last price
+        assert order.status == "FILLED"
+        assert len(await fetch_trades(db)) == 2
 
 
 # ===========================================================================
@@ -437,6 +535,18 @@ class TestStartupMigration:
                 " 'acct-1', 'nonkyc', 'T1')"
             ))
 
+            # CDX-R02: the index is the FULL triple — the same account and
+            # exchange id under a DIFFERENT connector is a legitimate distinct
+            # fill and must insert (a two-column (account, exchange_trade_id)
+            # index would reject it here).
+            conn.execute(text(
+                "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
+                " trade_type, amount, price, account_name, connector_name,"
+                " exchange_trade_id) "
+                "VALUES (1, 'n-1b', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                " 'acct-1', 'other-dex', 'T1')"
+            ))
+
         # ... and it is ENFORCED: a duplicate scoped triple is rejected
         # (own transaction — the IntegrityError poisons it).
         with pytest.raises(IntegrityError):
@@ -461,3 +571,76 @@ class TestStartupMigration:
         # And the constants actually carry this phase's migration at all.
         assert any(t == "trades" and c == "exchange_trade_id" for t, c, _ in STARTUP_MIGRATIONS)
         assert any("uq_trade_scoped_exchange_trade_id" in sql for sql in STARTUP_UNIQUE_INDEXES)
+
+    @pytest.mark.asyncio
+    async def test_real_startup_path_installs_scoped_index_on_legacy_db(self):
+        """CDX-R03: the direct-helper test above proves the helpers work but
+        not that startup CALLS them. This one runs the REAL production startup
+        entrypoint (AsyncDatabaseManager.create_tables — create_all +
+        _run_migrations + _create_unique_indexes + _drop_hummingbot_tables)
+        against a legacy database whose trades table predates this phase, then
+        proves the scoped dedup index is actually enforced. Unwiring
+        _create_unique_indexes from create_tables fails this test: create_all
+        skips the pre-existing trades table, so ONLY the startup call installs
+        the index there. The engine is a thin awaitable facade over a real
+        sync sqlite engine (no async sqlite driver in this env) — every
+        statement create_tables issues executes for real."""
+
+        class RunSyncConnAdapter:
+            def __init__(self, conn):
+                self._conn = conn
+
+            async def execute(self, stmt, params=None):
+                if params is not None:
+                    return self._conn.execute(stmt, params)
+                return self._conn.execute(stmt)
+
+            async def run_sync(self, fn, *args, **kwargs):
+                return fn(self._conn, *args, **kwargs)
+
+        class SyncEngineAdapter:
+            def __init__(self, engine):
+                self._engine = engine
+
+            @asynccontextmanager
+            async def begin(self):
+                with self._engine.begin() as conn:
+                    yield RunSyncConnAdapter(conn)
+
+        engine = create_engine(
+            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+        )
+        with engine.begin() as conn:
+            # The trades schema as it existed BEFORE this phase.
+            conn.execute(text(
+                "CREATE TABLE trades ("
+                "id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, "
+                "trade_id TEXT NOT NULL UNIQUE, timestamp TIMESTAMP NOT NULL, "
+                "trading_pair TEXT NOT NULL, trade_type TEXT NOT NULL, "
+                "amount NUMERIC NOT NULL, price NUMERIC NOT NULL, "
+                "fee_paid NUMERIC NOT NULL DEFAULT 0, fee_currency TEXT)"
+            ))
+
+        mgr = AsyncDatabaseManager.__new__(AsyncDatabaseManager)  # skip asyncpg-only __init__
+        mgr.engine = SyncEngineAdapter(engine)
+        await mgr.create_tables()  # the REAL startup entrypoint
+
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
+                " trade_type, amount, price, account_name, connector_name,"
+                " exchange_trade_id) "
+                "VALUES (1, 's-1', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                " 'acct-1', 'nonkyc', 'T1')"
+            ))
+        # Enforced: the same scoped triple under a different synthetic
+        # trade_id is rejected by the index startup just installed.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO trades (order_id, trade_id, timestamp, trading_pair,"
+                    " trade_type, amount, price, account_name, connector_name,"
+                    " exchange_trade_id) "
+                    "VALUES (1, 's-2', '2026-01-01', 'XMR-USDT', 'BUY', 1, 100,"
+                    " 'acct-1', 'nonkyc', 'T1')"
+                ))

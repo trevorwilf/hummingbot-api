@@ -46,9 +46,15 @@ class OrderRepository:
         becomes the incremental VWAP over all fills applied so far. Callers
         must apply each fill exactly once — dedup is the trade insert's job
         (TradeRepository.insert_trade_if_new), in the same transaction.
+
+        The row is read with FOR UPDATE: two DISTINCT concurrent fills would
+        otherwise both read the same pre-fill aggregates and the last writer
+        would erase the other fill (lost update on money). Postgres renders
+        the lock; sqlite renders nothing — there the in-process per-order
+        lock in OrdersRecorder plus sqlite's single-writer model cover it.
         """
         result = await self.session.execute(
-            select(Order).where(Order.client_order_id == client_order_id)
+            select(Order).where(Order.client_order_id == client_order_id).with_for_update()
         )
         order = result.scalar_one_or_none()
         if order:

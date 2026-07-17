@@ -10,10 +10,34 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderFilledEvent, SellOrderCreatedEvent, TradeType
 
+from contextlib import asynccontextmanager
+
 from database import AsyncDatabaseManager, OrderRepository, TradeRepository
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+
+# CDX-006 adjudication (CDX-R01): fill events are handled as independent
+# asyncio tasks, so two DISTINCT fills for one order can interleave their
+# read-modify-write of the order aggregates — both read the same pre-fill
+# state and the last writer erases the other fill. Serialize per order id
+# in-process; OrderRepository.update_order_fill additionally takes a
+# SELECT ... FOR UPDATE row lock for cross-process safety on postgres.
+# Entries are refcounted so the registry cannot grow without bound.
+_order_fill_locks: dict = {}
+
+
+@asynccontextmanager
+async def _order_fill_lock(client_order_id: str):
+    entry = _order_fill_locks.setdefault(client_order_id, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and _order_fill_locks.get(client_order_id) is entry:
+            del _order_fill_locks[client_order_id]
 
 
 class OrdersRecorder:
@@ -191,7 +215,15 @@ class OrdersRecorder:
             logger.error(f"OrdersRecorder: Error recording order created: {e}")
 
     async def _handle_order_filled(self, event: OrderFilledEvent):
-        """Handle order fill events"""
+        """Handle order fill events, serialized per order id (CDX-R01)."""
+        async with _order_fill_lock(event.order_id):
+            await self._handle_order_filled_locked(event)
+
+    async def _handle_order_filled_locked(self, event: OrderFilledEvent):
+        """Record one fill: insert-first dedup, then aggregate update.
+
+        Must only run under the per-order lock taken by _handle_order_filled.
+        """
         try:
             async with self.db_manager.get_session_context() as session:
                 order_repo = OrderRepository(session)
