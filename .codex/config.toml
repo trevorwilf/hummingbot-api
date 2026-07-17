@@ -1,0 +1,225 @@
+# ~/.codex/config.toml
+#
+# Important: top-level keys must appear before the first [table].
+
+###############################################################################
+# Model and response behavior
+###############################################################################
+
+model = "gpt-5.6-sol"
+model_provider = "openai"
+
+# minimal | low | medium | high | xhigh
+model_reasoning_effort = "xhigh"
+
+# Use more reasoning when Codex is explicitly planning.
+plan_mode_reasoning_effort = "xhigh"
+
+# auto | concise | detailed | none
+model_reasoning_summary = "detailed"
+
+# low | medium | high
+model_verbosity = "high"
+
+# none | friendly | pragmatic
+personality = "pragmatic"
+
+# Optional:
+# review_model = "gpt-5.6"
+# service_tier = "fast"
+# service_tier = "flex"
+
+###############################################################################
+# Permissions and sandboxing
+###############################################################################
+
+# untrusted | on-request | never
+approval_policy = "on-request"
+
+# read-only | workspace-write | danger-full-access
+sandbox_mode = "workspace-write"
+
+allow_login_shell = true
+
+###############################################################################
+# Search and editor integration
+###############################################################################
+
+# disabled | cached | indexed | live
+web_search = "live"
+
+# vscode | vscode-insiders | windsurf | cursor | none
+file_opener = "vscode"
+
+###############################################################################
+# Project instructions
+###############################################################################
+
+project_doc_max_bytes = 65536
+
+# Used only when AGENTS.md is absent.
+project_doc_fallback_filenames = [
+  "TEAM_GUIDE.md",
+  ".agents.md"
+]
+
+###############################################################################
+# Authentication storage
+###############################################################################
+
+# file | keyring | auto
+cli_auth_credentials_store = "auto"
+mcp_oauth_credentials_store = "auto"
+
+###############################################################################
+# Display and maintenance
+###############################################################################
+
+hide_agent_reasoning = false
+show_raw_agent_reasoning = false
+check_for_update_on_startup = true
+
+# Optional global instructions. Longer project instructions are generally
+# better placed in AGENTS.md.
+#
+# developer_instructions = """
+# Prefer small, reviewable diffs.
+# Run focused tests after changing code.
+# Never expose secrets in output.
+# """
+
+###############################################################################
+# Tables begin here
+###############################################################################
+
+[agents]
+
+# Lower this if you want fewer parallel agents and more predictable changes.
+max_threads = 6
+max_depth = 1
+job_max_runtime_seconds = 3600
+interrupt_message = true
+
+[sandbox_workspace_write]
+
+# Extra directories Codex may modify outside the current workspace.
+writable_roots = [
+    "E:\\tradingsoftware\\hummingbot",
+    "E:\\stocktradingsoftware\\hummingbot-api",
+]
+
+# Keep commands offline by default. Enable this for package installation,
+# networked integration tests, or commands that access remote APIs.
+network_access = true
+
+exclude_tmpdir_env_var = false
+exclude_slash_tmp = false
+
+[shell_environment_policy]
+
+# all | core | none
+inherit = "all"
+
+# Preserve Codex's default filtering of variable names containing
+# KEY, SECRET, or TOKEN.
+ignore_default_excludes = false
+
+# Additional case-insensitive environment-variable patterns to remove.
+exclude = []
+
+# Example:
+# exclude = ["AWS_*", "AZURE_*", "GOOGLE_*", "GITHUB_*"]
+
+# Explicit environment-variable overrides.
+set = {}
+
+# When non-empty, retain only matching variables.
+include_only = []
+
+# Very restrictive example:
+# include_only = ["PATH", "HOME", "USER", "SHELL", "TMPDIR", "LANG"]
+
+experimental_use_profile = false
+
+[history]
+
+# save-all | none
+persistence = "save-all"
+
+# Approximately 10 MiB; old entries are trimmed after this limit.
+max_bytes = 10485760
+
+[features]
+
+# Stable features normally inherit Codex defaults. Pin these only when needed.
+# apps = true
+# goals = true
+# hooks = true
+# fast_mode = true
+# multi_agent = true
+# personality = true
+# remote_plugin = true
+# shell_snapshot = true
+# shell_tool = true
+# unified_exec = true
+
+# Experimental and off by default:
+# memories = true
+
+[tools]
+
+view_image = true
+
+[analytics]
+
+# Set false to opt out on this machine.
+enabled = true
+
+[feedback]
+
+enabled = true
+
+###############################################################################
+# Optional MCP examples
+###############################################################################
+
+# Local STDIO MCP server:
+#
+# [mcp_servers.local_docs]
+# enabled = true
+# required = false
+# command = "your-docs-server"
+# args = ["--stdio"]
+# env_vars = ["DOCS_API_TOKEN"]
+# cwd = "/absolute/path/to/server"
+# startup_timeout_sec = 10.0
+# tool_timeout_sec = 60.0
+# enabled_tools = ["search", "read"]
+# disabled_tools = ["delete"]
+
+# Remote MCP server:
+#
+# [mcp_servers.example_remote]
+# enabled = true
+# required = false
+# url = "https://mcp.example.com/mcp"
+# bearer_token_env_var = "MCP_BEARER_TOKEN"
+# startup_timeout_sec = 10.0
+# tool_timeout_sec = 60.0
+# enabled_tools = ["search", "get"]
+# disabled_tools = ["delete", "admin"]
+
+###############################################################################
+# Optional project trust and Windows settings
+###############################################################################
+
+# [projects."/absolute/path/to/project"]
+# trust_level = "trusted"
+
+# Native Windows only:
+#
+# [windows]
+#  sandbox = "elevated"
+#
+# Use this if elevated setup is unavailable:
+sandbox = "unelevated"

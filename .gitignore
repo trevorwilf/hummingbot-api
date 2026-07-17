@@ -189,3 +189,14 @@ CLAUDE.md
 # Upstream ignores
 improvements
 bots/gateway-files/
+
+
+# Test runner log output
+test_logs/
+
+/instances/*
+/reviews/*
+/reviews_old/*
+
+/batch_logs/*
+/batch_reviews/*
