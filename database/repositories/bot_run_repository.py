@@ -25,15 +25,35 @@ RETIREMENT_UNVERIFIED = "UNVERIFIED"
 #   initiated_at                  — retirement state machine started
 #   skip_order_cancellation       — the stop request's cancellation flag
 #   stop_requested_at             — stop command reached the broker
-#   stop_ack_at                   — the bot's own RPC response to the stop
-#                                   command (strategy quiescence acknowledged)
+#   stop_ack_at                   — the bot's own RPC reply to the stop command
+#                                   with SUCCESS status (the command was
+#                                   RECEIVED AND ACCEPTED — with async_backend
+#                                   this is scheduling, not completion; error,
+#                                   malformed or absent replies are never acks)
+#   quiescence_confirmed_at       — the bot's status RPC reports that no
+#                                   strategy is running. The engine clears
+#                                   trading_core.strategy only at the END of
+#                                   stop_loop() — after StrategyV2Base.on_stop()
+#                                   (controllers stopped, executors stored),
+#                                   exchange-acknowledged cancel_all, connector
+#                                   removal and markets-recorder shutdown — so
+#                                   this reply is the bot's own confirmation
+#                                   that the graceful stop ran to COMPLETION
+#                                   (engine client/command/stop_command.py,
+#                                   remote_iface/mqtt.py:_on_cmd_status)
 #   zero_open_orders_confirmed_at — the API's order records show zero active
-#                                   orders for the run's account (independent
-#                                   of cancellation — see fill drain below)
+#                                   orders for the run's account, observed
+#                                   AFTER quiescence (before the bot confirms
+#                                   its stop finished a momentary zero proves
+#                                   nothing; independent of cancellation —
+#                                   see fill drain below)
 #   fills_drained_at              — zero active orders still held after the
 #                                   final-fill drain window
-#   state_flushed_at              — container exited with code 0 (the engine's
-#                                   graceful-shutdown/checkpoint path ran)
+#   state_flushed_at              — quiescence confirmed AND container exited
+#                                   with code 0: the durable-state shutdown
+#                                   path completed and the process did not die
+#                                   dirty afterwards (exit 0 ALONE is never
+#                                   flush evidence)
 #   process_exited_at             — container observed in the exited state
 #   archived_at                   — bot data archive completed
 REQUIRED_RETIREMENT_EVIDENCE = (
@@ -41,6 +61,7 @@ REQUIRED_RETIREMENT_EVIDENCE = (
     "skip_order_cancellation",
     "stop_requested_at",
     "stop_ack_at",
+    "quiescence_confirmed_at",
     "zero_open_orders_confirmed_at",
     "fills_drained_at",
     "state_flushed_at",

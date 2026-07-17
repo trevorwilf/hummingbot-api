@@ -5,18 +5,29 @@ Covers:
     from complete evidence; every postcondition gate is exercised (missing key
     K → UNVERIFIED with K recorded), including the ordering claim that a
     verified-STOPPED row cannot be persisted without the exchange-confirmed
-    zero-open-orders evidence.
+    zero-open-orders evidence. The required-evidence set is pinned to a
+    LITERAL spec tuple (SPEC_REQUIRED_EVIDENCE) — never generated from the
+    implementation constant (CDX-R07).
   * BotsOrchestrator.stop_and_archive_bot — the full state machine against a
-    REAL in-memory sqlite DB: happy path (VERIFIED), no stop ack → UNVERIFIED,
+    REAL in-memory sqlite DB: happy path (VERIFIED), no/error/malformed stop
+    ack → UNVERIFIED, no quiescence → UNVERIFIED with zero-order confirmation
+    never attempted and no state flush despite exit 0 (CDX-R01/R02/R03),
     open orders at timeout → UNVERIFIED, dirty container exit → UNVERIFIED,
     no order history → fail-closed UNVERIFIED, archive failure → UNVERIFIED,
-    publish failure → run row untouched (no STOPPED write, container untouched),
-    skip_order_cancellation recorded + independently verifiable.
+    publish failure → run row untouched, crash at a stage boundary → the
+    stage's evidence already persisted (CDX-R06),
+    skip_order_cancellation recorded + independently verifiable to VERIFIED
+    through the terminal write (CDX-R08).
+  * The startup migration (database.connection.STARTUP_MIGRATIONS via the real
+    _run_migrations routine) — legacy STOPPED rows land UNVERIFIED (CDX-R09).
   * resume_service._guard_ungraceful_source (via run_guards) — legacy STOPPED
-    rows and UNVERIFIED retirements refuse; VERIFIED passes; the pre-existing
-    resume_accept_ungraceful human override still works, default refuse.
+    rows, UNVERIFIED retirements, and VERIFIED markers with absent/malformed/
+    incomplete evidence all refuse (CDX-R04); a fully-evidenced VERIFIED row
+    passes; the pre-existing resume_accept_ungraceful human override still
+    works, default refuse.
   * MQTTManager.publish_command_with_ack — publication and acknowledgement are
-    reported separately (publish success is never an ack).
+    reported separately; same-millisecond reply topics never collide
+    (CDX-R05); on_published fires between publish and ack (CDX-R06).
   * DockerService.get_container_status — exit_code is actually extracted from
     container attrs (the old getattr-on-a-dict always returned None).
 
@@ -26,8 +37,10 @@ thin adapter awaits the same calls against a synchronous Session — every SQL
 statement, column default and constraint executes for real; only the await
 plumbing is adapted. Mocked things are the unavoidable externals: the docker
 daemon, the MQTT broker, the archiver. Expected values are derived from the
-phase spec (evidence keys, VERIFIED/UNVERIFIED semantics), never from running
-the implementation.
+phase spec and the ENGINE's wire contract (reply envelopes per
+remote_iface/mqtt.py:_wrap_response, status codes per messages.py
+MQTT_STATUS_CODE, the no-strategy reply per _on_cmd_status), never from
+running the implementation.
 """
 
 import asyncio
@@ -38,10 +51,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from database.connection import STARTUP_MIGRATIONS, AsyncDatabaseManager
 from database.models import Base, BotRun, Order
 from database.repositories.bot_run_repository import (
     REQUIRED_RETIREMENT_EVIDENCE,
@@ -162,19 +176,65 @@ def evidence_of(run):
 
 
 # ---------------------------------------------------------------------------
-# Spec-derived evidence fixtures (timestamps are arbitrary ISO strings; what
-# matters is presence/absence — the spec keys, not implementation output)
+# THE SPEC (independent oracles — never generated from the implementation)
 # ---------------------------------------------------------------------------
 
 TS = "2026-07-16T12:00:00+00:00"
 
+# Phase 7 hard requirement 1: the postcondition stages that must each carry
+# persisted evidence before a verified-STOPPED terminal state may exist.
+# LITERAL, spec-derived, independent of REQUIRED_RETIREMENT_EVIDENCE (CDX-R07):
+# if the implementation silently drops a gate, the conformance test below and
+# every parametrized gate test fail instead of the test set shrinking with it.
+SPEC_REQUIRED_EVIDENCE = (
+    "initiated_at",                   # state machine started
+    "skip_order_cancellation",        # cancellation flag recorded (spec req 3)
+    "stop_requested_at",              # stop command reached the broker
+    "stop_ack_at",                    # bot's validated reply: stop accepted
+    "quiescence_confirmed_at",        # bot reports strategy gone (stop completed)
+    "zero_open_orders_confirmed_at",  # exchange-confirmed zero open orders
+    "fills_drained_at",               # final-fill drain window held at zero
+    "state_flushed_at",               # state flush/checkpoint confirmed
+    "process_exited_at",              # process/container exit observed
+    "archived_at",                    # archive completed
+)
+
+
+def test_required_evidence_matches_spec():
+    """CDX-R07 guard: the implementation constant must equal the spec tuple."""
+    assert sorted(REQUIRED_RETIREMENT_EVIDENCE) == sorted(SPEC_REQUIRED_EVIDENCE)
+
 
 def full_evidence(skip_order_cancellation=False):
-    ev = {k: TS for k in REQUIRED_RETIREMENT_EVIDENCE}
+    ev = {k: TS for k in SPEC_REQUIRED_EVIDENCE}
     ev["skip_order_cancellation"] = skip_order_cancellation
     if not skip_order_cancellation:
         ev["cancellation_requested_at"] = TS
     return ev
+
+
+def rpc_reply(status, msg=""):
+    """Engine RPC reply envelope — spec: remote_iface/mqtt.py:_wrap_response
+    wraps every reply as {"header": {...}, "data": response.model_dump()};
+    status codes per messages.py MQTT_STATUS_CODE (SUCCESS=200, ERROR=400)."""
+    return {
+        "header": {
+            "reply_to": "",
+            "timestamp": 0,
+            "content_type": "json",
+            "encoding": "utf8",
+            "agent": "commlib",
+        },
+        "data": {"status": status, "msg": msg},
+    }
+
+
+RPC_STOP_OK = rpc_reply(200)
+RPC_STOP_ERROR = rpc_reply(400, "stop failed")
+# Engine _on_cmd_status replies exactly this once trading_core.strategy is
+# None — which stop_loop() sets only after the full graceful stop sequence.
+RPC_NO_STRATEGY = rpc_reply(400, "No strategy is currently running!")
+RPC_STRATEGY_RUNNING = rpc_reply(200, "")
 
 
 # ===========================================================================
@@ -195,10 +255,10 @@ class TestFinalizeRetirementGates:
         assert json.loads(row.final_status) == {"status": "stopped"}
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("missing_key", REQUIRED_RETIREMENT_EVIDENCE)
+    @pytest.mark.parametrize("missing_key", SPEC_REQUIRED_EVIDENCE)
     async def test_each_postcondition_gate(self, db, missing_key):
-        """Missing evidence for ANY stage → the terminal state is UNVERIFIED,
-        with the gap recorded for the operator."""
+        """Missing evidence for ANY spec stage → the terminal state is
+        UNVERIFIED, with the gap recorded for the operator."""
         await seed_bot_run(db)
         ev = full_evidence()
         ev[missing_key] = None
@@ -233,29 +293,88 @@ class TestFinalizeRetirementGates:
     @pytest.mark.asyncio
     async def test_cancellation_marker_required_unless_skipped(self, db):
         """skip=False without a cancellation request marker cannot verify;
-        skip=True can (its verification rides on the INDEPENDENT
-        zero-open-orders confirmation, which stays required)."""
-        await seed_bot_run(db)
+        skip=True CAN reach VERIFIED through the terminal repository write
+        (CDX-R08) — its verification rides on the INDEPENDENT zero-open-orders
+        confirmation, which stays required."""
+        await seed_bot_run(db, bot_name="bot-noskip")
+        await seed_bot_run(db, bot_name="bot-skip")
+
         not_skipped = full_evidence(skip_order_cancellation=False)
         del not_skipped["cancellation_requested_at"]
         skipped = full_evidence(skip_order_cancellation=True)
         assert "cancellation_requested_at" not in skipped
-
         assert "cancellation_requested_at" in missing_retirement_evidence(not_skipped)
         assert missing_retirement_evidence(skipped) == []
 
         async with db.get_session_context() as session:
-            row = await BotRunRepository(session).finalize_bot_run_retirement("bot1", not_skipped)
+            row = await BotRunRepository(session).finalize_bot_run_retirement(
+                "bot-noskip", not_skipped
+            )
         assert row.retirement_status == RETIREMENT_UNVERIFIED
+        assert "cancellation_requested_at" in json.loads(row.retirement_evidence)["missing_evidence"]
+
+        async with db.get_session_context() as session:
+            row = await BotRunRepository(session).finalize_bot_run_retirement(
+                "bot-skip", skipped
+            )
+        assert row.retirement_status == RETIREMENT_VERIFIED
+        ev = json.loads(row.retirement_evidence)
+        assert ev["skip_order_cancellation"] is True
+        assert ev["zero_open_orders_confirmed_at"] is not None
 
     @pytest.mark.asyncio
     async def test_new_rows_default_unverified(self, db):
-        """Schema: rows never touched by the state machine are UNVERIFIED —
-        the same default legacy rows receive when the column is added."""
+        """Schema default: rows never touched by the state machine are
+        UNVERIFIED (fresh-schema ORM/server default)."""
         await seed_bot_run(db)
         run = await fetch_run(db)
         assert run.retirement_status == RETIREMENT_UNVERIFIED
         assert run.retirement_evidence is None
+
+    @pytest.mark.asyncio
+    async def test_legacy_rows_migrate_to_unverified(self):
+        """CDX-R09: run the REAL startup migration routine (the production
+        ALTER statements in database.connection.STARTUP_MIGRATIONS, executed
+        by the real AsyncDatabaseManager._run_migrations) against a
+        PRE-migration bot_runs table holding a legacy STOPPED row. The
+        migration must leave that row UNVERIFIED with no fabricated evidence —
+        a DEFAULT of 'VERIFIED' in the ALTER would silently bless every
+        legacy stop."""
+
+        class SyncConnAdapter:
+            """Awaitable facade over a sync Connection for _run_migrations."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            async def execute(self, stmt, params=None):
+                if params is not None:
+                    return self._conn.execute(stmt, params)
+                return self._conn.execute(stmt)
+
+        engine = create_engine(
+            "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+        )
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE bot_runs ("
+                "id INTEGER PRIMARY KEY, bot_name TEXT, run_status TEXT, "
+                "stopped_at TIMESTAMP)"
+            ))
+            conn.execute(text(
+                "INSERT INTO bot_runs (bot_name, run_status, stopped_at) "
+                "VALUES ('legacy', 'STOPPED', '2026-01-01 00:00:00')"
+            ))
+            mgr = AsyncDatabaseManager.__new__(AsyncDatabaseManager)  # migrations only
+            await AsyncDatabaseManager._run_migrations(mgr, SyncConnAdapter(conn))
+            row = conn.execute(text(
+                "SELECT retirement_status, retirement_evidence FROM bot_runs "
+                "WHERE bot_name='legacy'"
+            )).fetchone()
+        assert row[0] == RETIREMENT_UNVERIFIED
+        assert row[1] is None
+        # And the constant actually contains the bot_runs migration at all.
+        assert any(t == "bot_runs" and c == "retirement_status" for t, c, _ in STARTUP_MIGRATIONS)
 
     @pytest.mark.asyncio
     async def test_progressive_evidence_write_changes_no_status(self, db):
@@ -276,6 +395,7 @@ class TestFinalizeRetirementGates:
 
 FAST = RetirementTimeouts(
     stop_ack_timeout=0.05,
+    quiescence_timeout=0.1,
     zero_open_orders_timeout=0.1,
     fill_drain_seconds=0.01,
     poll_interval=0.01,
@@ -283,16 +403,26 @@ FAST = RetirementTimeouts(
 
 
 class StubMQTT:
-    """The MQTT broker/bot boundary — the unavoidable external."""
+    """The MQTT broker/bot boundary — the unavoidable external. Replies are
+    engine-shaped envelopes (see rpc_reply); per-command so the stop reply and
+    the status (quiescence) reply are independently controllable."""
 
-    def __init__(self, published=True, response=None):
+    def __init__(self, published=True, stop_response=RPC_STOP_OK, status_response=RPC_NO_STRATEGY):
         self.published = published
-        self.response = response
+        self.stop_response = stop_response
+        self.status_response = status_response
         self.commands = []
 
-    async def publish_command_with_ack(self, bot_id, command, data, timeout=30.0, qos=1):
+    async def publish_command_with_ack(
+        self, bot_id, command, data, timeout=30.0, qos=1, on_published=None
+    ):
         self.commands.append((bot_id, command, dict(data)))
-        return {"published": self.published, "response": self.response}
+        if not self.published:
+            return {"published": False, "response": None}
+        if on_published is not None:
+            await on_published()
+        response = self.stop_response if command == "stop" else self.status_response
+        return {"published": True, "response": response}
 
     def clear_bot_controller_reports(self, bot_id):
         pass
@@ -311,6 +441,19 @@ class StubMQTT:
 
     def clear_bot_data(self, bot_id):
         pass
+
+
+class CrashDuringAckWaitMQTT(StubMQTT):
+    """Publishes (on_published runs), then the process 'dies' mid-ack-wait —
+    CDX-R06's stage-boundary interruption."""
+
+    async def publish_command_with_ack(
+        self, bot_id, command, data, timeout=30.0, qos=1, on_published=None
+    ):
+        self.commands.append((bot_id, command, dict(data)))
+        if on_published is not None:
+            await on_published()
+        raise asyncio.CancelledError()
 
 
 class StubDockerManager:
@@ -334,6 +477,14 @@ class StubDockerManager:
     def remove_container(self, name, force=True):
         self.remove_calls.append((name, force))
         return {"success": self.remove_success, "message": ""}
+
+
+class CrashOnRemoveDocker(StubDockerManager):
+    """The process 'dies' during container removal — after archive, before
+    finalization (CDX-R06)."""
+
+    def remove_container(self, name, force=True):
+        raise asyncio.CancelledError()
 
 
 class StubArchiver:
@@ -382,10 +533,10 @@ class TestStopAndArchiveStateMachine:
     @pytest.mark.asyncio
     async def test_happy_path_persists_verified(self, db):
         """All postconditions confirmable → STOPPED + ARCHIVED + VERIFIED with
-        every evidence stage stamped."""
+        every SPEC evidence stage stamped."""
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")  # history exists, zero active
-        mqtt = StubMQTT(response={"status": 200, "msg": ""})
+        mqtt = StubMQTT()
         orch = make_orchestrator(db, mqtt)
         dockermgr = StubDockerManager(exit_code=0)
         archiver = StubArchiver()
@@ -397,13 +548,17 @@ class TestStopAndArchiveStateMachine:
         assert run.deployment_status == "ARCHIVED"
         assert run.retirement_status == RETIREMENT_VERIFIED
         ev = evidence_of(run)
-        for key in REQUIRED_RETIREMENT_EVIDENCE:
+        for key in SPEC_REQUIRED_EVIDENCE:
             assert ev.get(key) is not None, f"evidence {key} missing on the happy path"
         assert ev["cancellation_requested_at"] is not None
         assert ev["skip_order_cancellation"] is False
         assert ev["container_exit_code"] == 0
-        # The stop command actually carried the cancellation flag.
-        assert mqtt.commands == [("bot1", "stop", {"skip_order_cancellation": False, "async_backend": True})]
+        # The stop command actually carried the cancellation flag; quiescence
+        # was confirmed via subsequent status polls.
+        assert mqtt.commands[0] == (
+            "bot1", "stop", {"skip_order_cancellation": False, "async_backend": True}
+        )
+        assert any(c[1] == "status" for c in mqtt.commands[1:])
         assert archiver.archived == ["bot1"]
 
     @pytest.mark.asyncio
@@ -412,7 +567,8 @@ class TestStopAndArchiveStateMachine:
         (CDX-005) — the run must finalize UNVERIFIED."""
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")
-        orch = make_orchestrator(db, StubMQTT(response=None))  # broker took it, bot silent
+        # Broker took it; bot fully silent (stop AND status).
+        orch = make_orchestrator(db, StubMQTT(stop_response=None, status_response=None))
 
         await run_fsm(orch, StubDockerManager(), StubArchiver())
 
@@ -425,6 +581,65 @@ class TestStopAndArchiveStateMachine:
         assert "stop_ack_at" in ev["missing_evidence"]
 
     @pytest.mark.asyncio
+    async def test_error_stop_reply_is_not_an_ack(self, db):
+        """CDX-R01: a bot reply with an ERROR status (the engine's stop
+        handler raised) is NOT a stop acknowledgement."""
+        await seed_bot_run(db)
+        await seed_order(db, status="FILLED")
+        orch = make_orchestrator(db, StubMQTT(stop_response=RPC_STOP_ERROR))
+
+        await run_fsm(orch, StubDockerManager(), StubArchiver())
+
+        run = await fetch_run(db)
+        assert run.retirement_status == RETIREMENT_UNVERIFIED
+        ev = evidence_of(run)
+        assert ev.get("stop_ack_at") is None
+        assert "stop_ack_at" in ev["missing_evidence"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_stop_reply_is_not_an_ack(self, db):
+        """CDX-R01: a reply that is not the engine's envelope (bare dict, no
+        'data') is malformed and never an acknowledgement."""
+        await seed_bot_run(db)
+        await seed_order(db, status="FILLED")
+        orch = make_orchestrator(db, StubMQTT(stop_response={"status": 200, "msg": ""}))
+
+        await run_fsm(orch, StubDockerManager(), StubArchiver())
+
+        run = await fetch_run(db)
+        assert run.retirement_status == RETIREMENT_UNVERIFIED
+        ev = evidence_of(run)
+        assert ev.get("stop_ack_at") is None
+
+    @pytest.mark.asyncio
+    async def test_no_quiescence_never_verifies(self, db):
+        """CDX-R01/R02/R03: the bot accepts the stop (scheduling ack) but
+        never reports the strategy gone. Quiescence stays unconfirmed, the
+        zero-open-orders stage is NEVER stamped (even though the DB shows zero
+        active orders), and a clean exit code does NOT become state-flush
+        evidence. UNVERIFIED."""
+        await seed_bot_run(db)
+        await seed_order(db, status="FILLED")  # zero active in the DB!
+        orch = make_orchestrator(
+            db, StubMQTT(stop_response=RPC_STOP_OK, status_response=RPC_STRATEGY_RUNNING)
+        )
+
+        await run_fsm(orch, StubDockerManager(exit_code=0), StubArchiver())
+
+        run = await fetch_run(db)
+        assert run.retirement_status == RETIREMENT_UNVERIFIED
+        ev = evidence_of(run)
+        assert ev.get("stop_ack_at") is not None  # accepted...
+        assert ev.get("quiescence_confirmed_at") is None  # ...but never completed
+        assert ev["quiescence_basis"] == "timeout"
+        assert ev.get("zero_open_orders_confirmed_at") is None
+        assert ev["zero_open_orders_basis"] == "quiescence_unconfirmed"
+        assert ev["container_exit_code"] == 0
+        assert ev.get("state_flushed_at") is None  # exit 0 alone is not a flush
+        for key in ("quiescence_confirmed_at", "zero_open_orders_confirmed_at", "state_flushed_at"):
+            assert key in ev["missing_evidence"]
+
+    @pytest.mark.asyncio
     async def test_open_orders_timeout_is_unverified(self, db):
         """Active orders that never clear within the bounded poll → the
         zero-open-orders stage stays unconfirmed → UNVERIFIED, with the
@@ -432,7 +647,7 @@ class TestStopAndArchiveStateMachine:
         just never verified)."""
         await seed_bot_run(db)
         await seed_order(db, status="OPEN")
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
 
         await run_fsm(orch, StubDockerManager(), StubArchiver())
 
@@ -450,7 +665,7 @@ class TestStopAndArchiveStateMachine:
         """An account with NO recorded orders proves nothing (a disconnected
         recorder looks identical) — silence is never read as zero."""
         await seed_bot_run(db)  # no orders seeded at all
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
 
         await run_fsm(orch, StubDockerManager(), StubArchiver())
 
@@ -462,17 +677,18 @@ class TestStopAndArchiveStateMachine:
 
     @pytest.mark.asyncio
     async def test_dirty_container_exit_is_unverified(self, db):
-        """Exit code != 0: the engine's graceful shutdown (which flushes
-        state) did not complete — state_flush stays unconfirmed."""
+        """Exit code != 0: the process died dirty — state_flush stays
+        unconfirmed even though quiescence was confirmed."""
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
 
         await run_fsm(orch, StubDockerManager(exit_code=137), StubArchiver())
 
         run = await fetch_run(db)
         assert run.retirement_status == RETIREMENT_UNVERIFIED
         ev = evidence_of(run)
+        assert ev.get("quiescence_confirmed_at") is not None
         assert ev.get("process_exited_at") is not None
         assert ev["container_exit_code"] == 137
         assert ev.get("state_flushed_at") is None
@@ -498,13 +714,50 @@ class TestStopAndArchiveStateMachine:
         assert evidence_of(run)["failure"].startswith("stop command could not be published")
 
     @pytest.mark.asyncio
+    async def test_crash_during_ack_wait_preserves_stop_requested(self, db):
+        """CDX-R06: a crash while waiting for the bot's stop reply must not
+        lose the fact the stop was PUBLISHED — stop_requested_at is persisted
+        at the publish boundary, before the ack wait."""
+        await seed_bot_run(db, run_status="RUNNING")
+        orch = make_orchestrator(db, CrashDuringAckWaitMQTT())
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_fsm(orch, StubDockerManager(), StubArchiver())
+
+        run = await fetch_run(db)
+        assert run.run_status == "RUNNING"  # no premature terminal write
+        assert run.stopped_at is None
+        assert run.retirement_status == RETIREMENT_UNVERIFIED
+        ev = evidence_of(run)
+        assert ev.get("stop_requested_at") is not None  # survived the crash
+        assert ev.get("cancellation_requested_at") is not None
+
+    @pytest.mark.asyncio
+    async def test_crash_during_removal_preserves_archive_evidence(self, db):
+        """CDX-R06: a crash during container removal (after a successful
+        archive, before finalization) must not lose the archive evidence —
+        archived_at is persisted before the removal stage."""
+        await seed_bot_run(db)
+        await seed_order(db, status="FILLED")
+        orch = make_orchestrator(db, StubMQTT())
+
+        with pytest.raises(asyncio.CancelledError):
+            await run_fsm(orch, CrashOnRemoveDocker(), StubArchiver())
+
+        run = await fetch_run(db)
+        assert run.run_status != "STOPPED"  # finalization never ran
+        assert run.retirement_status == RETIREMENT_UNVERIFIED
+        ev = evidence_of(run)
+        assert ev.get("archived_at") is not None  # persisted BEFORE removal
+
+    @pytest.mark.asyncio
     async def test_skip_order_cancellation_recorded_and_independently_verifiable(self, db):
         """skip=True is recorded in the evidence; verification is still
         possible because zero-open-orders is confirmed INDEPENDENTLY from the
         API's own order records (spec §3)."""
         await seed_bot_run(db)
         await seed_order(db, status="CANCELLED")
-        mqtt = StubMQTT(response={"status": 200})
+        mqtt = StubMQTT()
         orch = make_orchestrator(db, mqtt)
 
         await run_fsm(orch, StubDockerManager(), StubArchiver(), skip_order_cancellation=True)
@@ -521,7 +774,7 @@ class TestStopAndArchiveStateMachine:
     async def test_archive_failure_is_unverified(self, db):
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
 
         await run_fsm(orch, StubDockerManager(), StubArchiver(fail=True))
 
@@ -536,7 +789,7 @@ class TestStopAndArchiveStateMachine:
     async def test_remove_failure_finalizes_error_unverified(self, db):
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
 
         await run_fsm(orch, StubDockerManager(remove_success=False), StubArchiver())
 
@@ -549,7 +802,7 @@ class TestStopAndArchiveStateMachine:
     async def test_serialized_run_exposes_retirement_fields(self, db):
         await seed_bot_run(db)
         await seed_order(db, status="FILLED")
-        orch = make_orchestrator(db, StubMQTT(response={"status": 200}))
+        orch = make_orchestrator(db, StubMQTT())
         await run_fsm(orch, StubDockerManager(), StubArchiver())
 
         runs = await orch.get_bot_runs(bot_name="bot1")
@@ -559,7 +812,7 @@ class TestStopAndArchiveStateMachine:
 
 
 # ===========================================================================
-# CFH guard: STOPPED alone is no longer trusted
+# CFH guard: STOPPED alone is no longer trusted — nor is the bare marker
 # ===========================================================================
 
 def make_source(tmp_path, name="SRC-20260712-230254"):
@@ -591,6 +844,20 @@ def make_repo(rows):
 
 def make_dep(accept_ungraceful=False):
     return SimpleNamespace(resume_accept_ungraceful=accept_ungraceful)
+
+
+def verified_row(instance_name, **evidence_overrides):
+    """A bot_runs row as the state machine would persist a VERIFIED
+    retirement: marker AND full spec evidence."""
+    ev = full_evidence()
+    ev.update(evidence_overrides)
+    return SimpleNamespace(
+        instance_name=instance_name,
+        run_status="STOPPED",
+        stopped_at=datetime(2026, 7, 12, 23, 5, 0),
+        retirement_status=RETIREMENT_VERIFIED,
+        retirement_evidence=json.dumps(ev),
+    )
 
 
 class TestCFHRequiresVerifiedRetirement:
@@ -629,14 +896,63 @@ class TestCFHRequiresVerifiedRetirement:
         assert exc.value.reason is ResumeAbortReason.UNGRACEFUL_SOURCE
 
     @pytest.mark.asyncio
-    async def test_verified_retirement_passes(self, tmp_path):
+    async def test_verified_marker_without_evidence_refused(self, tmp_path):
+        """CDX-R04: retirement_status is an unconstrained column — a bare
+        VERIFIED marker with NO persisted evidence must refuse."""
         source = make_source(tmp_path)
         row = SimpleNamespace(
             instance_name=source.instance_name,
             run_status="STOPPED",
             stopped_at=datetime(2026, 7, 12, 23, 5, 0),
             retirement_status=RETIREMENT_VERIFIED,
+            retirement_evidence=None,
         )
+        with pytest.raises(ResumeError) as exc:
+            await run_guards(
+                source, make_dest(tmp_path), make_dep(),
+                make_docker_exited(), make_repo([row]),
+            )
+        assert exc.value.reason is ResumeAbortReason.UNGRACEFUL_SOURCE
+        assert "marker alone" in exc.value.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_verified_marker_with_malformed_evidence_refused(self, tmp_path):
+        """CDX-R04: unparseable evidence never validates."""
+        source = make_source(tmp_path)
+        row = SimpleNamespace(
+            instance_name=source.instance_name,
+            run_status="STOPPED",
+            stopped_at=datetime(2026, 7, 12, 23, 5, 0),
+            retirement_status=RETIREMENT_VERIFIED,
+            retirement_evidence="{not json",
+        )
+        with pytest.raises(ResumeError) as exc:
+            await run_guards(
+                source, make_dest(tmp_path), make_dep(),
+                make_docker_exited(), make_repo([row]),
+            )
+        assert exc.value.reason is ResumeAbortReason.UNGRACEFUL_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_verified_marker_with_incomplete_evidence_refused(self, tmp_path):
+        """CDX-R04: a VERIFIED marker whose evidence is missing a spec
+        postcondition (here: exchange-confirmed zero open orders) refuses."""
+        source = make_source(tmp_path)
+        row = verified_row(source.instance_name, zero_open_orders_confirmed_at=None)
+        with pytest.raises(ResumeError) as exc:
+            await run_guards(
+                source, make_dest(tmp_path), make_dep(),
+                make_docker_exited(), make_repo([row]),
+            )
+        assert exc.value.reason is ResumeAbortReason.UNGRACEFUL_SOURCE
+        assert "zero_open_orders_confirmed_at" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_verified_retirement_passes(self, tmp_path):
+        """The fully-evidenced row — marker AND complete spec evidence — is
+        the ONLY row the guard passes without an override."""
+        source = make_source(tmp_path)
+        row = verified_row(source.instance_name)
         report = await run_guards(
             source, make_dest(tmp_path), make_dep(),
             make_docker_exited(), make_repo([row]),
@@ -664,7 +980,7 @@ class TestCFHRequiresVerifiedRetirement:
 
 
 # ===========================================================================
-# MQTT: publication vs acknowledgement
+# MQTT: publication vs acknowledgement; reply-topic correlation
 # ===========================================================================
 
 class TestPublishCommandWithAck:
@@ -715,6 +1031,66 @@ class TestPublishCommandWithAck:
         result = await m.publish_command_with_ack("bot1", "stop", {}, timeout=2.0)
         await task
         assert result == {"published": True, "response": {"status": 200}}
+
+    @pytest.mark.asyncio
+    async def test_same_millisecond_reply_topics_do_not_collide(self):
+        """CDX-R05: two concurrent commands started in the SAME millisecond
+        must get distinct reply topics, and each pending future must receive
+        its OWN response — no overwrite, no cross-attribution."""
+        m = self._manager()
+        with patch("utils.mqtt_manager.time") as frozen:
+            frozen.time.return_value = 1_752_624_000.0  # both calls: same ms
+            t1 = asyncio.ensure_future(m.publish_command_with_ack("bot1", "stop", {}, timeout=2.0))
+            t2 = asyncio.ensure_future(m.publish_command_with_ack("bot2", "stop", {}, timeout=2.0))
+            for _ in range(200):
+                if len(m._pending_responses) == 2:
+                    break
+                await asyncio.sleep(0.005)
+            topics = list(m._pending_responses.keys())
+            assert len(topics) == 2 and topics[0] != topics[1]
+            m._pending_responses[topics[0]].set_result({"data": {"who": "first"}})
+            m._pending_responses[topics[1]].set_result({"data": {"who": "second"}})
+            r1 = await t1
+            r2 = await t2
+        assert r1["response"]["data"]["who"] == "first"
+        assert r2["response"]["data"]["who"] == "second"
+
+    @pytest.mark.asyncio
+    async def test_on_published_runs_after_publish_before_ack(self):
+        """CDX-R06: the on_published boundary callback fires once the broker
+        accepts the publish, BEFORE the acknowledgement arrives."""
+        m = self._manager()
+        order = []
+
+        async def cb():
+            order.append("published")
+
+        async def answer():
+            for _ in range(200):
+                if m._pending_responses:
+                    order.append("answered")
+                    topic = next(iter(m._pending_responses))
+                    m._pending_responses[topic].set_result(rpc_reply(200))
+                    return
+                await asyncio.sleep(0.005)
+
+        task = asyncio.ensure_future(answer())
+        result = await m.publish_command_with_ack("bot1", "stop", {}, timeout=2.0, on_published=cb)
+        await task
+        assert result["published"] is True and result["response"] is not None
+        assert order == ["published", "answered"]
+
+    @pytest.mark.asyncio
+    async def test_on_published_not_called_when_publish_fails(self):
+        m = self._manager(publish_side_effect=Exception("broker down"))
+        called = []
+
+        async def cb():
+            called.append(True)
+
+        result = await m.publish_command_with_ack("bot1", "stop", {}, timeout=0.01, on_published=cb)
+        assert result == {"published": False, "response": None}
+        assert called == []
 
 
 # ===========================================================================

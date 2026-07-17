@@ -18,6 +18,18 @@ from utils.mqtt_manager import MQTTManager
 
 logger = logging.getLogger(__name__)
 
+# Engine RPC status codes — mirrored from the engine's wire contract
+# (E:/tradingsoftware/hummingbot/hummingbot/remote_iface/messages.py:
+# MQTT_STATUS_CODE — SUCCESS=200, ERROR=400).
+MQTT_RPC_SUCCESS = 200
+MQTT_RPC_ERROR = 400
+# The engine's status handler replies ERROR with exactly this message once
+# trading_core.strategy is None (remote_iface/mqtt.py:_on_cmd_status) — and
+# stop_loop() clears the strategy only after the ENTIRE graceful shutdown
+# (on_stop with executor store, exchange-acked cancel_all, connector removal,
+# markets-recorder stop) has completed (client/command/stop_command.py).
+_NO_STRATEGY_RUNNING = "no strategy is currently running"
+
 
 @dataclass(frozen=True)
 class RetirementTimeouts:
@@ -29,6 +41,7 @@ class RetirementTimeouts:
     """
 
     stop_ack_timeout: float = 30.0
+    quiescence_timeout: float = 120.0
     zero_open_orders_timeout: float = 90.0
     fill_drain_seconds: float = 10.0
     poll_interval: float = 2.0
@@ -49,6 +62,7 @@ class RetirementTimeouts:
 
         return cls(
             stop_ack_timeout=read("RETIREMENT_STOP_ACK_TIMEOUT_S", cls.stop_ack_timeout),
+            quiescence_timeout=read("RETIREMENT_QUIESCENCE_TIMEOUT_S", cls.quiescence_timeout),
             zero_open_orders_timeout=read("RETIREMENT_ZERO_ORDERS_TIMEOUT_S", cls.zero_open_orders_timeout),
             fill_drain_seconds=read("RETIREMENT_FILL_DRAIN_S", cls.fill_drain_seconds),
             poll_interval=read("RETIREMENT_POLL_INTERVAL_S", cls.poll_interval),
@@ -710,6 +724,60 @@ class BotsOrchestrator:
         except Exception as e:
             logger.error(f"Failed to finalize retirement for {bot_name}: {e}")
 
+    @staticmethod
+    def _rpc_response_data(response) -> Optional[Dict[str, Any]]:
+        """Extract the payload from the engine's RPC reply envelope
+        ``{"header": {...}, "data": {"status": <int>, "msg": <str>, ...}}``
+        (engine remote_iface/mqtt.py:_wrap_response). Anything else — string,
+        bare dict without the ``data`` envelope, None — is malformed and maps
+        to None: an unparseable reply is never evidence (fail-closed)."""
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict):
+                return data
+        return None
+
+    async def _await_strategy_quiescence(
+        self, bot_id: str, evidence: Dict[str, Any], timeouts: RetirementTimeouts
+    ):
+        """Bounded poll of the bot's status RPC for strategy quiescence.
+
+        The engine clears ``trading_core.strategy`` only at the END of
+        ``stop_loop()`` — after ``StrategyV2Base.on_stop()`` (controllers
+        stopped, executors stored), exchange-acknowledged ``cancel_all``,
+        connector removal and markets-recorder shutdown. Once cleared, the
+        status RPC replies ERROR / 'No strategy is currently running!': that
+        reply is the bot's OWN confirmation that the graceful shutdown ran to
+        completion — unlike the stop ack, which (async_backend) only proves
+        the command was accepted. Silence, unrelated errors, or malformed
+        replies are never quiescence; on timeout the stage stays unconfirmed.
+        """
+        deadline = time.monotonic() + timeouts.quiescence_timeout
+        while True:
+            result = await self.mqtt_manager.publish_command_with_ack(
+                bot_id,
+                "status",
+                {"async_backend": True},
+                timeout=max(timeouts.poll_interval, 5.0),
+            )
+            data = self._rpc_response_data(result.get("response")) if result.get("published") else None
+            if (
+                data is not None
+                and data.get("status") == MQTT_RPC_ERROR
+                and _NO_STRATEGY_RUNNING in str(data.get("msg", "")).lower()
+            ):
+                evidence["quiescence_confirmed_at"] = self._utc_iso()
+                evidence["quiescence_basis"] = "bot status RPC reports no strategy running"
+                return
+            if time.monotonic() >= deadline:
+                evidence["quiescence_basis"] = "timeout"
+                logger.warning(
+                    f"Bot {bot_id} did not report strategy quiescence within "
+                    f"{timeouts.quiescence_timeout}s — retirement cannot be verified"
+                )
+                return
+            await asyncio.sleep(timeouts.poll_interval)
+
     async def _await_zero_open_orders(
         self, account_name: Optional[str], evidence: Dict[str, Any], timeouts: RetirementTimeouts
     ):
@@ -784,7 +852,9 @@ class BotsOrchestrator:
         FastAPI-agnostic and can be invoked/tested directly.
 
         Each stage persists evidence gathered from CONFIRMED data only — the
-        bot's own RPC response to the stop command, the API's order records,
+        bot's own validated RPC replies (stop accepted; strategy quiescent —
+        the bot reporting "no strategy running", which the engine sets only
+        after its full graceful stop sequence), the API's order records, and
         Docker container state. MQTT publish success is never evidence. Where
         confirmation is impossible (silent bot, timeout, dirty exit) the stage
         stays unconfirmed and the run finalizes UNVERIFIED — never fabricated,
@@ -825,11 +895,23 @@ class BotsOrchestrator:
 
             self.set_bot_stopping(bot_name_for_orchestrator)
             logger.info(f"Stopping bot trading process for {bot_name_for_orchestrator}")
+
+            async def _on_stop_published():
+                # Persist "stop requested" at the TRUE stage boundary — the
+                # moment the broker accepts the publish — not after the (up to
+                # stop_ack_timeout) wait for the bot's reply: a crash during
+                # that wait must not lose the fact the stop was sent.
+                evidence["stop_requested_at"] = self._utc_iso()
+                if not skip_order_cancellation:
+                    evidence["cancellation_requested_at"] = evidence["stop_requested_at"]
+                await self._persist_retirement_evidence(bot_name, evidence)
+
             stop_result = await self.mqtt_manager.publish_command_with_ack(
                 bot_name_for_orchestrator,
                 "stop",
                 {"skip_order_cancellation": skip_order_cancellation, "async_backend": True},
                 timeout=timeouts.stop_ack_timeout,
+                on_published=_on_stop_published,
             )
 
             if not stop_result.get("published"):
@@ -841,39 +923,59 @@ class BotsOrchestrator:
                 await self._persist_retirement_evidence(bot_name, evidence)
                 return
 
-            evidence["stop_requested_at"] = self._utc_iso()
-            if not skip_order_cancellation:
-                evidence["cancellation_requested_at"] = evidence["stop_requested_at"]
+            # Defensive: an MQTT implementation that never ran the callback
+            # still leaves a correct trail (published implies requested).
+            if evidence.get("stop_requested_at") is None:
+                evidence["stop_requested_at"] = self._utc_iso()
+                if not skip_order_cancellation:
+                    evidence["cancellation_requested_at"] = evidence["stop_requested_at"]
             # Clear performance data after the stop request so status reflects it.
             self.mqtt_manager.clear_bot_controller_reports(bot_name_for_orchestrator)
 
-            if stop_result.get("response") is not None:
+            stop_data = self._rpc_response_data(stop_result.get("response"))
+            if stop_data is not None and stop_data.get("status") == MQTT_RPC_SUCCESS:
+                # The bot's own SUCCESS reply: the stop command was received
+                # and accepted. With async_backend this proves acceptance, not
+                # completion — completion is confirmed by the quiescence stage
+                # below. Error, malformed or absent replies are never acks.
                 evidence["stop_ack_at"] = self._utc_iso()
                 evidence["stop_ack"] = str(stop_result["response"])[:500]
             else:
                 logger.warning(
-                    f"No stop acknowledgement from {bot_name_for_orchestrator} within "
-                    f"{timeouts.stop_ack_timeout}s — retirement cannot be verified"
+                    f"No valid stop acknowledgement from {bot_name_for_orchestrator} "
+                    f"(reply: {str(stop_result.get('response'))[:200]!r}) — "
+                    f"retirement cannot be verified"
                 )
             await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 3: Exchange-confirmed zero open orders + final-fill drain
-            # (bounded polling replaces the old fixed 15 s sleep).
-            await self._await_zero_open_orders(account_name, evidence, timeouts)
-            if evidence.get("zero_open_orders_confirmed_at"):
-                await asyncio.sleep(timeouts.fill_drain_seconds)
-                remaining = await self._active_order_count(account_name)
-                if remaining == 0:
-                    evidence["fills_drained_at"] = self._utc_iso()
-                else:
-                    evidence["orders_active_after_drain"] = remaining
-                    logger.warning(
-                        f"Active orders reappeared (or were unreadable) during the fill drain "
-                        f"for {bot_name}: {remaining!r} — retirement cannot be verified"
-                    )
+            # Step 3: Strategy quiescence — the bot itself must report that no
+            # strategy is running (the engine sets that only at the END of its
+            # graceful stop sequence). Everything downstream keys off this.
+            await self._await_strategy_quiescence(bot_name_for_orchestrator, evidence, timeouts)
             await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 4: Stop the container with monitoring
+            # Step 4: Zero open orders + final-fill drain (bounded polling
+            # replaces the old fixed 15 s sleep). Only meaningful AFTER
+            # quiescence: until the bot confirms its stop sequence finished it
+            # may still be trading, so a momentary zero proves nothing.
+            if evidence.get("quiescence_confirmed_at"):
+                await self._await_zero_open_orders(account_name, evidence, timeouts)
+                if evidence.get("zero_open_orders_confirmed_at"):
+                    await asyncio.sleep(timeouts.fill_drain_seconds)
+                    remaining = await self._active_order_count(account_name)
+                    if remaining == 0:
+                        evidence["fills_drained_at"] = self._utc_iso()
+                    else:
+                        evidence["orders_active_after_drain"] = remaining
+                        logger.warning(
+                            f"Active orders reappeared (or were unreadable) during the fill drain "
+                            f"for {bot_name}: {remaining!r} — retirement cannot be verified"
+                        )
+            else:
+                evidence["zero_open_orders_basis"] = "quiescence_unconfirmed"
+            await self._persist_retirement_evidence(bot_name, evidence)
+
+            # Step 5: Stop the container with monitoring
             max_retries = 10
             retry_interval = 2
             container_stopped = False
@@ -904,19 +1006,25 @@ class BotsOrchestrator:
 
             evidence["process_exited_at"] = self._utc_iso()
             evidence["container_exit_code"] = exit_code
-            if exit_code == 0:
-                # A clean exit means the engine's graceful-shutdown path — which
-                # flushes/checkpoints strategy state — ran to completion. A dirty
-                # or unknown exit code cannot claim a flushed state.
-                evidence["state_flushed_at"] = evidence["process_exited_at"]
+            if exit_code == 0 and evidence.get("quiescence_confirmed_at"):
+                # State flush/checkpoint evidence requires BOTH: the bot's own
+                # confirmation that stop_loop() completed (which runs the
+                # durable-state shutdown — executor store, markets-recorder
+                # stop; the ladder controller additionally write-throughs its
+                # state ledger on every mutation) AND a clean process exit
+                # afterwards. Exit code 0 ALONE is never flush evidence — a
+                # container can exit 0 without ever running that path.
+                evidence["state_flushed_at"] = self._utc_iso()
+                evidence["state_flush_basis"] = "quiescence_confirmed+clean_exit"
             else:
                 logger.warning(
-                    f"Container {container_name} exited with code {exit_code!r} — "
+                    f"Container {container_name} exited with code {exit_code!r} "
+                    f"(quiescence confirmed: {bool(evidence.get('quiescence_confirmed_at'))}) — "
                     f"state flush unconfirmed, retirement cannot be verified"
                 )
             await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 5: Archive the bot data
+            # Step 6: Archive the bot data
             instance_dir = os.path.join('bots', 'instances', container_name)
             logger.info(f"Archiving bot data from {instance_dir}")
 
@@ -931,8 +1039,11 @@ class BotsOrchestrator:
                 logger.error(f"Archive failed: {str(e)}")
                 evidence["archive_error"] = str(e)[:500]
                 # Continue with removal even if archive fails
+            # Archive evidence must survive a crash during container removal —
+            # persist BEFORE the next destructive stage, not at finalization.
+            await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 6: Remove the container
+            # Step 7: Remove the container
             logging.info(f"Removing container {container_name}")
             remove_response = docker_manager.remove_container(container_name, force=False)
 
@@ -944,7 +1055,7 @@ class BotsOrchestrator:
             if remove_response.get("success"):
                 logging.info(f"Successfully completed stop-and-archive for bot {bot_name}")
 
-                # Step 7: Finalize retirement (STOPPED + VERIFIED/UNVERIFIED from
+                # Step 8: Finalize retirement (STOPPED + VERIFIED/UNVERIFIED from
                 # the evidence), then flip deployment status to ARCHIVED.
                 await self._finalize_retirement(bot_name, evidence, final_status=final_status)
                 try:

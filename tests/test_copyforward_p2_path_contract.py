@@ -45,6 +45,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from models.bot_orchestration import V2ControllerDeployment, V2ScriptDeployment
 from ledger_fixtures import valid_ledger_payload
 from services.resume_service import (
@@ -249,6 +250,14 @@ def make_deployment(**overrides):
     return V2ControllerDeployment(**kwargs)
 
 
+_RETIREMENT_TS = "2026-07-10T12:00:00+00:00"
+_VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _RETIREMENT_TS,
+})
+
+
 def graceful_repo(*names):
     repo = MagicMock()
     repo.get_bot_runs = AsyncMock(
@@ -257,7 +266,9 @@ def graceful_repo(*names):
                 instance_name=n,
                 run_status="STOPPED",
                 stopped_at=datetime(2026, 7, 10, 12, 0, 0),
-                retirement_status="VERIFIED",  # CDX-005: STOPPED alone is untrusted
+                # CDX-005: neither STOPPED nor the bare marker is trusted (CDX-R04).
+                retirement_status="VERIFIED",
+                retirement_evidence=_VERIFIED_EVIDENCE_JSON,
             )
             for n in names
         ]

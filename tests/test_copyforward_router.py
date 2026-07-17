@@ -44,6 +44,7 @@ if _GATEWAY_MOD not in sys.modules:
 # Module-level imports that are SAFE (no hummingbot chain)
 # ---------------------------------------------------------------------------
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from ledger_fixtures import valid_ledger_payload
 from services.resume_service import (
     CopyPlan,
@@ -52,6 +53,15 @@ from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
 )
+
+_RETIREMENT_TS = "2026-07-10T12:00:00+00:00"
+# CDX-005/CDX-R04: the graceful-source guard validates the FULL retirement
+# evidence, not just the VERIFIED marker.
+_VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _RETIREMENT_TS,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +506,7 @@ class TestPreviewNoWrites:
             run_status="STOPPED",
             stopped_at="2026-07-10",
             retirement_status="VERIFIED",
+            retirement_evidence=_VERIFIED_EVIDENCE_JSON,
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])
@@ -582,6 +593,7 @@ class TestPreviewResumeService:
         fake_run = SimpleNamespace(
             instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10",
             retirement_status="VERIFIED",  # CDX-005
+            retirement_evidence=_VERIFIED_EVIDENCE_JSON,
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])
@@ -686,6 +698,7 @@ class TestPreviewResumeService:
         fake_run = SimpleNamespace(
             instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10",
             retirement_status="VERIFIED",  # CDX-005
+            retirement_evidence=_VERIFIED_EVIDENCE_JSON,
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])
