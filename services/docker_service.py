@@ -3,15 +3,17 @@ import logging
 import os
 import secrets
 import shutil
+import socket
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import docker
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound
 from docker.types import LogConfig
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from config import settings
 from models import V2ControllerDeployment
@@ -103,6 +105,146 @@ def _rename_noreplace(src: str, dst: str) -> None:
         except OSError as rm_exc:
             logger.error("Could not release promote reservation '%s': %s", dst, rm_exc)
         raise
+
+
+# ---------------------------------------------------------------------------
+# CLA-M02 — the bots/ path coupling
+# ---------------------------------------------------------------------------
+#
+# Two code paths address the SAME bots tree through two different names, and
+# nothing ever checked they agree:
+#
+#   * the copy-forward hook writes through a CWD-RELATIVE ``bots/`` — inside the
+#     API container that is ``/hummingbot-api/bots`` (its WORKDIR);
+#   * ``_run_instance_container`` builds the bot containers' bind-mount SOURCES
+#     from ``$BOTS_PATH`` — a HOST path (``os.path.join(bots_path, instance_dir,
+#     ...)``), because the daemon resolves mount sources on the host, not in our
+#     namespace.
+#
+# The deployment is only correct because the compose file happens to bind
+# ``${BOTS_PATH}/bots`` at ``/hummingbot-api/bots``. That is an undocumented
+# invariant: break it and the hook seeds a data/ directory that the bot it was
+# seeded for can never read — the bot starts clean and re-seeds from the wallet,
+# which is a money event, and nothing logs a word.
+#
+# So: prove it at deploy time by asking the daemon what THIS container's mounts
+# actually are.
+_HOOK_BOTS_ROOT = "bots"  # the hook's write root, relative to CWD
+
+
+def _self_container_id() -> Optional[str]:
+    """This container's id/name, or None if it cannot be determined.
+
+    Docker sets the container hostname to the short container id unless compose
+    overrides it; ``HOSTNAME`` is the documented escape hatch for the override
+    case. Outside a container this returns the host's name, which simply will
+    not resolve as a container — handled by the caller as "unavailable".
+    """
+    try:
+        return os.environ.get("HOSTNAME") or socket.gethostname() or None
+    except OSError:
+        return None
+
+
+def _inspect_self_mounts(client) -> Optional[list]:
+    """This API container's mount table, or ``None`` if self-inspection is
+    genuinely unavailable.
+
+    ``None`` means "we could not determine our own mounts" — NOT "we have none".
+    An empty list is a real answer (a container with no bind mounts) and is
+    returned as ``[]``, because that answer proves a mismatch.
+
+    The distinction is the whole safety argument for CLA-M02, so the
+    unavailable set is closed and enumerated here rather than being whatever a
+    bare ``except Exception`` happens to swallow:
+
+    * no client, or no determinable container id — not running under Docker;
+    * ``NotFound`` — our id is not a container the daemon knows (dev/test, or
+      the API running on the host);
+    * ``DockerException`` / ``requests`` ``ConnectionError`` — daemon
+      unreachable or API error, so we know nothing;
+    * a payload that is not the shape the Docker SDK documents (``attrs`` dict,
+      ``Mounts`` list of dicts) — we are not talking to a real daemon (this is
+      what a ``MagicMock`` client in the test suite looks like). A real daemon
+      always returns the documented shape, so a real MISMATCH can never arrive
+      disguised as a malformed payload.
+
+    Note what is deliberately NOT caught: everything after this function
+    returns. Comparing the paths happens in the caller, outside any handler, so
+    no bug in the comparison — and no genuine mismatch — can be laundered into
+    "unavailable".
+    """
+    if client is None:
+        return None
+    container_id = _self_container_id()
+    if not container_id:
+        return None
+    try:
+        attrs = client.containers.get(container_id).attrs
+    except NotFound:
+        return None
+    except (DockerException, RequestsConnectionError):
+        return None
+    if not isinstance(attrs, dict):
+        return None
+    mounts = attrs.get("Mounts")
+    if not isinstance(mounts, list):
+        return None
+    if not all(isinstance(m, dict) for m in mounts):
+        return None
+    return mounts
+
+
+def _mount_remainder(destination: str, target: str) -> Optional[str]:
+    """The path of ``target`` relative to ``destination``, or ``None`` when
+    ``destination`` does not contain ``target``.
+
+    ``os.path.relpath`` rather than a string prefix test, because a prefix test
+    reads ``/hummingbot-api/bots-backup`` as containing ``/hummingbot-api/bots``
+    and would then compute a host path out of two unrelated mounts. A
+    non-containing destination yields a remainder that escapes upward (or, on
+    Windows, a different drive), and both are rejected here.
+    """
+    dest_n = os.path.normpath(destination)
+    target_n = os.path.normpath(target)
+    if dest_n == target_n:
+        return ""
+    try:
+        rel = os.path.relpath(target_n, dest_n)
+    except ValueError:
+        return None  # different drives (Windows) — cannot contain
+    if rel == os.curdir:
+        return ""
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return None
+    return rel
+
+
+def _host_source_for(mounts: list, container_path: str) -> Optional[str]:
+    """The HOST directory backing ``container_path``, per this container's mount
+    table — or ``None`` if no mount backs it (the path lives in the container's
+    own writable layer).
+
+    Matches the LONGEST covering mount rather than requiring an exact
+    destination: binding the parent (``/hummingbot-api``) backs
+    ``/hummingbot-api/bots`` just as validly as binding it directly, and calling
+    that "unmounted" would be a false alarm that aborts a correct deployment.
+    """
+    best_depth = -1
+    best_host = None
+    for mount in mounts:
+        dest = mount.get("Destination")
+        source = mount.get("Source")
+        if not isinstance(dest, str) or not isinstance(source, str) or not dest:
+            continue
+        remainder = _mount_remainder(dest, container_path)
+        if remainder is None:
+            continue
+        depth = len(os.path.normpath(dest).split(os.sep))
+        if depth > best_depth:
+            best_depth = depth
+            best_host = os.path.join(source, remainder) if remainder else source
+    return best_host
 
 
 @asynccontextmanager
@@ -308,6 +450,81 @@ class DockerService:
             raise ValueError(f"Invalid {label}: '{path}' resolves outside of '{base_dir}'.")
         return resolved_path
 
+    def _check_bots_path_coupling(self) -> Optional[dict]:
+        """Prove the hook's write root and the bot containers' mount source are
+        the same directory (CLA-M02).
+
+        The two paths are computed exactly as the code that uses them computes
+        them — ``os.path.abspath("bots")`` is what the hook writes through, and
+        ``abspath(join($BOTS_PATH, "bots"))`` is the root of every mount source
+        ``_run_instance_container`` builds — so this checks the real coupling,
+        not a restatement of it.
+
+        Returns:
+            A structured warning dict when the coupling could not be verified,
+            or ``None`` when it was verified to hold.
+
+        Raises:
+            ResumeError: ``BOTS_PATH_MISCONFIGURED``, mapped to 409. Raised only
+                on PROOF: a successful self-inspection whose answer disagrees.
+                Unverifiable is not proof — outside a container there is nothing
+                to disagree with, and aborting there would brick every dev and
+                test deploy over assertion machinery for a mount that does not
+                exist. Proven danger fails closed; unknown warns loudly.
+        """
+        bots_path = os.environ.get("BOTS_PATH", self.SOURCE_PATH)
+        mount_root = os.path.abspath(os.path.join(bots_path, "bots"))
+        write_root = os.path.abspath(_HOOK_BOTS_ROOT)
+
+        mounts = _inspect_self_mounts(self.client)
+        if mounts is None:
+            message = (
+                f"Could not verify the bots/ path coupling: this process could "
+                f"not inspect its own container mounts. The resume hook writes "
+                f"through '{write_root}' while bot containers will bind-mount "
+                f"host path '{mount_root}' — if those are not the same "
+                f"directory, a resumed bot silently starts with an empty data/ "
+                f"and re-seeds from the wallet. Unverified, not refused."
+            )
+            logger.warning(message, extra={"event": "bots_path_coupling_unverified"})
+            return {
+                "code": "BOTS_PATH_COUPLING_UNVERIFIED",
+                "message": message,
+                "hook_write_root": write_root,
+                "bot_mount_root": mount_root,
+            }
+
+        # Everything below is outside the unavailable handler on purpose: once
+        # the daemon has answered, any disagreement is a finding, not a doubt.
+        actual_mount_root = _host_source_for(mounts, write_root)
+        if actual_mount_root is None:
+            raise ResumeError(
+                ResumeAbortReason.BOTS_PATH_MISCONFIGURED,
+                f"The resume hook's write root '{write_root}' is not backed by "
+                f"any bind mount of this API container, so it lives in the "
+                f"container's own writable layer — but bot containers bind-mount "
+                f"host path '{mount_root}' (from BOTS_PATH='{bots_path}'). "
+                f"Nothing written by the hook could ever be read by the bot. "
+                f"Refusing to deploy.",
+            )
+        if os.path.normpath(actual_mount_root) != os.path.normpath(mount_root):
+            raise ResumeError(
+                ResumeAbortReason.BOTS_PATH_MISCONFIGURED,
+                f"bots/ path coupling violated: the resume hook writes through "
+                f"'{write_root}', which this container mounts from host path "
+                f"'{actual_mount_root}' — but bot containers would bind-mount "
+                f"host path '{mount_root}' (from BOTS_PATH='{bots_path}'). Those "
+                f"are different directories: a resumed bot would start with an "
+                f"empty data/ and re-seed from the wallet. Refusing to deploy. "
+                f"Set BOTS_PATH so that BOTS_PATH + '/bots' == "
+                f"'{actual_mount_root}', or fix the bind mount.",
+            )
+        logger.debug(
+            "bots/ path coupling verified: hook write root '%s' and bot mount "
+            "root '%s' are the same host directory.", write_root, mount_root,
+        )
+        return None
+
     def _create_staging_dir(self, instance_name: str) -> str:
         """Create the exclusive staging sibling this attempt builds the instance in.
 
@@ -396,6 +613,11 @@ class DockerService:
     async def create_hummingbot_instance(self, config: V2ControllerDeployment):
         bots_path = os.environ.get('BOTS_PATH', self.SOURCE_PATH)  # Default to 'SOURCE_PATH' if BOTS_PATH is not set
         instance_name = config.instance_name
+
+        # CLA-M02 — before ANY filesystem mutation: a proven-broken coupling
+        # means everything staged below would be written somewhere the bot
+        # cannot read it, so there is nothing to gain by building it first.
+        coupling_warning = self._check_bots_path_coupling()
         # The one resolver, shared with preview_resume (CDX-R02): if preview and
         # deploy each joined the path themselves they could drift, and preview's
         # whole job is to grade the path deploy will actually build.
@@ -433,12 +655,18 @@ class DockerService:
         )
 
         # Surface the resume hook's structured warnings (CONTRACT C1's opt-out skip
-        # is the first of them) on the deploy response. A skipped controller means a
-        # bot came up without its ledger; the operator who asked for that is entitled
-        # to see it in the reply rather than find it in a log later.
+        # is the first of them; CLA-M01's sizing-critical drift rides here too) on
+        # the deploy response. A skipped controller means a bot came up without its
+        # ledger, and sizing drift means it came up trading a different amount of
+        # money than the bot it replaced; the operator who asked for that is
+        # entitled to see it in the reply rather than find it in a log later.
         resume_warnings = (resume_manifest or {}).get("warnings") or []
         if resume_warnings:
             response["resume_warnings"] = resume_warnings
+        # CLA-M02's unverified-coupling warning is deploy-wide, not resume-scoped:
+        # it is raised for every deploy, including resume_mode="off".
+        if coupling_warning:
+            response["warnings"] = [coupling_warning]
         return response
 
     async def _stage_instance(
