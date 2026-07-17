@@ -10,10 +10,34 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderFilledEvent, SellOrderCreatedEvent, TradeType
 
+from contextlib import asynccontextmanager
+
 from database import AsyncDatabaseManager, OrderRepository, TradeRepository
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+
+# CDX-006 adjudication (CDX-R01): fill events are handled as independent
+# asyncio tasks, so two DISTINCT fills for one order can interleave their
+# read-modify-write of the order aggregates — both read the same pre-fill
+# state and the last writer erases the other fill. Serialize per order id
+# in-process; OrderRepository.update_order_fill additionally takes a
+# SELECT ... FOR UPDATE row lock for cross-process safety on postgres.
+# Entries are refcounted so the registry cannot grow without bound.
+_order_fill_locks: dict = {}
+
+
+@asynccontextmanager
+async def _order_fill_lock(client_order_id: str):
+    entry = _order_fill_locks.setdefault(client_order_id, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and _order_fill_locks.get(client_order_id) is entry:
+            del _order_fill_locks[client_order_id]
 
 
 class OrdersRecorder:
@@ -191,7 +215,15 @@ class OrdersRecorder:
             logger.error(f"OrdersRecorder: Error recording order created: {e}")
 
     async def _handle_order_filled(self, event: OrderFilledEvent):
-        """Handle order fill events"""
+        """Handle order fill events, serialized per order id (CDX-R01)."""
+        async with _order_fill_lock(event.order_id):
+            await self._handle_order_filled_locked(event)
+
+    async def _handle_order_filled_locked(self, event: OrderFilledEvent):
+        """Record one fill: insert-first dedup, then aggregate update.
+
+        Must only run under the per-order lock taken by _handle_order_filled.
+        """
         try:
             async with self.db_manager.get_session_context() as session:
                 order_repo = OrderRepository(session)
@@ -236,58 +268,74 @@ class OrdersRecorder:
                             logger.error(f"Fallback fee calculation also failed: {fallback_err}")
                             trade_fee_paid = 0
                             trade_fee_currency = None
-                # Update order with fill information (handle potential NaN values like Hummingbot does)
+                # Validate numeric inputs BEFORE touching the DB (handle
+                # potential NaN values like Hummingbot does)
                 try:
                     filled_amount = Decimal(str(event.amount))
-                    average_fill_price = Decimal(str(event.price))
+                    fill_price = Decimal(str(event.price))
                     fee_paid_decimal = Decimal(str(trade_fee_paid)) if trade_fee_paid else None
-
-                    order = await order_repo.update_order_fill(
-                        client_order_id=event.order_id,
-                        filled_amount=filled_amount,
-                        average_fill_price=average_fill_price,
-                        fee_paid=fee_paid_decimal,
-                        fee_currency=trade_fee_currency
-                    )
                 except (ValueError, InvalidOperation) as e:
                     logger.error(f"Error processing order fill for {event.order_id}: {e}, skipping update")
                     return
 
-                # Create trade record using validated values
-                if order:
-                    try:
-                        # Validate all values before creating trade record
-                        validated_timestamp = event.timestamp if event.timestamp and not math.isnan(
-                            event.timestamp) else time.time()
-                        validated_fee = trade_fee_paid if trade_fee_paid and not math.isnan(trade_fee_paid) else 0
+                order = await order_repo.get_order_by_client_id(event.order_id)
+                if order is None:
+                    logger.warning(f"Fill event for unknown order {event.order_id}; nothing recorded")
+                    return
 
-                        # Use exchange_trade_id if available (unique per fill), fallback to generated id
-                        exchange_trade_id = getattr(event, 'exchange_trade_id', None)
-                        if exchange_trade_id:
-                            trade_id = f"{event.order_id}_{exchange_trade_id}"
-                        else:
-                            # Fallback: include amount to differentiate partial fills at same timestamp
-                            trade_id = f"{event.order_id}_{validated_timestamp}_{float(filled_amount)}"
+                # CDX-006: insert the immutable trade FIRST — the DB unique
+                # constraints are the dedup authority. Aggregates are mutated
+                # ONLY when the insert actually inserted, in the same
+                # session/transaction.
+                validated_timestamp = event.timestamp if event.timestamp and not math.isnan(
+                    event.timestamp) else time.time()
+                validated_fee = trade_fee_paid if trade_fee_paid and not math.isnan(trade_fee_paid) else 0
 
-                        trade_data = {
-                            "order_id": order.id,
-                            "trade_id": trade_id,
-                            "timestamp": datetime.fromtimestamp(validated_timestamp),
-                            "trading_pair": event.trading_pair,
-                            "trade_type": event.trade_type.name,
-                            "amount": float(filled_amount),  # Use validated amount
-                            "price": float(average_fill_price),  # Use validated price
-                            "fee_paid": validated_fee,
-                            "fee_currency": trade_fee_currency
-                        }
-                        result = await trade_repo.create_trade(trade_data)
-                        if result is None:
-                            logger.debug(f"Trade {trade_id} already exists, skipping duplicate")
-                    except (ValueError, TypeError) as e:
-                        logger.error(f"Error creating trade record for {event.order_id}: {e}")
-                        logger.error(
-                            f"Trade data that failed: timestamp={event.timestamp}, "
-                            f"amount={event.amount}, price={event.price}, fee={trade_fee_paid}")
+                # Empty/whitespace exchange_trade_id maps to None so the scoped
+                # unique constraint never collides unrelated id-less fills
+                # (NULLs are distinct); those dedup via the trade_id fallback.
+                raw_exchange_trade_id = getattr(event, 'exchange_trade_id', None)
+                exchange_trade_id = str(raw_exchange_trade_id).strip() if raw_exchange_trade_id else None
+                exchange_trade_id = exchange_trade_id or None
+
+                if exchange_trade_id:
+                    trade_id = f"{event.order_id}_{exchange_trade_id}"
+                else:
+                    # Fallback: include amount to differentiate partial fills at same timestamp
+                    trade_id = f"{event.order_id}_{validated_timestamp}_{float(filled_amount)}"
+
+                trade_data = {
+                    "order_id": order.id,
+                    "trade_id": trade_id,
+                    "account_name": self.account_name,
+                    "connector_name": self.connector_name,
+                    "exchange_trade_id": exchange_trade_id,
+                    "timestamp": datetime.fromtimestamp(validated_timestamp),
+                    "trading_pair": event.trading_pair,
+                    "trade_type": event.trade_type.name,
+                    "amount": float(filled_amount),  # Use validated amount
+                    "price": float(fill_price),  # Use validated price
+                    "fee_paid": validated_fee,
+                    "fee_currency": trade_fee_currency
+                }
+                inserted = await trade_repo.insert_trade_if_new(trade_data)
+                if inserted is None:
+                    logger.info(
+                        f"Duplicate fill delivery for order {event.order_id} "
+                        f"(trade_id={trade_id}, exchange_trade_id={exchange_trade_id}): "
+                        f"trade already recorded, aggregates left untouched")
+                    return
+
+                # A failure past this point propagates out of the session
+                # context, rolling back the trade insert together with any
+                # partial aggregate mutation — never one without the other.
+                await order_repo.update_order_fill(
+                    client_order_id=event.order_id,
+                    filled_amount=filled_amount,
+                    fill_price=fill_price,
+                    fee_paid=fee_paid_decimal,
+                    fee_currency=trade_fee_currency
+                )
 
             logger.debug(f"Recorded order fill: {event.order_id} - {event.amount} @ {event.price}")
         except Exception as e:

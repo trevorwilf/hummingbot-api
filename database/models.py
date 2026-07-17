@@ -72,12 +72,30 @@ class Order(Base):
 
 class Trade(Base):
     __tablename__ = "trades"
+    # CDX-006: duplicate fill delivery must never double-count order
+    # aggregates. The exchange's fill identity is scoped per account+connector
+    # (two accounts can legitimately see the same exchange_trade_id), so the
+    # dedup constraint is the triple, not the bare exchange id. NULL
+    # exchange_trade_id rows (fills the exchange gave no id for, plus legacy
+    # rows predating these columns) never collide — NULLs are distinct in both
+    # sqlite and postgres; those fills dedup via the global trade_id instead.
+    __table_args__ = (
+        UniqueConstraint(
+            "account_name", "connector_name", "exchange_trade_id",
+            name="uq_trade_scoped_exchange_trade_id"
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
 
     # Trade identification
     trade_id = Column(String, nullable=False, unique=True, index=True)
+    # Scoped exchange identity (nullable: legacy rows / fills without an
+    # exchange-assigned id)
+    account_name = Column(String, nullable=True, index=True)
+    connector_name = Column(String, nullable=True, index=True)
+    exchange_trade_id = Column(String, nullable=True, index=True)
 
     # Timestamps
     timestamp = Column(TIMESTAMP(timezone=True), nullable=False, index=True)
