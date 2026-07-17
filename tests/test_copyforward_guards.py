@@ -16,6 +16,7 @@ raises ``docker.errors.NotFound``); the bot-run repo is mocked via ``AsyncMock``
 all filesystem via ``tmp_path``. No real Docker, no DB, no network.
 """
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -23,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from docker.errors import NotFound
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from services.resume_service import (
     GuardCheck,
     GuardReport,
@@ -81,12 +83,26 @@ def make_repo(rows=None, *, error=None):
     return repo
 
 
+_RETIREMENT_TS = "2026-07-12T23:05:00+00:00"
+# Full retirement evidence as the state machine persists it — the guard now
+# validates the evidence, not just the VERIFIED marker (CDX-005 / CDX-R04).
+VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _RETIREMENT_TS,
+})
+
+
 def graceful_row(instance_name):
-    """A bot_runs row for a clean, graceful stop (STOPPED + end marker)."""
+    """A bot_runs row for a clean, graceful stop: STOPPED + end marker +
+    VERIFIED retirement with full evidence (CDX-005 — neither STOPPED nor
+    the bare marker is trusted)."""
     return SimpleNamespace(
         instance_name=instance_name,
         run_status="STOPPED",
         stopped_at=datetime(2026, 7, 12, 23, 5, 0),
+        retirement_status="VERIFIED",
+        retirement_evidence=VERIFIED_EVIDENCE_JSON,
     )
 
 

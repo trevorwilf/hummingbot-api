@@ -9,6 +9,39 @@ from .models import Base
 
 logger = logging.getLogger(__name__)
 
+# Lightweight startup migrations: (table, column, ALTER SQL). Module-level so
+# tests can execute the EXACT production statements (and the routine itself)
+# against a real database — tests/test_retirement_fsm.py runs the bot_runs
+# ALTERs on a pre-migration schema to prove legacy rows land UNVERIFIED.
+STARTUP_MIGRATIONS = [
+    # Add controller_id to executors table (default "main" for existing rows)
+    (
+        "executors", "controller_id",
+        "ALTER TABLE executors ADD COLUMN controller_id TEXT NOT NULL DEFAULT 'main'"
+    ),
+    # Add error_log to executors table for storing errors on failed executors
+    (
+        "executors", "error_log",
+        "ALTER TABLE executors ADD COLUMN error_log TEXT"
+    ),
+    # Add cum_fees_quote to position_holds table for tracking fees
+    (
+        "position_holds", "cum_fees_quote",
+        "ALTER TABLE position_holds ADD COLUMN cum_fees_quote NUMERIC(30,18) NOT NULL DEFAULT 0"
+    ),
+    # CDX-005: acknowledged-retirement state machine evidence on bot_runs.
+    # Legacy rows get the UNVERIFIED default — existing STOPPED rows are
+    # unverified by definition.
+    (
+        "bot_runs", "retirement_status",
+        "ALTER TABLE bot_runs ADD COLUMN retirement_status TEXT NOT NULL DEFAULT 'UNVERIFIED'"
+    ),
+    (
+        "bot_runs", "retirement_evidence",
+        "ALTER TABLE bot_runs ADD COLUMN retirement_evidence TEXT"
+    ),
+]
+
 
 class AsyncDatabaseManager:
     def __init__(self, database_url: str):
@@ -58,24 +91,7 @@ class AsyncDatabaseManager:
 
     async def _run_migrations(self, conn):
         """Run lightweight schema migrations for existing tables."""
-        migrations = [
-            # Add controller_id to executors table (default "main" for existing rows)
-            (
-                "executors", "controller_id",
-                "ALTER TABLE executors ADD COLUMN controller_id TEXT NOT NULL DEFAULT 'main'"
-            ),
-            # Add error_log to executors table for storing errors on failed executors
-            (
-                "executors", "error_log",
-                "ALTER TABLE executors ADD COLUMN error_log TEXT"
-            ),
-            # Add cum_fees_quote to position_holds table for tracking fees
-            (
-                "position_holds", "cum_fees_quote",
-                "ALTER TABLE position_holds ADD COLUMN cum_fees_quote NUMERIC(30,18) NOT NULL DEFAULT 0"
-            ),
-        ]
-        for table, column, sql in migrations:
+        for table, column, sql in STARTUP_MIGRATIONS:
             try:
                 # Check if column already exists
                 result = await conn.execute(
@@ -85,9 +101,17 @@ class AsyncDatabaseManager:
                     ),
                     {"table": table, "column": column}
                 )
-                if result.fetchone() is None:
-                    await conn.execute(text(sql))
-                    logger.info(f"Migration: added {column} to {table}")
+                column_missing = result.fetchone() is None
+            except Exception as e:
+                # No information_schema (e.g. sqlite): attempt the ALTER anyway;
+                # the duplicate-column swallow below handles repeat startups.
+                logger.debug(f"Migration existence probe failed for {table}.{column}: {e}")
+                column_missing = True
+            if not column_missing:
+                continue
+            try:
+                await conn.execute(text(sql))
+                logger.info(f"Migration: added {column} to {table}")
             except Exception as e:
                 # Column-already-exists is expected on repeat startups
                 err_msg = str(e).lower()

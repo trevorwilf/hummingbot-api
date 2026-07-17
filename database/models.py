@@ -187,7 +187,21 @@ class BotRun(Base):
 
     # Status tracking
     deployment_status = Column(String, nullable=False, default="DEPLOYED", index=True)  # DEPLOYED, FAILED, ARCHIVED
+    # run_status STOPPED is descriptive, NOT evidence of a clean retirement
+    # (CDX-005): consumers that need a verified stop must check
+    # retirement_status == "VERIFIED" below.
     run_status = Column(String, nullable=False, default="CREATED", index=True)  # CREATED, RUNNING, STOPPED, ERROR
+
+    # Acknowledged-retirement state machine (CDX-005 / CDX-M03).
+    # retirement_status: UNVERIFIED | VERIFIED. VERIFIED is persisted ONLY by
+    # BotRunRepository.finalize_bot_run_retirement once every retirement
+    # postcondition carries evidence; rows predating this schema default to
+    # UNVERIFIED (existing STOPPED rows are unverified by definition).
+    retirement_status = Column(String, nullable=False, default="UNVERIFIED",
+                               server_default="UNVERIFIED", index=True)
+    # JSON dict of per-stage evidence timestamps/fields (stop ack, zero open
+    # orders confirmation, fill drain, clean exit, archive, ...).
+    retirement_evidence = Column(Text, nullable=True)
 
     # Configuration and final state
     deployment_config = Column(Text, nullable=True)  # JSON of full deployment config

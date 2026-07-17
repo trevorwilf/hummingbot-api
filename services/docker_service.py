@@ -424,7 +424,9 @@ class DockerService:
                 "state": {
                     "status": container.status,
                     "running": container.status == "running",
-                    "exit_code": getattr(container.attrs.get("State", {}), "ExitCode", None)
+                    # NB: attrs["State"] is a dict — getattr() on it always
+                    # returned None, which made exit codes unobservable.
+                    "exit_code": (container.attrs.get("State") or {}).get("ExitCode")
                 }
             }
         except DockerException as e:

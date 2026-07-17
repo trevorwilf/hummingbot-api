@@ -7,6 +7,83 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import BotRun
 
+# ---------------------------------------------------------------------------
+# Acknowledged-retirement state machine (CDX-005 / CDX-M03)
+# ---------------------------------------------------------------------------
+# A bot run is VERIFIED-retired only when every postcondition below carries
+# persisted evidence. Anything less — legacy rows, timeouts, missing acks,
+# dirty exits — stays UNVERIFIED. Evidence comes from confirmed data only
+# (bot RPC response messages, the API's own order records, Docker container
+# state); MQTT publish success is never evidence (utils/mqtt_manager.py:
+# publish proves broker delivery, not that the bot did anything).
+RETIREMENT_VERIFIED = "VERIFIED"
+RETIREMENT_UNVERIFIED = "UNVERIFIED"
+
+# Evidence keys required (non-None) before VERIFIED may be persisted. Each is
+# an ISO-8601 UTC timestamp except skip_order_cancellation (bool, recorded so
+# the evidence shows whether cancellation was requested or skipped):
+#   initiated_at                  — retirement state machine started
+#   skip_order_cancellation       — the stop request's cancellation flag
+#   stop_requested_at             — stop command reached the broker
+#   stop_ack_at                   — the bot's own RPC reply to the stop command
+#                                   with SUCCESS status (the command was
+#                                   RECEIVED AND ACCEPTED — with async_backend
+#                                   this is scheduling, not completion; error,
+#                                   malformed or absent replies are never acks)
+#   quiescence_confirmed_at       — the bot's status RPC reports that no
+#                                   strategy is running. The engine clears
+#                                   trading_core.strategy only at the END of
+#                                   stop_loop() — after StrategyV2Base.on_stop()
+#                                   (controllers stopped, executors stored),
+#                                   exchange-acknowledged cancel_all, connector
+#                                   removal and markets-recorder shutdown — so
+#                                   this reply is the bot's own confirmation
+#                                   that the graceful stop ran to COMPLETION
+#                                   (engine client/command/stop_command.py,
+#                                   remote_iface/mqtt.py:_on_cmd_status)
+#   zero_open_orders_confirmed_at — the API's order records show zero active
+#                                   orders for the run's account, observed
+#                                   AFTER quiescence (before the bot confirms
+#                                   its stop finished a momentary zero proves
+#                                   nothing; independent of cancellation —
+#                                   see fill drain below)
+#   fills_drained_at              — zero active orders still held after the
+#                                   final-fill drain window
+#   state_flushed_at              — quiescence confirmed AND container exited
+#                                   with code 0: the durable-state shutdown
+#                                   path completed and the process did not die
+#                                   dirty afterwards (exit 0 ALONE is never
+#                                   flush evidence)
+#   process_exited_at             — container observed in the exited state
+#   archived_at                   — bot data archive completed
+REQUIRED_RETIREMENT_EVIDENCE = (
+    "initiated_at",
+    "skip_order_cancellation",
+    "stop_requested_at",
+    "stop_ack_at",
+    "quiescence_confirmed_at",
+    "zero_open_orders_confirmed_at",
+    "fills_drained_at",
+    "state_flushed_at",
+    "process_exited_at",
+    "archived_at",
+)
+
+
+def missing_retirement_evidence(evidence: Dict[str, Any]) -> List[str]:
+    """Return the evidence keys still missing for a VERIFIED retirement.
+
+    ``is None`` (not falsy) — ``skip_order_cancellation=False`` is present
+    evidence. When cancellation was NOT skipped, the request marker
+    ``cancellation_requested_at`` is additionally required; when it WAS
+    skipped, verification remains possible only through the independent
+    zero-open-orders confirmation, which is already in the required set.
+    """
+    missing = [k for k in REQUIRED_RETIREMENT_EVIDENCE if evidence.get(k) is None]
+    if evidence.get("skip_order_cancellation") is False and evidence.get("cancellation_requested_at") is None:
+        missing.append("cancellation_requested_at")
+    return missing
+
 
 class BotRunRepository:
     def __init__(self, session: AsyncSession):
@@ -75,16 +152,84 @@ class BotRunRepository:
         stmt = select(BotRun).where(
             BotRun.bot_name == bot_name
         ).order_by(desc(BotRun.deployed_at))
-        
+
         result = await self.session.execute(stmt)
         bot_run = result.scalar_one_or_none()
-        
+
         if bot_run:
             bot_run.deployment_status = "ARCHIVED"
             bot_run.stopped_at = datetime.now(timezone.utc)
             await self.session.flush()
             await self.session.refresh(bot_run)
-            
+
+        return bot_run
+
+    async def _latest_open_run(self, bot_name: str) -> Optional[BotRun]:
+        """The newest not-yet-archived run for ``bot_name`` — the retirement
+        target. Includes rows already flipped to STOPPED by the plain stop-bot
+        route, so a stop-then-archive sequence still accumulates evidence."""
+        stmt = select(BotRun).where(
+            and_(
+                BotRun.bot_name == bot_name,
+                BotRun.deployment_status == "DEPLOYED",
+            )
+        ).order_by(desc(BotRun.deployed_at))
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def update_bot_run_retirement_evidence(
+        self, bot_name: str, evidence: Dict[str, Any]
+    ) -> Optional[BotRun]:
+        """Persist in-progress retirement evidence WITHOUT changing any status.
+
+        Called after each stage of the retirement state machine so a crash
+        mid-retirement leaves an audit trail. Never touches ``run_status`` or
+        ``retirement_status`` — an interrupted retirement stays exactly as
+        fail-closed as it was.
+        """
+        bot_run = await self._latest_open_run(bot_name)
+        if bot_run:
+            bot_run.retirement_evidence = json.dumps(evidence)
+            await self.session.flush()
+            await self.session.refresh(bot_run)
+        return bot_run
+
+    async def finalize_bot_run_retirement(
+        self,
+        bot_name: str,
+        evidence: Dict[str, Any],
+        final_status: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> Optional[BotRun]:
+        """Terminal write of the retirement state machine (CDX-005).
+
+        ``retirement_status`` is computed HERE, from the evidence itself —
+        there is deliberately no caller-supplied ``verified`` flag, so a
+        verified-STOPPED row cannot be persisted before every postcondition
+        (exchange-confirmed zero open orders included) carries evidence.
+        Missing evidence or an error → UNVERIFIED, with the missing keys
+        recorded in the persisted evidence for the operator.
+        """
+        bot_run = await self._latest_open_run(bot_name)
+        if not bot_run:
+            return None
+
+        missing = missing_retirement_evidence(evidence)
+        verified = not missing and error_message is None
+
+        persisted = dict(evidence)
+        if missing:
+            persisted["missing_evidence"] = missing
+
+        bot_run.run_status = "STOPPED" if error_message is None else "ERROR"
+        bot_run.stopped_at = datetime.now(timezone.utc)
+        if final_status is not None:
+            bot_run.final_status = json.dumps(final_status)
+        bot_run.error_message = error_message
+        bot_run.retirement_evidence = json.dumps(persisted)
+        bot_run.retirement_status = RETIREMENT_VERIFIED if verified else RETIREMENT_UNVERIFIED
+        await self.session.flush()
+        await self.session.refresh(bot_run)
         return bot_run
 
     async def get_bot_runs(

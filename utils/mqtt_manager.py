@@ -2,9 +2,10 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 import aiomqtt
 
@@ -379,6 +380,73 @@ class MQTTManager:
             logger.error(f"Error sending command and waiting for response: {e}")
             self._pending_responses.pop(reply_to_topic, None)
             return None
+
+    async def publish_command_with_ack(
+        self,
+        bot_id: str,
+        command: str,
+        data: Dict[str, Any],
+        timeout: float = 30.0,
+        qos: int = 1,
+        on_published: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        """Publish a command and wait for the bot's own RPC response,
+        reporting publication and acknowledgement SEPARATELY.
+
+        ``publish_command``'s True return proves only that the broker took the
+        message — not that the bot received or acted on it (CDX-005). Callers
+        that need evidence of bot behavior must use the ``response`` field
+        here, which carries the bot's actual reply message.
+
+        The reply topic carries a UUID: a millisecond timestamp alone collides
+        across concurrent commands, silently replacing one pending future with
+        another and attributing an acknowledgement to the wrong bot.
+
+        ``on_published`` (optional) is awaited immediately after the broker
+        accepts the publish, BEFORE the response wait — so callers can persist
+        "request sent" evidence at the true stage boundary instead of after a
+        potentially long acknowledgement wait. Its failure never changes the
+        result: publication has already objectively happened.
+
+        Returns:
+            ``{"published": False, "response": None}`` — never reached the broker.
+            ``{"published": True,  "response": None}`` — published, but the bot
+            did not answer within ``timeout`` (NOT evidence of anything).
+            ``{"published": True,  "response": <msg>}`` — the bot's response.
+        """
+        if not self._connected or not self._client:
+            logger.error("Not connected to MQTT broker")
+            return {"published": False, "response": None}
+
+        reply_to_topic = f"hummingbot-api/response/{int(time.time() * 1000)}-{uuid.uuid4().hex}"
+        future = asyncio.Future()
+        self._pending_responses[reply_to_topic] = future
+
+        try:
+            try:
+                published = await self._publish_command_with_reply_to(bot_id, command, data, reply_to_topic, qos)
+            except Exception as e:
+                logger.error(f"Error sending command '{command}' to {bot_id}: {e}")
+                return {"published": False, "response": None}
+            if not published:
+                return {"published": False, "response": None}
+
+            if on_published is not None:
+                try:
+                    await on_published()
+                except Exception as e:
+                    logger.error(f"on_published callback failed for '{command}' to {bot_id}: {e}")
+
+            try:
+                response = await asyncio.wait_for(future, timeout=timeout)
+                return {"published": True, "response": response}
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"⏰ Timeout waiting for ack from {bot_id} for command '{command}' on {reply_to_topic}"
+                )
+                return {"published": True, "response": None}
+        finally:
+            self._pending_responses.pop(reply_to_topic, None)
 
     async def _publish_command_with_reply_to(
         self, bot_id: str, command: str, data: Dict[str, Any], reply_to: str, qos: int = 1

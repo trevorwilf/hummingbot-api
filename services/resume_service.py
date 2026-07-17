@@ -34,6 +34,10 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from database.repositories.bot_run_repository import (
+    RETIREMENT_VERIFIED,
+    missing_retirement_evidence,
+)
 from services.controller_id_contract import classify_controller_id
 from services.ledger_envelope_contract import classify_ledger_envelope
 from services.state_file_contract import (
@@ -1324,8 +1328,14 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
 _ACTIVE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
 
 # API ``bot_runs.run_status`` value that denotes a clean, graceful stop
-# (database/models.py:190 — CREATED / RUNNING / STOPPED / ERROR). Anything else
+# (database/models.py — CREATED / RUNNING / STOPPED / ERROR). Anything else
 # (or a missing end marker / absent row) is treated as ungraceful (§7.5).
+# CDX-005: STOPPED alone is NOT trusted — the row must also carry
+# ``retirement_status == RETIREMENT_VERIFIED``, written only by the
+# acknowledged-retirement state machine once every postcondition (stop ack,
+# exchange-confirmed zero open orders, fill drain, clean exit, archive) has
+# persisted evidence. Legacy rows predate that schema and are UNVERIFIED by
+# definition.
 _GRACEFUL_RUN_STATUS = "STOPPED"
 
 # Destination state-file globs whose presence means the new ``data/`` is not the
@@ -1582,17 +1592,42 @@ async def _latest_source_run(source: "ResolvedSource", bot_run_repo):
     return None
 
 
+def _parse_retirement_evidence(raw) -> Optional[Dict]:
+    """``bot_runs.retirement_evidence`` (JSON text) → dict, else None.
+
+    None / empty / unparseable / non-dict all map to None — absent or
+    malformed evidence can never validate (fail-closed, CDX-005)."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 async def _guard_ungraceful_source(
     source: "ResolvedSource", deployment, bot_run_repo, report: GuardReport
 ) -> None:
-    """§7.5 — advisory: the source should have stopped gracefully.
+    """§7.5 — advisory: the source must have VERIFIABLY retired (CDX-005).
 
     The source's most recent ``bot_runs`` row is graceful iff its ``run_status``
-    is ``STOPPED`` AND it carries an end marker (``stopped_at``). A non-stopped /
-    errored status, a missing end marker, or an absent row (unknown history) is
-    ungraceful → ``UNGRACEFUL_SOURCE`` unless ``resume_accept_ungraceful=True``,
-    in which case the guard PASSES with a loud warning recorded. Exchange
-    open-order verification is the operator runbook's job, not the hook's.
+    is ``STOPPED`` AND it carries an end marker (``stopped_at``) AND its
+    ``retirement_status`` is ``VERIFIED`` AND its persisted
+    ``retirement_evidence`` actually VALIDATES — parses to a dict carrying
+    every postcondition the state machine requires (the same
+    ``missing_retirement_evidence`` predicate the writer used). The marker
+    alone is never trusted: ``retirement_status`` is an unconstrained column,
+    so a bare/hand-set ``VERIFIED`` with null, malformed or incomplete
+    evidence is treated as unverified (CDX-005). A non-stopped / errored
+    status, a missing end marker, an absent row (unknown history), or an
+    UNVERIFIED/unevidenced retirement — which includes EVERY legacy STOPPED
+    row predating the evidence schema — is ungraceful →
+    ``UNGRACEFUL_SOURCE`` unless the explicit human override
+    ``resume_accept_ungraceful=True`` is set, in which case the guard PASSES
+    with a loud warning recorded. Default is refusal.
     """
     accept = bool(getattr(deployment, "resume_accept_ungraceful", False))
     run = await _latest_source_run(source, bot_run_repo)
@@ -1606,11 +1641,37 @@ async def _guard_ungraceful_source(
     else:
         status = getattr(run, "run_status", None)
         stopped_at = getattr(run, "stopped_at", None)
-        graceful = status == _GRACEFUL_RUN_STATUS and stopped_at is not None
+        retirement = getattr(run, "retirement_status", None)
+        evidence = _parse_retirement_evidence(getattr(run, "retirement_evidence", None))
+        evidence_gaps = missing_retirement_evidence(evidence) if evidence is not None else None
+        graceful = (
+            status == _GRACEFUL_RUN_STATUS
+            and stopped_at is not None
+            and retirement == RETIREMENT_VERIFIED
+            and evidence_gaps == []
+        )
         detail = (
             f"Source '{source.instance_name}' last run_status={status!r}, "
-            f"stopped_at={stopped_at!r}."
+            f"stopped_at={stopped_at!r}, retirement_status={retirement!r}."
         )
+        if not graceful and status == _GRACEFUL_RUN_STATUS:
+            if retirement != RETIREMENT_VERIFIED:
+                detail += (
+                    " STOPPED without VERIFIED retirement evidence (legacy row or"
+                    " unconfirmed stop) is UNVERIFIED by definition (CDX-005)."
+                )
+            elif evidence is None:
+                detail += (
+                    " retirement_status=VERIFIED but the persisted retirement"
+                    " evidence is absent or malformed — the marker alone is never"
+                    " trusted (CDX-005); treated as unverified."
+                )
+            elif evidence_gaps:
+                detail += (
+                    f" retirement_status=VERIFIED but the persisted evidence is"
+                    f" missing postconditions {evidence_gaps} — the marker alone"
+                    f" is never trusted (CDX-005); treated as unverified."
+                )
 
     if graceful:
         report._record("graceful_source", True, f"Graceful stop confirmed. {detail}")

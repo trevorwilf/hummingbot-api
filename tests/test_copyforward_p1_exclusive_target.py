@@ -38,6 +38,7 @@ import pytest
 import yaml
 from docker.errors import NotFound
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from models import V2ControllerDeployment
 from services import docker_service
 from ledger_fixtures import valid_ledger_payload
@@ -196,13 +197,26 @@ def make_deployment(**overrides):
     return V2ControllerDeployment(**kwargs)
 
 
+_RETIREMENT_TS = "2026-07-10T12:00:00+00:00"
+_VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _RETIREMENT_TS,
+})
+
+
 def graceful_repo(*names):
-    """A bot_run_repo whose lineage rows are all gracefully stopped."""
+    """A bot_run_repo whose lineage rows are all gracefully stopped
+    (STOPPED + VERIFIED retirement with full evidence — CDX-005/CDX-R04)."""
     repo = MagicMock()
     repo.get_bot_runs = AsyncMock(
         return_value=[
             SimpleNamespace(
-                instance_name=n, run_status="STOPPED", stopped_at=datetime(2026, 7, 10, 12, 0, 0)
+                instance_name=n,
+                run_status="STOPPED",
+                stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+                retirement_status="VERIFIED",
+                retirement_evidence=_VERIFIED_EVIDENCE_JSON,
             )
             for n in names
         ]

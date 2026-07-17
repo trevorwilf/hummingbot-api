@@ -49,6 +49,7 @@ import pytest
 import yaml
 from docker.errors import NotFound
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from models import V2ControllerDeployment
 from ledger_fixtures import valid_ledger_payload
 from services.docker_service import DockerService
@@ -215,11 +216,23 @@ def make_deployment(**overrides):
     return V2ControllerDeployment(**kwargs)
 
 
+_RETIREMENT_TS = "2026-07-10T12:00:00+00:00"
+_VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _RETIREMENT_TS,
+})
+
+
 def graceful_row(instance_name):
+    # CDX-005: neither STOPPED nor the bare VERIFIED marker is trusted —
+    # graceful requires VERIFIED retirement WITH full evidence (CDX-R04).
     return SimpleNamespace(
         instance_name=instance_name,
         run_status="STOPPED",
         stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+        retirement_status="VERIFIED",
+        retirement_evidence=_VERIFIED_EVIDENCE_JSON,
     )
 
 
