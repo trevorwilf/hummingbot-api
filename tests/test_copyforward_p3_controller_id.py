@@ -35,6 +35,7 @@ import pytest
 import yaml
 
 import services.resume_service as resume_service
+from ledger_fixtures import valid_ledger_payload
 from services.controller_id_contract import (
     ControllerIdStatus,
     classify_controller_id,
@@ -97,10 +98,18 @@ def write_controller(
     (cdir / filename).write_text(yaml.safe_dump(doc), encoding="utf-8")
 
 
-def write_ledger(source, filename, owner_id):
-    """A real ledger in the source ``data/``, with its ``.owner`` sidecar."""
+def write_ledger(source, filename, owner_id, ledger_controller_id="ctrl_a"):
+    """A real ledger in the source ``data/``, with its ``.owner`` sidecar.
+
+    The body is a VALID engine envelope (CDX-M02, phase 4). It was
+    ``{"seed_value_quote": 100}`` — accepted by the old length+JSON validator, but
+    never a ledger the engine would load. ``ledger_controller_id`` is the ledger's
+    INTERNAL id and must equal the CANONICAL (stripped) id of the controller under
+    test; it is separate from ``owner_id`` so the owner-mismatch tests still
+    isolate the SIDECAR as the only disagreeing party.
+    """
     (source.data_dir / filename).write_text(
-        json.dumps({"seed_value_quote": 100}), encoding="utf-8"
+        json.dumps(valid_ledger_payload(ledger_controller_id)), encoding="utf-8"
     )
     (source.data_dir / f"{filename}.owner").write_text(
         json.dumps({"controller_id": owner_id, "pid": 1}), encoding="utf-8"
@@ -231,7 +240,7 @@ class TestC2AbortsTheDeploy:
         FIND a ledger would pass the cases above for the wrong reason.
         """
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_   .json", owner_id="   ")
+        write_ledger(src, "range_inventory_ladder_   .json", owner_id="   ", ledger_controller_id="   ")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="   ")
 
@@ -288,7 +297,7 @@ class TestAbortLeavesNoPartialPlan:
         check would have planned the good one and only then hit the bad one.
         """
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good")
+        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good", ledger_controller_id="ctrl_good")
         new = new_instance(tmp_path)
         write_controller(new, "a_good.yml", controller_id="ctrl_good")
         write_controller(new, "b_bad.yml", controller_id="   ")
@@ -305,7 +314,7 @@ class TestAbortLeavesNoPartialPlan:
         recorded anything under ANY conditions, ``spy == []`` would prove nothing.
         """
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good")
+        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good", ledger_controller_id="ctrl_good")
         new = new_instance(tmp_path)
         write_controller(new, "a_good.yml", controller_id="ctrl_good")
 
@@ -332,7 +341,7 @@ class TestCanonicalIdIsUsedDownstream:
 
     def test_padded_id_is_planned_under_the_stripped_id(self, tmp_path):
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_pad.json", owner_id="ctrl_pad")
+        write_ledger(src, "range_inventory_ladder_ctrl_pad.json", owner_id="ctrl_pad", ledger_controller_id="ctrl_pad")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="  ctrl_pad  ")
 
@@ -359,7 +368,7 @@ class TestCanonicalIdIsUsedDownstream:
         rather than the filename, so it exercises the canonical '.owner' match on
         its own."""
         src = make_source(tmp_path)
-        write_ledger(src, "custom.json", owner_id="ctrl_pad")
+        write_ledger(src, "custom.json", owner_id="ctrl_pad", ledger_controller_id="ctrl_pad")
         new = new_instance(tmp_path)
         write_controller(
             new, "c.yml", controller_id=" ctrl_pad ", state_file_name="custom.json"
@@ -379,7 +388,7 @@ class TestCanonicalIdIsUsedDownstream:
         ``test_numerically_typed_owner_id_is_a_mismatch``'s job.
         """
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_pad.json", owner_id="somebody_else")
+        write_ledger(src, "range_inventory_ladder_ctrl_pad.json", owner_id="somebody_else", ledger_controller_id="ctrl_pad")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="  ctrl_pad  ")
 
@@ -400,7 +409,7 @@ class TestCanonicalIdIsUsedDownstream:
         unverifiable provenance is copied into a live trading instance.
         """
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_123.json", owner_id=123)
+        write_ledger(src, "range_inventory_ladder_123.json", owner_id=123, ledger_controller_id="123")
         new = new_instance(tmp_path)
         write_controller(new, "c.yml", controller_id="123")
 
@@ -425,7 +434,7 @@ class TestScope:
 
     def test_non_ladder_controller_with_an_invalid_id_does_not_abort(self, tmp_path):
         src = make_source(tmp_path)
-        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good")
+        write_ledger(src, "range_inventory_ladder_ctrl_good.json", owner_id="ctrl_good", ledger_controller_id="ctrl_good")
         new = new_instance(tmp_path)
         write_controller(new, "a_good.yml", controller_id="ctrl_good")
         write_controller(
@@ -440,7 +449,7 @@ class TestScope:
         """The accept path still works end to end."""
         src = make_source(tmp_path)
         write_ledger(src, "range_inventory_ladder_ctrl_a.json", owner_id="ctrl_a")
-        write_ledger(src, "range_inventory_ladder_ctrl_b.json", owner_id="ctrl_b")
+        write_ledger(src, "range_inventory_ladder_ctrl_b.json", owner_id="ctrl_b", ledger_controller_id="ctrl_b")
         new = new_instance(tmp_path)
         write_controller(new, "a.yml", controller_id="ctrl_a")
         write_controller(new, "b.yml", controller_id="ctrl_b")

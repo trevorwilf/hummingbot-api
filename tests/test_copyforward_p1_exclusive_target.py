@@ -40,6 +40,7 @@ from docker.errors import NotFound
 
 from models import V2ControllerDeployment
 from services import docker_service
+from ledger_fixtures import valid_ledger_payload
 from services.docker_service import DockerService
 from services.resume_service import (
     ResumeAbortReason,
@@ -61,7 +62,15 @@ NEW_NAME = "LADDER_BOT-20260714-121212"
 CONTROLLER_ID = "ladder_xmr"
 CONTROLLER_FILE = "ladder_xmr.yml"
 LEDGER_NAME = f"range_inventory_ladder_{CONTROLLER_ID}.json"
-LEDGER_BYTES = json.dumps({"levels": [1, 2, 3], "seq": 42}).encode("utf-8")
+# A VALID engine ledger envelope (CDX-M02, phase 4). This was a placeholder
+# ({"levels": [1, 2, 3], ...}) back when the validator only checked length + UTF-8
+# + json.loads: valid JSON, but never a ledger the engine would load — it would
+# quarantine on load and re-seed from the wallet. The envelope validator rejects
+# it, so the fixture is now built from the engine's own contract. connector_name
+# must match TEMPLATE_CFG's, which the API compares the ledger against.
+LEDGER_BYTES = json.dumps(
+    valid_ledger_payload(CONTROLLER_ID, connector_name="kraken")
+).encode("utf-8")
 OWNER_BYTES = json.dumps({"controller_id": CONTROLLER_ID, "pid": 7}).encode("utf-8")
 SCRIPT_CONFIG = f"{NEW_NAME}.yml"
 IMAGE = "hummingbot/hummingbot:v2.9"

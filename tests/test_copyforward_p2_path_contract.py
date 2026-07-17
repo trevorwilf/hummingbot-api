@@ -46,6 +46,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from models.bot_orchestration import V2ControllerDeployment, V2ScriptDeployment
+from ledger_fixtures import valid_ledger_payload
 from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
@@ -205,7 +206,10 @@ def bots_tree(tmp_path, monkeypatch):
 
     src = bots / "instances" / SRC_NAME / "data"
     src.mkdir(parents=True)
-    (src / LEDGER_NAME).write_text(json.dumps({"levels": [1, 2], "seq": 7}), encoding="utf-8")
+    (src / LEDGER_NAME).write_text(
+        json.dumps(valid_ledger_payload(CONTROLLER_ID, connector_name="kraken")),
+        encoding="utf-8",
+    )
     (src / f"{LEDGER_NAME}.owner").write_text(
         json.dumps({"controller_id": CONTROLLER_ID, "pid": 7}), encoding="utf-8"
     )
@@ -331,7 +335,10 @@ class TestPreviewC1:
         target. Without this, "abort everything" would pass the tests above."""
         custom = "custom_ladder.json"
         src_data = bots_tree / "instances" / SRC_NAME / "data"
-        (src_data / custom).write_text(json.dumps({"levels": [3]}), encoding="utf-8")
+        (src_data / custom).write_text(
+            json.dumps(valid_ledger_payload(CONTROLLER_ID, connector_name="kraken")),
+            encoding="utf-8",
+        )
         (src_data / f"{custom}.owner").write_text(
             json.dumps({"controller_id": CONTROLLER_ID}), encoding="utf-8"
         )

@@ -34,6 +34,7 @@ from typing import Dict, List, Optional
 import yaml
 
 from services.controller_id_contract import classify_controller_id
+from services.ledger_envelope_contract import classify_ledger_envelope
 from services.state_file_contract import (
     ALLOW_ABSOLUTE_FIELD,
     StateFileStatus,
@@ -742,11 +743,35 @@ def _expected_ledger_name(
     return f"range_inventory_ladder_{canonical_controller_id}.json"
 
 
-def _validate_ledger(src_ledger: Path) -> None:
-    """Fail-closed if an expected ledger is zero-length or not parseable JSON.
+def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: str) -> None:
+    """Fail-closed unless an expected ledger is a VALID ENGINE ENVELOPE (CDX-M02).
 
     Never seed garbage — the engine would quarantine and re-seed from the wallet
     (the insufficient-funds bug this whole hook exists to prevent).
+
+    This used to check length + UTF-8 + ``json.loads`` and stop, which proved only
+    that the bytes were JSON. ``{"levels": [1, 2]}`` passed it, got copied forward
+    as a "resumed" ledger, and then quarantined engine-side on load — re-seeding
+    from the wallet anyway, but now with the operator believing state had been
+    carried. Syntax is not an envelope. The envelope rules live in
+    :mod:`services.ledger_envelope_contract`, mirrored from the engine.
+
+    The split is deliberate: this function owns the file (read errors, zero-length,
+    JSON syntax) and the contract module owns the envelope, exactly as the engine
+    splits ``_load_state`` from ``_validate_loaded_state``.
+
+    Args:
+        src_ledger: The source ledger path (already containment-checked).
+        config: The staged controller config, read for the identity fields the
+            engine will compare the ledger against at load. Fields it does not
+            carry are passed as None (unknowable, not assumed).
+        canonical_controller_id: The C2-CANONICAL (stripped) staged id. Passed in
+            rather than re-read from ``config`` so no unvalidated id reaches an
+            identity comparison — the same reasoning as :func:`_plan_controller`'s.
+
+    Raises:
+        ResumeError: ``LEDGER_INVALID`` on any read error, zero-length file, JSON
+            syntax error, or envelope violation. Every uncertainty is a refusal.
     """
     try:
         raw = src_ledger.read_bytes()
@@ -761,12 +786,44 @@ def _validate_ledger(src_ledger: Path) -> None:
             f"Expected ledger '{src_ledger}' is zero-length — refusing to seed garbage.",
         )
     try:
-        json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ResumeError(
             ResumeAbortReason.LEDGER_INVALID,
             f"Expected ledger '{src_ledger}' is not valid JSON ({exc}) — refusing to seed garbage.",
         )
+
+    verdict = classify_ledger_envelope(
+        payload,
+        canonical_controller_id=canonical_controller_id,
+        expected_controller_name=_expected_identity(config, "controller_name"),
+        expected_controller_type=_expected_identity(config, "controller_type"),
+        expected_connector_name=_expected_identity(config, "connector_name"),
+        expected_trading_pair=_expected_identity(config, "trading_pair"),
+    )
+    if not verdict.is_valid:
+        raise ResumeError(
+            ResumeAbortReason.LEDGER_INVALID,
+            f"Expected ledger '{src_ledger}' is not a valid engine ledger: {verdict.reason} "
+            f"Copying it forward would deploy a bot that quarantines this state on load and "
+            f"re-seeds from the wallet. Refusing to deploy (CDX-M02, fail-closed).",
+        )
+
+
+def _expected_identity(config: dict, field_name: str) -> Optional[str]:
+    """Return a staged-config identity value for the envelope comparison, or None.
+
+    None means "the staged config did not carry a usable value", and the contract
+    module SKIPS that comparison rather than inventing the engine's Pydantic model
+    default. A non-str (or blank) staged value is deliberately reported as
+    unknowable too: comparing the ledger against a value the engine would itself
+    reject or coerce would abort on the wrong evidence. The ledger's own field is
+    still type- and presence-checked by the contract either way.
+    """
+    value = config.get(field_name)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def _read_owner_controller_id(owner_path: Path) -> str:
@@ -953,8 +1010,11 @@ def _plan_controller(
         )
         return ledger_name
 
-    # Ledger present -> must be valid, else abort (never seed garbage).
-    _validate_ledger(src_ledger)
+    # Ledger present -> must be a valid engine envelope, else abort (never seed
+    # garbage). Runs BEFORE the .owner check on purpose: the envelope carries the
+    # controller's own identity claim, so a ledger that is not an engine ledger at
+    # all is rejected as such rather than as an owner mismatch.
+    _validate_ledger(src_ledger, config, controller_id)
 
     # Identity via .owner controller_id, never the filename (§6).
     if src_owner.exists():
