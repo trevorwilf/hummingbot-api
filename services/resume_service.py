@@ -78,6 +78,17 @@ class ResumeAbortReason(str, Enum):
     EXTRA_PATH_ESCAPE = "EXTRA_PATH_ESCAPE"
     EXTRA_PATH_MISSING = "EXTRA_PATH_MISSING"
     COPY_IO_ERROR = "COPY_IO_ERROR"
+    # CDX-015: a staged 'db_engine' outside the known set. The old code compared
+    # it to "sqlite" exactly and treated EVERY other value — including a typo or
+    # a casing variant like "SQLite" — as a live Postgres deployment with no
+    # per-instance sqlite to carry, silently dropping the source DB from the copy
+    # set. An unrecognised engine is now an abort, never a guess.
+    DB_ENGINE_UNKNOWN = "DB_ENGINE_UNKNOWN"
+    # CLA-008 P2: the source container's state could not be verified because the
+    # Docker client itself failed (API error, daemon unreachable). Distinct from
+    # SOURCE_RUNNING (verified active) and from NotFound (verified absent): here
+    # we know nothing, so we refuse rather than proceed on an unverified source.
+    SOURCE_STATE_UNVERIFIED = "SOURCE_STATE_UNVERIFIED"
 
 
 class ResumeError(Exception):
@@ -691,13 +702,63 @@ def _validate_staged_controller_ids(new_instance_dir: Path) -> List[tuple]:
     return staged
 
 
+_DB_ENGINE_SQLITE = "sqlite"
+_DB_ENGINE_POSTGRES_PREFIX = "postgres"
+
+
+def _classify_db_engine(engine) -> bool:
+    """CDX-015 — classify a staged ``db_mode.db_engine`` value. True == sqlite.
+
+    The old test was ``engine is None or engine == "sqlite"``: an exact,
+    case-sensitive comparison whose ELSE branch meant "Postgres, so there is no
+    per-instance sqlite to carry forward". Every value that was not literally
+    ``"sqlite"`` therefore took the Postgres path silently — ``"SQLite"``,
+    ``" sqlite "`` and a typo like ``"sqlkite"`` all dropped the source DB from
+    the copy set and the deploy still SUCCEEDED. That is fail-open on a value
+    nobody validates, so this normalizes and then refuses what it cannot name.
+
+    Args:
+        engine: The raw ``db_mode.db_engine`` value as staged (any YAML type).
+
+    Returns:
+        True for sqlite (carry the per-instance DB), False for Postgres (§15:
+        nothing per-instance to carry).
+
+    Raises:
+        ResumeError: ``DB_ENGINE_UNKNOWN`` for any value that is neither. An
+            unrecognised engine is genuine uncertainty about whether a DB must
+            be carried forward, and guessing either way is a silent data
+            decision — so it aborts.
+    """
+    if engine is None:
+        # Unset -> the engine's documented default (DBSqliteMode,
+        # client_config_map.py:772). This is not fail-open: it is the value the
+        # bot itself will use.
+        return True
+    normalized = str(engine).strip().casefold()
+    if normalized == _DB_ENGINE_SQLITE:
+        return True
+    if normalized.startswith(_DB_ENGINE_POSTGRES_PREFIX):
+        # "postgres", "postgresql", "postgresql+asyncpg", ... — DBOtherMode.
+        return False
+    raise ResumeError(
+        ResumeAbortReason.DB_ENGINE_UNKNOWN,
+        f"Staged conf_client.yml declares an unrecognised db_mode.db_engine "
+        f"{engine!r} (normalized: '{normalized}'). Refusing to deploy: the hook "
+        f"cannot tell whether a per-instance sqlite DB must be carried forward, "
+        f"and assuming Postgres would silently drop the source DB from the copy "
+        f"set. Expected 'sqlite' or a 'postgres...' engine (CDX-015, fail-closed).",
+    )
+
+
 def _is_sqlite_deployment(new_instance_dir: Path) -> bool:
     """Parse the staged ``conf_client.yml`` and decide if the engine DB is sqlite.
 
     The engine default is ``DBSqliteMode`` (client_config_map.py:772), so a
     missing file / missing ``db_mode`` block is treated as sqlite. A Postgres
-    (``DBOtherMode``) deployment carries ``db_mode.db_engine != "sqlite"`` and
-    has no per-instance sqlite to carry (§15).
+    (``DBOtherMode``) deployment carries a ``db_mode.db_engine`` naming Postgres
+    and has no per-instance sqlite to carry (§15). Anything else aborts — see
+    :func:`_classify_db_engine`.
     """
     conf_client = new_instance_dir / "conf" / "conf_client.yml"
     if not conf_client.is_file():
@@ -710,8 +771,7 @@ def _is_sqlite_deployment(new_instance_dir: Path) -> bool:
     db_mode = data.get("db_mode")
     if not isinstance(db_mode, dict):
         return True  # default sqlite
-    engine = db_mode.get("db_engine")
-    return engine is None or engine == "sqlite"
+    return _classify_db_engine(db_mode.get("db_engine"))
 
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1056,13 @@ def _plan_controller(
     # would have us WRITE.
     _assert_contained(src_ledger, source.data_dir, "source ledger path", controller_id)
     _assert_contained(new_data_dir / ledger_name, new_data_dir, "ledger destination", controller_id)
+    # The sidecar is guarded on the same terms as the ledger it describes: it is
+    # written to a path derived from the same (attacker-influenced) name, so it
+    # needs the same containment proof rather than inheriting the ledger's.
+    _assert_contained(src_owner, source.data_dir, "source owner sidecar path", controller_id)
+    _assert_contained(
+        new_data_dir / f"{ledger_name}.owner", new_data_dir, "owner sidecar destination", controller_id
+    )
 
     # No ledger in source -> warn + fresh seed for THIS controller only (§6 table).
     if not src_ledger.exists():
@@ -1021,8 +1088,19 @@ def _plan_controller(
                 f"Owner mismatch for ledger '{src_ledger}': sidecar claims controller "
                 f"'{owner_id}' but the deploy expects '{controller_id}'. Wrong ledger — failing closed.",
             )
+        # CLA-008 #7: the sidecar keeps the ledger's RELATIVE path, exactly as the
+        # ledger item below does. Using ``src_owner.name`` flattened it to the
+        # bare basename, so a state_file_name of 'sub/dir/x.json' copied the
+        # ledger to 'data/sub/dir/x.json' but its sidecar to 'data/x.json.owner'.
+        # The engine looks for the sidecar ADJACENT to the ledger, so the pair was
+        # separated: the ledger arrived with its identity marker missing.
         plan.items.append(
-            CopyItem(src=src_owner, dst=new_data_dir / src_owner.name, controller_id=controller_id, kind="owner")
+            CopyItem(
+                src=src_owner,
+                dst=new_data_dir / f"{ledger_name}.owner",
+                controller_id=controller_id,
+                kind="owner",
+            )
         )
     else:
         # No sidecar. A custom state_file_name carries no id in its name, so
@@ -1331,19 +1409,48 @@ def _guard_source_container(source: "ResolvedSource", docker_client, report: Gua
     ledger). ``NotFound`` → PASS: the container object is gone, so the
     directory-on-disk is an acceptable source. No PID / ``.owner``-liveness
     checks — Docker state is the only valid stopped-check (§2.2).
+
+    CLA-008 P2: any OTHER Docker failure (API error, daemon unreachable) used to
+    escape as an opaque 500 from whatever handler caught it last. A 500 reads as
+    "the API broke", not as "we never verified the source was stopped" — and that
+    verification is the guard's whole job. An unreachable daemon is not evidence
+    of a quiesced container, so it now refuses with ``SOURCE_STATE_UNVERIFIED``
+    (409) rather than proceeding against a source that may still be running and
+    writing to the ledger.
+
+    Only Docker-client exceptions are mapped. Programming errors (``TypeError``,
+    ``AttributeError``) propagate untouched: a blanket ``except Exception`` here
+    would turn our own bugs into a tidy "could not verify" 409 that blames the
+    daemon and hides them.
     """
-    from docker.errors import NotFound
+    from docker.errors import DockerException, NotFound
+    from requests.exceptions import RequestException
 
     name = source.instance_name
     try:
         container = docker_client.containers.get(name)
     except NotFound:
+        # Verified ABSENT. NotFound subclasses APIError, so this arm must stay
+        # ahead of the DockerException arm below or a gone container would
+        # become a refusal.
         report._record(
             "source_container",
             True,
             f"No container named '{name}' — source is a stopped/removed instance on disk.",
         )
         return
+    except (DockerException, RequestException) as exc:
+        # DockerException covers APIError and friends; RequestException covers the
+        # transport layer beneath docker-py (daemon down, socket refused, timeout),
+        # which does NOT subclass DockerException.
+        _abort_guard(
+            ResumeAbortReason.SOURCE_STATE_UNVERIFIED,
+            f"Source container state could not be verified for '{name}': the Docker "
+            f"client failed with {type(exc).__name__}: {exc}. Refusing to deploy — an "
+            f"unverifiable source may still be running and holding the ledger "
+            f"(CLA-008 P2, fail-closed).",
+            report,
+        )
 
     status = getattr(container, "status", None)
     if status in _ACTIVE_CONTAINER_STATES:
