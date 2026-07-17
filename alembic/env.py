@@ -8,14 +8,13 @@ Runs under two callers:
 so the URL may name either an async driver (postgresql+asyncpg) or a sync one
 (sqlite). Both are handled below; the dialect decides, not a string guess.
 """
-import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import create_engine, pool
-from sqlalchemy.engine import Connection, make_url
+from sqlalchemy.engine import Connection
 
 # alembic.ini sets prepend_sys_path=. so the app package is importable.
+from database.migration_runner import run_online_migrations
 from database.models import Base  # noqa: F401  (registers all models on Base.metadata)
 
 config = context.config
@@ -47,18 +46,17 @@ def _database_url() -> str:
     return settings.database.url
 
 
-def _is_async_url(url: str) -> bool:
-    """True when the URL's dialect requires an async driver."""
-    return bool(getattr(make_url(url).get_dialect(), "is_async", False))
-
-
 def _configure(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        # Type/default comparison is enabled so a drifted column is caught by
-        # the schema-parity check rather than silently ignored.
+        # Type AND server-default comparison are enabled so a drifted column —
+        # including a wrong DEFAULT — is caught by the schema-parity check
+        # rather than silently ignored (CDX-R04). compare_server_default is off
+        # by default in alembic, which is exactly why the parity guard needs it
+        # explicitly.
         compare_type=True,
+        compare_server_default=True,
         render_as_batch=connection.dialect.name == "sqlite",
     )
 
@@ -81,30 +79,11 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-async def _run_async_migrations(url: str) -> None:
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    connectable = create_async_engine(url, poolclass=pool.NullPool)
-    try:
-        async with connectable.connect() as connection:
-            await connection.run_sync(_do_run_migrations)
-            await connection.commit()
-    finally:
-        await connectable.dispose()
-
-
 def run_migrations_online() -> None:
-    url = _database_url()
-    if _is_async_url(url):
-        asyncio.run(_run_async_migrations(url))
-        return
-    connectable = create_engine(url, poolclass=pool.NullPool)
-    try:
-        with connectable.connect() as connection:
-            _do_run_migrations(connection)
-            connection.commit()
-    finally:
-        connectable.dispose()
+    # Routing (sync vs async engine, by dialect) lives in an importable helper
+    # so it can be falsification-tested without a live database (CDX-R05);
+    # env.py itself runs migrations at import and cannot be imported for that.
+    run_online_migrations(_database_url(), _do_run_migrations)
 
 
 if context.is_offline_mode():

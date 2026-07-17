@@ -120,11 +120,16 @@ class TestUpgradeBuildsSchema:
         """Schema parity: autogenerate against a database at head is empty.
 
         This is what makes the baseline trustworthy — if a revision drifts from
-        database/models.py in any column, type or index, this fails.
+        database/models.py in any column, type, index OR server default, this
+        fails. compare_server_default is enabled explicitly (it is OFF by
+        default in alembic); without it a wrong DEFAULT in a migration would
+        slip past this "exact" check (CDX-R04).
         """
         url = upgrade_to(tmp_path, "head")
         with create_engine(url).connect() as conn:
-            context = MigrationContext.configure(conn, opts={"compare_type": True})
+            context = MigrationContext.configure(
+                conn, opts={"compare_type": True, "compare_server_default": True}
+            )
             diff = compare_metadata(context, Base.metadata)
         assert diff == [], f"schema at head drifted from models: {diff}"
 
@@ -398,11 +403,61 @@ class TestDeadCodeRemoved:
         assert not hasattr(AsyncDatabaseManager, "_create_unique_indexes")
 
     def test_startup_path_calls_the_verification(self):
-        """The check must be on the REAL startup path, not a helper nobody
-        calls: main.py's lifespan must verify, and must not build tables."""
+        """Cheap sanity check: main.py references the verification and no longer
+        builds tables. NOT sufficient on its own (a substring survives an
+        `if False:` guard) — the real wiring is proven by
+        test_lifespan_aborts_when_schema_not_at_head below (CDX-R02)."""
         main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
         assert "verify_schema_at_head()" in main_source
         assert "create_tables()" not in main_source
+
+    @pytest.mark.asyncio
+    async def test_lifespan_aborts_when_schema_not_at_head(self, monkeypatch):
+        """The REAL FastAPI lifespan must abort startup when the schema check
+        fails — not merely mention it (CDX-R02).
+
+        Every startup side effect BEFORE the schema check is neutralised, the
+        database manager is made to report a bad schema, and the actual
+        `main.lifespan` context is entered. Correct code awaits the check at
+        main.py:145 and the MigrationStateError propagates out of startup.
+
+        Mutation this catches: main.py:145 -> `if False: await
+        db_manager.verify_schema_at_head()`. The check is then never awaited, no
+        MigrationStateError is raised, and this test fails (the older
+        substring/helper tests kept passing under exactly that mutation).
+        """
+        import sys
+        from unittest.mock import AsyncMock, MagicMock
+
+        # logfire is an optional runtime dep not installed in this test env, and
+        # main.py configures it at import. Stub it so the REAL main module (and
+        # its real lifespan) can be imported; everything else in main imports
+        # normally here.
+        monkeypatch.setitem(sys.modules, "logfire", MagicMock())
+        import main
+
+        # Neutralise the pre-check startup side effects (main.py:108-141).
+        monkeypatch.setattr(
+            main.BackendAPISecurity, "new_password_required", staticmethod(lambda: False)
+        )
+        monkeypatch.setattr(main, "ETHKeyFileSecretManger", MagicMock())
+        monkeypatch.setattr(main.GatewayHttpClient, "get_instance", MagicMock())
+        # http gateway URL -> the mTLS cert-sync branch (which imports extra
+        # modules) is skipped; the check still runs right after.
+        monkeypatch.setattr(main.settings.gateway, "url", "http://localhost:15888")
+
+        # The database reports it is NOT at head.
+        failing_manager = MagicMock()
+        failing_manager.verify_schema_at_head = AsyncMock(
+            side_effect=MigrationStateError("schema behind head")
+        )
+        monkeypatch.setattr(main, "AsyncDatabaseManager", MagicMock(return_value=failing_manager))
+
+        with pytest.raises(MigrationStateError):
+            async with main.lifespan(MagicMock()):
+                pytest.fail("startup must abort at the schema check, never reach the body")
+
+        failing_manager.verify_schema_at_head.assert_awaited_once()
 
 
 # ===========================================================================
@@ -420,17 +475,138 @@ class TestMigrateServiceCompatibility:
         assert (REPO_ROOT / "alembic" / "env.py").is_file()
         assert (REPO_ROOT / "alembic" / "versions").is_dir()
 
-    def test_url_comes_from_database_url_env_var(self, monkeypatch, tmp_path):
-        """The migrate service passes the database only via DATABASE_URL, and
-        alembic.ini deliberately holds no URL. env.py must resolve it from the
-        app settings (which read DATABASE_URL) — otherwise the service would
-        migrate the wrong database or fail.
-        """
-        assert alembic_config().get_main_option("sqlalchemy.url") in (None, "")
+    def test_runtime_image_packages_the_scaffold(self):
+        """The scaffold existing in the CHECKOUT is not enough: neither the
+        migrate service nor the API container mounts the repo root — they run
+        from the built image. If the Dockerfile does not COPY alembic.ini and
+        alembic/ into /hummingbot-api, the migrate service takes its silent
+        `[ -f alembic.ini ]` skip branch and the API's startup check has no
+        scaffold to read (CDX-R01).
 
-        target = f"sqlite:///{(tmp_path / 'from_env.db').as_posix()}"
+        Mutation this catches: reverting the Dockerfile copy line to
+        `COPY main.py config.py deps.py ./` (dropping alembic.ini) — the
+        assertion on alembic.ini being copied then fails.
+        """
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        copy_lines = [ln.strip() for ln in dockerfile.splitlines()
+                      if ln.strip().upper().startswith("COPY")]
+
+        def _copied(token: str) -> bool:
+            # A COPY whose source list contains `token` (destination is the last
+            # arg, so a bare `alembic` dir or `alembic.ini` on the left side).
+            return any(token in ln.split()[1:-1] for ln in copy_lines)
+
+        assert _copied("alembic.ini"), (
+            "Dockerfile must COPY alembic.ini into the image; without it the "
+            "migrate service skips migrations and the API cannot verify head."
+        )
+        assert _copied("alembic"), "Dockerfile must COPY the alembic/ directory into the image."
+
+    def test_alembic_is_a_declared_runtime_dependency(self):
+        """The API imports alembic at startup (database/migration_state.py) and
+        the migrate service invokes the alembic CLI. alembic is not a transitive
+        dependency of anything in environment.yml, so it must be declared
+        explicitly or the rebuilt image would lack it entirely (CDX-R01)."""
+        env_yml = (REPO_ROOT / "environment.yml").read_text(encoding="utf-8")
+        assert "alembic" in env_yml, "environment.yml must declare the alembic dependency."
+
+    def test_env_resolves_target_db_from_settings(self, monkeypatch, tmp_path):
+        """The migrate service passes the database ONLY via DATABASE_URL, and
+        alembic.ini deliberately holds no URL, so env.py must resolve the URL
+        from the app settings (which read DATABASE_URL). This runs the REAL
+        resolver: a real `alembic upgrade head` with sqlalchemy.url unset, and
+        proves the migration landed on the settings-resolved database (CDX-R03).
+
+        Mutation this catches: alembic/env.py `_database_url` -> `return
+        "sqlite:///wrong.db"`. Migrations then go to wrong.db, the target below
+        never gets an alembic_version table, and this test fails. (The old test
+        only constructed DatabaseSettings() and never executed the resolver, so
+        it passed under exactly that mutation.)
+        """
+        cfg = alembic_config()
+        assert cfg.get_main_option("sqlalchemy.url") in (None, "")
+
+        target = f"sqlite:///{(tmp_path / 'from_settings.db').as_posix()}"
+        # env.py does `from config import settings; return settings.database.url`
+        # — the singleton the real migrate process resolves through. Point it at
+        # the target the way DATABASE_URL would in that process.
+        import config
+
+        monkeypatch.setattr(config.settings.database, "url", target)
+
+        command.upgrade(cfg, "head")
+
+        # The RESOLVED database received the migration.
+        target_tables = set(inspect(create_engine(target)).get_table_names())
+        assert "alembic_version" in target_tables
+        assert set(Base.metadata.tables) <= target_tables
+
+    def test_database_url_env_var_feeds_settings(self, monkeypatch):
+        """The other half of the contract: DatabaseSettings reads DATABASE_URL,
+        so a fresh process picks up the migrate service's env var."""
+        target = "postgresql+asyncpg://u:p@h:5432/db"
         monkeypatch.setenv("DATABASE_URL", target)
-        # Rebuild settings the way a fresh process would.
         from config import DatabaseSettings
 
         assert DatabaseSettings().url == target
+
+
+# ===========================================================================
+# Online-migration engine routing (sync vs async, by dialect) — CDX-R05
+# ===========================================================================
+
+class TestOnlineMigrationRouting:
+
+    def test_is_async_url_classifies_drivers_by_dialect(self):
+        from database.migration_runner import is_async_url
+
+        assert is_async_url("postgresql+asyncpg://u:p@h:5432/db") is True
+        assert is_async_url("sqlite:///x.db") is False
+        assert is_async_url("postgresql+psycopg2://u:p@h:5432/db") is False
+
+    def test_async_url_routes_to_async_runner_never_sync_engine(self):
+        """Production runs against postgresql+asyncpg. That URL MUST take the
+        async runner; building the synchronous engine for it fails before any
+        migration is applied (CDX-R05).
+
+        Mutation this catches: disabling the async branch in
+        migration_runner.run_online_migrations (equivalently env.py's old
+        `if _is_async_url(url):` -> `if False and ...`) routes the async URL
+        into sync_engine_factory, tripping the assertion below.
+        """
+        from database.migration_runner import run_online_migrations
+
+        calls = {"async": 0}
+
+        def sync_factory_must_not_run(*args, **kwargs):
+            raise AssertionError("sync engine must never be built for an async URL")
+
+        def async_runner(url, do_run):
+            calls["async"] += 1
+
+        run_online_migrations(
+            "postgresql+asyncpg://u:p@h:5432/db",
+            do_run_migrations=lambda conn: None,
+            sync_engine_factory=sync_factory_must_not_run,
+            async_runner=async_runner,
+        )
+        assert calls["async"] == 1
+
+    def test_sync_url_routes_to_sync_engine_never_async_runner(self, tmp_path):
+        """The mirror: a sqlite (sync) URL takes the synchronous engine and
+        never the async runner."""
+        from database.migration_runner import run_online_migrations
+
+        ran = {"do_run": 0}
+
+        def async_runner_must_not_run(url, do_run):
+            raise AssertionError("async runner must never fire for a sync URL")
+
+        def do_run(conn):
+            ran["do_run"] += 1
+
+        url = f"sqlite:///{(tmp_path / 'sync.db').as_posix()}"
+        run_online_migrations(
+            url, do_run_migrations=do_run, async_runner=async_runner_must_not_run
+        )
+        assert ran["do_run"] == 1
