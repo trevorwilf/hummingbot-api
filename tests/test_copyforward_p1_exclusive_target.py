@@ -313,9 +313,18 @@ class TestExclusiveTargetCreation:
 
         The no-work property is what distinguishes the up-front guard from the
         promote-time check — both refuse, but only the guard refuses for free.
-        ``containers.get`` is the observable: the hook's source-container guard
-        is the first thing a seed does, so an un-guarded deploy would stage the
-        whole instance and seed it before the promote threw it away.
+        A ``containers.get`` for the SOURCE instance is the observable: the
+        hook's source-container guard is the first thing a seed does, so an
+        un-guarded deploy would stage the whole instance and seed it before the
+        promote threw it away.
+
+        Phase 6 (CLA-M02) made ``containers.get`` no longer unique to the hook —
+        the deploy now also inspects the API's OWN container to prove the bots/
+        path coupling, which is a read-only query and not "work" in the sense
+        this test means. So the assertion names the call it actually cares
+        about (get(SOURCE)) instead of asserting the method was never called at
+        all; the mutation strength is unchanged, since a seed that ran would
+        still query the source.
 
         Catches (mutation): deleting ``guard_target_available(instance_dir)`` from
         ``create_hummingbot_instance``, or moving it after
@@ -329,9 +338,13 @@ class TestExclusiveTargetCreation:
             await service.create_hummingbot_instance(make_deployment())
 
         assert exc.value.reason is ResumeAbortReason.DEST_EXISTS
+        source_lookups = [
+            call for call in client.containers.get.call_args_list
+            if call.args and call.args[0] == SRC_NAME
+        ]
+        assert source_lookups == [], "the resume hook ran: it guarded the source container"
+        # Nothing was staged, nothing was seeded.
         assert list((bots_tree / "instances").glob("*.staging-*")) == []
-        # The resume hook never ran: nothing was staged, nothing was seeded.
-        client.containers.get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_clean_deploy_promotes_target_and_seeds(self, bots_tree, patched_security):

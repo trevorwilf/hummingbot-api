@@ -89,6 +89,12 @@ class ResumeAbortReason(str, Enum):
     # SOURCE_RUNNING (verified active) and from NotFound (verified absent): here
     # we know nothing, so we refuse rather than proceed on an unverified source.
     SOURCE_STATE_UNVERIFIED = "SOURCE_STATE_UNVERIFIED"
+    # CLA-M02: the API's own bots/ write root and the host directory the bot
+    # containers bind-mount are PROVEN to be different directories. The hook
+    # would seed a data/ the bot can never read. Raised only on proof (a
+    # successful self-inspection that disagrees), never on an unverified guess —
+    # see ``DockerService._check_bots_path_coupling``.
+    BOTS_PATH_MISCONFIGURED = "BOTS_PATH_MISCONFIGURED"
 
 
 class ResumeError(Exception):
@@ -1719,6 +1725,84 @@ async def run_guards(
 # Sentinel for a field present on only one side of the config-drift diff (§12).
 _DRIFT_ABSENT = "<absent>"
 
+# ---------------------------------------------------------------------------
+# CLA-M01 — sizing-critical drift classification
+# ---------------------------------------------------------------------------
+#
+# Template-wins is DELIBERATE and unchanged: a resumed bot runs the staged
+# template's parameters, not the live edits made to the source instance's YAML
+# while it ran. What CLA-M01 fixes is that the operator only learned this from a
+# log line they never saw. Drift in a field that decides HOW MUCH MONEY the bot
+# deploys is surfaced as a structured warning on the deploy and preview
+# responses, so the decision to accept template-wins is an informed one.
+#
+# Field names enumerated (read-only) from the engine's ladder config,
+# ``hummingbot/controllers/market_making/range_inventory_ladder.py``:
+#   :210 total_amount_quote        — the managed quote fund
+#   :218 max_fund_value_quote      — hard cap on deployable fund value
+#   :226 shared_account_quote_quota— clamps free_buy_budget_quote
+#   :262 use_wallet_balance        — whether base inventory is claimed at all
+#   :270 claimed_base_value_quote  — quote value of base claimed on first start
+#   :278 claimed_base_amount       — explicit base amount claimed (overrides ^)
+#   :291 buy_prices                — the ladder's buy-side range bounds
+#   :302 buy_amounts_pct           — per-level buy sizing weights
+#   :310 sell_prices               — the ladder's sell-side range bounds
+#   :320 sell_amounts_pct          — per-level sell sizing weights
+# Matched by NAME, not by controller type: these names mean the same thing in
+# any controller that carries them, and mis-classifying drift as ordinary is the
+# failure this fix exists to prevent.
+_SIZING_CRITICAL_FIELDS = frozenset({
+    "total_amount_quote",
+    "max_fund_value_quote",
+    "shared_account_quote_quota",
+    "use_wallet_balance",
+    "buy_prices",
+    "buy_amounts_pct",
+    "sell_prices",
+    "sell_amounts_pct",
+})
+
+# ``claimed_base_*`` per the triage's glob: covers claimed_base_value_quote and
+# claimed_base_amount above, and any future sibling the engine adds — a new
+# base-claiming field must be loud by default rather than silent until someone
+# remembers to list it here.
+_SIZING_CRITICAL_PREFIXES = ("claimed_base_",)
+
+
+def _is_sizing_critical(field: str) -> bool:
+    """True if drift in ``field`` can change the size of the resumed bot's
+    positions or the capital it deploys (CLA-M01)."""
+    return field in _SIZING_CRITICAL_FIELDS or field.startswith(_SIZING_CRITICAL_PREFIXES)
+
+
+def _warn_sizing_critical_drift(drift: List[dict], plan: CopyPlan) -> None:
+    """Surface sizing-critical drift on the response, one entry per field.
+
+    Structured (not just logged) because a log line is invisible to whoever
+    posted the deploy — the whole point of CLA-M01. Per FIELD rather than per
+    file so a caller can branch on ``field`` without re-parsing prose.
+
+    Behavior is unchanged: this only reports. The template still wins.
+    """
+    for entry in drift:
+        for field in entry["fields"]:
+            if not field.get("sizing_critical"):
+                continue
+            plan._warn_structured(
+                "SIZING_CRITICAL_DRIFT",
+                f"Sizing-critical config drift for controller "
+                f"'{entry['controller_id']}' ({entry['file']}): '{field['field']}' "
+                f"was {field['source']!r} on the source instance but is "
+                f"{field['template']!r} in the staged template. The template WINS "
+                f"— the resumed bot deploys capital per the template value, not "
+                f"the value the stopped bot was running.",
+                file=entry["file"],
+                controller_id=entry["controller_id"],
+                field=field["field"],
+                source=field["source"],
+                template=field["template"],
+            )
+
 
 def _manifest_file_entry(path: Path, new_data_root: Path) -> dict:
     """Manifest entry for one copied file: name (relative to ``data/``), size,
@@ -1788,6 +1872,12 @@ def _diff_controller_configs(source: "ResolvedSource", new_instance_dir: Path) -
     difference is warned loudly and recorded in the manifest — the template
     WINS (no carry-forward). A controller file absent from the source (newly
     added controller) has nothing to drift against and is skipped.
+
+    CLA-M01: each field entry additionally carries ``sizing_critical``
+    (:func:`_is_sizing_critical`) and each file entry lists
+    ``sizing_critical_fields``. Callers surface those on the deploy/preview
+    response via :func:`_warn_sizing_critical_drift`. The classification is
+    reporting only — no copy or template semantics change here.
     """
     drift: List[dict] = []
     new_controllers_dir = new_instance_dir / "conf" / "controllers"
@@ -1817,13 +1907,21 @@ def _diff_controller_configs(source: "ResolvedSource", new_instance_dir: Path) -
             template_value = new_cfg.get(key, _DRIFT_ABSENT)
             if source_value != template_value:
                 fields.append(
-                    {"field": key, "source": source_value, "template": template_value}
+                    {
+                        "field": key,
+                        "source": source_value,
+                        "template": template_value,
+                        "sizing_critical": _is_sizing_critical(key),
+                    }
                 )
         if fields:
             entry = {
                 "file": staged.name,
                 "controller_id": new_cfg.get("id"),
                 "fields": fields,
+                "sizing_critical_fields": [
+                    f["field"] for f in fields if f["sizing_critical"]
+                ],
             }
             drift.append(entry)
             logger.warning(
@@ -1941,6 +2039,11 @@ async def _seed(
 
     # 5. Config-drift diff (§12) — warn + record; template wins.
     drift = _diff_controller_configs(source, new_instance_dir)
+    # CLA-M01: sizing-critical drift also rides the response, not just the log.
+    # Ordered before the manifest is built so plan.structured_warnings (which
+    # the manifest snapshots, and create_hummingbot_instance lifts onto the
+    # deploy response) already carries these entries.
+    _warn_sizing_critical_drift(drift, plan)
 
     # 6. Audit manifest (§13) — also the double-resume detector: it lands in
     #    data/ and trips the DEST_NOT_EMPTY guard of any later re-seed attempt.
@@ -2169,8 +2272,10 @@ async def preview_resume(
     Returns:
         Dict with keys: ``resolved_source``, ``target`` (the resolved target
         path + the representative name it was checked under), ``files`` (with
-        ``dst`` at real target paths), ``decisions``, ``guard_report``,
-        ``would_succeed`` (always ``True`` — failures raise).
+        ``dst`` at real target paths), ``decisions``, ``warnings`` (structured;
+        includes CLA-M01 sizing-critical drift), ``drift`` (the full classified
+        field-level config diff), ``guard_report``, ``would_succeed`` (always
+        ``True`` — failures raise).
 
     Raises:
         ResumeError: fail-closed on any §11 condition (caller maps to HTTP 409).
@@ -2244,15 +2349,22 @@ async def preview_resume(
             )
             _preview_base_name_collision(bots_path, base_name, guard_report)
             plan = compute_copy_plan(tmp_instance_dir, source, deployment)
-            return source, guard_report, plan
+            # CLA-M01: the same diff the deploy runs, against the same two
+            # inputs — the source instance's live YAMLs and the staged templates
+            # (which is exactly what ``tmp_instance_dir/conf/controllers`` holds
+            # above). Preview is where an operator can still act on sizing drift;
+            # learning about it from the deploy response is learning too late.
+            drift = _diff_controller_configs(source, tmp_instance_dir)
+            _warn_sizing_critical_drift(drift, plan)
+            return source, guard_report, plan, drift
 
         if bot_run_repo is None and db_manager is not None:
             from database import BotRunRepository
 
             async with db_manager.get_session_context() as session:
-                source, guard_report, plan = await _preview_run(BotRunRepository(session))
+                source, guard_report, plan, drift = await _preview_run(BotRunRepository(session))
         else:
-            source, guard_report, plan = await _preview_run(bot_run_repo)
+            source, guard_report, plan, drift = await _preview_run(bot_run_repo)
 
         # Build the files list from the planned (not executed) copy set.
         # Sizes and sha256 are computed from the SOURCE files — no copy occurs.
@@ -2298,10 +2410,16 @@ async def preview_resume(
             },
             "files": files,
             "decisions": dict(plan.decisions),
-            # Structured, machine-readable warnings (C1 opt-out skips land here).
-            # The preview is a pre-deploy check: a skip the deploy would perform is
-            # exactly what an operator needs to see BEFORE deploying.
+            # Structured, machine-readable warnings (C1 opt-out skips land here,
+            # CLA-M01's sizing-critical drift entries alongside them). The preview
+            # is a pre-deploy check: a skip — or a silent resize — the deploy
+            # would perform is exactly what an operator needs to see BEFORE
+            # deploying.
             "warnings": list(plan.structured_warnings),
+            # The full field-level diff (CLA-M01), classified. The warnings above
+            # are the sizing-critical subset; this is everything, for an operator
+            # who wants to see what else the template will overwrite.
+            "drift": drift,
             "guard_report": guard_report.to_dict(),
             "would_succeed": True,
         }
