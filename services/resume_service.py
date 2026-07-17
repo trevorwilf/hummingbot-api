@@ -34,6 +34,7 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from database.repositories.bot_run_repository import RETIREMENT_VERIFIED
 from services.controller_id_contract import classify_controller_id
 from services.ledger_envelope_contract import classify_ledger_envelope
 from services.state_file_contract import (
@@ -1324,8 +1325,14 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
 _ACTIVE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
 
 # API ``bot_runs.run_status`` value that denotes a clean, graceful stop
-# (database/models.py:190 — CREATED / RUNNING / STOPPED / ERROR). Anything else
+# (database/models.py — CREATED / RUNNING / STOPPED / ERROR). Anything else
 # (or a missing end marker / absent row) is treated as ungraceful (§7.5).
+# CDX-005: STOPPED alone is NOT trusted — the row must also carry
+# ``retirement_status == RETIREMENT_VERIFIED``, written only by the
+# acknowledged-retirement state machine once every postcondition (stop ack,
+# exchange-confirmed zero open orders, fill drain, clean exit, archive) has
+# persisted evidence. Legacy rows predate that schema and are UNVERIFIED by
+# definition.
 _GRACEFUL_RUN_STATUS = "STOPPED"
 
 # Destination state-file globs whose presence means the new ``data/`` is not the
@@ -1585,14 +1592,18 @@ async def _latest_source_run(source: "ResolvedSource", bot_run_repo):
 async def _guard_ungraceful_source(
     source: "ResolvedSource", deployment, bot_run_repo, report: GuardReport
 ) -> None:
-    """§7.5 — advisory: the source should have stopped gracefully.
+    """§7.5 — advisory: the source must have VERIFIABLY retired (CDX-005).
 
     The source's most recent ``bot_runs`` row is graceful iff its ``run_status``
-    is ``STOPPED`` AND it carries an end marker (``stopped_at``). A non-stopped /
-    errored status, a missing end marker, or an absent row (unknown history) is
-    ungraceful → ``UNGRACEFUL_SOURCE`` unless ``resume_accept_ungraceful=True``,
-    in which case the guard PASSES with a loud warning recorded. Exchange
-    open-order verification is the operator runbook's job, not the hook's.
+    is ``STOPPED`` AND it carries an end marker (``stopped_at``) AND its
+    ``retirement_status`` is ``VERIFIED`` — i.e. the acknowledged-retirement
+    state machine persisted evidence for every postcondition, exchange-confirmed
+    zero open orders included. A non-stopped / errored status, a missing end
+    marker, an absent row (unknown history), or an UNVERIFIED retirement —
+    which includes EVERY legacy STOPPED row predating the evidence schema — is
+    ungraceful → ``UNGRACEFUL_SOURCE`` unless the explicit human override
+    ``resume_accept_ungraceful=True`` is set, in which case the guard PASSES
+    with a loud warning recorded. Default is refusal.
     """
     accept = bool(getattr(deployment, "resume_accept_ungraceful", False))
     run = await _latest_source_run(source, bot_run_repo)
@@ -1606,11 +1617,21 @@ async def _guard_ungraceful_source(
     else:
         status = getattr(run, "run_status", None)
         stopped_at = getattr(run, "stopped_at", None)
-        graceful = status == _GRACEFUL_RUN_STATUS and stopped_at is not None
+        retirement = getattr(run, "retirement_status", None)
+        graceful = (
+            status == _GRACEFUL_RUN_STATUS
+            and stopped_at is not None
+            and retirement == RETIREMENT_VERIFIED
+        )
         detail = (
             f"Source '{source.instance_name}' last run_status={status!r}, "
-            f"stopped_at={stopped_at!r}."
+            f"stopped_at={stopped_at!r}, retirement_status={retirement!r}."
         )
+        if not graceful and status == _GRACEFUL_RUN_STATUS and retirement != RETIREMENT_VERIFIED:
+            detail += (
+                " STOPPED without VERIFIED retirement evidence (legacy row or"
+                " unconfirmed stop) is UNVERIFIED by definition (CDX-005)."
+            )
 
     if graceful:
         report._record("graceful_source", True, f"Graceful stop confirmed. {detail}")

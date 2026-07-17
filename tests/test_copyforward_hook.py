@@ -184,6 +184,7 @@ def graceful_repo():
                 instance_name=SRC_NAME,
                 run_status="STOPPED",
                 stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+                retirement_status="VERIFIED",  # CDX-005: STOPPED alone is untrusted
             )
         ]
     )

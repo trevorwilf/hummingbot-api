@@ -216,10 +216,12 @@ def make_deployment(**overrides):
 
 
 def graceful_row(instance_name):
+    # CDX-005: STOPPED alone is untrusted — graceful requires VERIFIED retirement.
     return SimpleNamespace(
         instance_name=instance_name,
         run_status="STOPPED",
         stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+        retirement_status="VERIFIED",
     )
 
 

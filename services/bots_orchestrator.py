@@ -1,19 +1,58 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import shutil
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import docker
 
-from database import AsyncDatabaseManager, BotRunRepository, ControllerPerformanceRepository
+from database import AsyncDatabaseManager, BotRunRepository, ControllerPerformanceRepository, OrderRepository
 from services.docker_service import DockerService
 from utils.bot_archiver import BotArchiver
 from utils.mqtt_manager import MQTTManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetirementTimeouts:
+    """Bounded polling for the acknowledged-retirement state machine (CDX-005).
+
+    Replaces the old fixed 15 s shutdown sleep. Every wait is bounded and
+    configurable; hitting a bound never fabricates evidence — the affected
+    stage simply stays unconfirmed and the run finalizes UNVERIFIED.
+    """
+
+    stop_ack_timeout: float = 30.0
+    zero_open_orders_timeout: float = 90.0
+    fill_drain_seconds: float = 10.0
+    poll_interval: float = 2.0
+
+    @classmethod
+    def from_env(cls) -> "RetirementTimeouts":
+        """Read overrides from RETIREMENT_*_S env vars (blank/missing → default).
+
+        Malformed values raise: a misconfigured timeout should fail the
+        retirement loudly (the run stays fail-closed), not silently pick a
+        number the operator didn't set.
+        """
+        def read(name: str, default: float) -> float:
+            raw = os.environ.get(name)
+            if raw is None or not raw.strip():
+                return default
+            return float(raw)
+
+        return cls(
+            stop_ack_timeout=read("RETIREMENT_STOP_ACK_TIMEOUT_S", cls.stop_ack_timeout),
+            zero_open_orders_timeout=read("RETIREMENT_ZERO_ORDERS_TIMEOUT_S", cls.zero_open_orders_timeout),
+            fill_drain_seconds=read("RETIREMENT_FILL_DRAIN_S", cls.fill_drain_seconds),
+            poll_interval=read("RETIREMENT_POLL_INTERVAL_S", cls.poll_interval),
+        )
 
 
 class BotsOrchestrator:
@@ -604,11 +643,127 @@ class BotsOrchestrator:
             "deployment_config": run.deployment_config,
             "final_status": run.final_status,
             "error_message": run.error_message,
+            "retirement_status": getattr(run, "retirement_status", None),
+            "retirement_evidence": BotsOrchestrator._safe_json_loads(
+                getattr(run, "retirement_evidence", None)
+            ),
         }
+
+    @staticmethod
+    def _safe_json_loads(raw: Optional[str]):
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
 
     # ============================================
     # Stop & Archive orchestration
     # ============================================
+
+    # -- Retirement evidence helpers (CDX-005) --------------------------------
+
+    @staticmethod
+    def _utc_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    async def _bot_run_account(self, bot_name: str) -> Optional[str]:
+        """Account of the bot's latest run, or None (no row / DB unavailable)."""
+        try:
+            async with self.db_manager.get_session_context() as session:
+                run = await BotRunRepository(session).get_latest_bot_run(bot_name)
+                return run.account_name if run else None
+        except Exception as e:
+            logger.error(f"Failed to look up bot run account for {bot_name}: {e}")
+            return None
+
+    async def _persist_retirement_evidence(self, bot_name: str, evidence: Dict[str, Any]):
+        """Progressive evidence write; never changes statuses (see repository)."""
+        try:
+            async with self.db_manager.get_session_context() as session:
+                await BotRunRepository(session).update_bot_run_retirement_evidence(bot_name, evidence)
+        except Exception as e:
+            logger.error(f"Failed to persist retirement evidence for {bot_name}: {e}")
+
+    async def _finalize_retirement(
+        self,
+        bot_name: str,
+        evidence: Dict[str, Any],
+        final_status: Optional[Dict] = None,
+        error_message: Optional[str] = None,
+    ):
+        """Terminal retirement write — the repository computes VERIFIED /
+        UNVERIFIED from the evidence itself (never from a caller flag)."""
+        try:
+            async with self.db_manager.get_session_context() as session:
+                row = await BotRunRepository(session).finalize_bot_run_retirement(
+                    bot_name, evidence, final_status=final_status, error_message=error_message
+                )
+            if row is not None:
+                logger.info(
+                    f"Finalized retirement for {bot_name}: run_status={row.run_status}, "
+                    f"retirement_status={row.retirement_status}"
+                )
+            else:
+                logger.warning(f"No open bot run row to finalize retirement for {bot_name}")
+        except Exception as e:
+            logger.error(f"Failed to finalize retirement for {bot_name}: {e}")
+
+    async def _await_zero_open_orders(
+        self, account_name: Optional[str], evidence: Dict[str, Any], timeouts: RetirementTimeouts
+    ):
+        """Bounded poll of the API's own order records for zero active orders.
+
+        Confirmation requires the account to HAVE order history: an account
+        with no recorded orders at all proves nothing about the exchange
+        (a disconnected recorder looks identical), so silence is never read
+        as zero (fail-closed). On timeout the remaining count is recorded and
+        the stage stays unconfirmed.
+        """
+        if not account_name:
+            evidence["zero_open_orders_basis"] = "no_bot_run_row"
+            return
+
+        deadline = time.monotonic() + timeouts.zero_open_orders_timeout
+        last_summary = None
+        while True:
+            try:
+                async with self.db_manager.get_session_context() as session:
+                    summary = await OrderRepository(session).get_orders_summary(account_name=account_name)
+            except Exception as e:
+                logger.warning(f"Order summary poll failed for account {account_name}: {e}")
+                summary = None
+
+            if summary is not None:
+                last_summary = summary
+                if summary.get("total_orders", 0) == 0:
+                    evidence["zero_open_orders_basis"] = "no_order_history"
+                    return
+                if summary.get("active_orders", 0) == 0:
+                    evidence["zero_open_orders_confirmed_at"] = self._utc_iso()
+                    evidence["zero_open_orders_basis"] = (
+                        f"orders_recorded_total={summary.get('total_orders')}"
+                    )
+                    return
+
+            if time.monotonic() >= deadline:
+                evidence["open_orders_remaining"] = (
+                    last_summary.get("active_orders") if last_summary is not None else None
+                )
+                evidence["zero_open_orders_basis"] = "timeout"
+                return
+            await asyncio.sleep(timeouts.poll_interval)
+
+    async def _active_order_count(self, account_name: str) -> Optional[int]:
+        """One-shot active-order count for the fill-drain recheck (None on error)."""
+        try:
+            async with self.db_manager.get_session_context() as session:
+                summary = await OrderRepository(session).get_orders_summary(account_name=account_name)
+                return summary.get("active_orders")
+        except Exception as e:
+            logger.warning(f"Fill-drain recheck failed for account {account_name}: {e}")
+            return None
 
     async def stop_and_archive_bot(
         self,
@@ -620,13 +775,30 @@ class BotsOrchestrator:
         s3_bucket: Optional[str],
         docker_manager: DockerService,
         bot_archiver: BotArchiver,
+        retirement_timeouts: Optional[RetirementTimeouts] = None,
     ):
-        """Stop a bot and archive its data (8-step workflow).
+        """Stop a bot and archive its data via the acknowledged-retirement
+        state machine (CDX-005 / CDX-M03).
 
         This is the background-task body for ``stop-and-archive-bot``. It is
         FastAPI-agnostic and can be invoked/tested directly.
+
+        Each stage persists evidence gathered from CONFIRMED data only — the
+        bot's own RPC response to the stop command, the API's order records,
+        Docker container state. MQTT publish success is never evidence. Where
+        confirmation is impossible (silent bot, timeout, dirty exit) the stage
+        stays unconfirmed and the run finalizes UNVERIFIED — never fabricated,
+        never defaulted to verified. Archival proceeds regardless; only the
+        VERIFIED marker is withheld. The bot_runs row is flipped to STOPPED
+        only at finalization, after the container has actually exited — never
+        before the stop is even requested (the old code wrote STOPPED first).
         """
+        evidence: Dict[str, Any] = {
+            "initiated_at": self._utc_iso(),
+            "skip_order_cancellation": bool(skip_order_cancellation),
+        }
         try:
+            timeouts = retirement_timeouts or RetirementTimeouts.from_env()
             logger.info(f"Starting background stop-and-archive for {bot_name}")
 
             # Step 1: Capture bot final status before stopping (while bot is still running)
@@ -638,36 +810,74 @@ class BotsOrchestrator:
             except Exception as e:
                 logger.warning(f"Failed to capture final status for {bot_name_for_orchestrator}: {e}")
 
-            # Step 2: Update bot run with stopped_at timestamp and final status before stopping
-            try:
-                await self.mark_bot_run_stopped(bot_name, final_status=final_status)
-                logger.info(f"Updated bot run with stopped_at timestamp and final status for {bot_name}")
-            except Exception as e:
-                logger.error(f"Failed to update bot run with stopped status: {e}")
-                # Continue with stop process even if database update fails
+            account_name = await self._bot_run_account(bot_name)
+            await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 3: Mark the bot as stopping, and stop the bot trading process
-            self.set_bot_stopping(bot_name_for_orchestrator)
-            logger.info(f"Stopping bot trading process for {bot_name_for_orchestrator}")
-            stop_response = await self.stop_bot(
-                bot_name_for_orchestrator,
-                skip_order_cancellation=skip_order_cancellation,
-                async_backend=True  # Always use async for background tasks
-            )
-
-            if not stop_response or not stop_response.get("success", False):
-                error_msg = stop_response.get('error', 'Unknown error') if stop_response else 'No response from bot orchestrator'
-                logger.error(f"Failed to stop bot process: {error_msg}")
+            # Step 2: Mark the bot as stopping and request the stop, waiting for
+            # the bot's OWN response — publish success is not an acknowledgement.
+            if bot_name_for_orchestrator not in self.active_bots:
+                logger.error(
+                    f"Bot {bot_name_for_orchestrator} not found in active bots — cannot request stop"
+                )
+                evidence["failure"] = "bot not in active bots at stop time"
+                await self._persist_retirement_evidence(bot_name, evidence)
                 return
 
-            # Step 4: Wait for graceful shutdown (15 seconds as requested)
-            logger.info(f"Waiting 15 seconds for bot {bot_name} to gracefully shutdown")
-            await asyncio.sleep(15)
+            self.set_bot_stopping(bot_name_for_orchestrator)
+            logger.info(f"Stopping bot trading process for {bot_name_for_orchestrator}")
+            stop_result = await self.mqtt_manager.publish_command_with_ack(
+                bot_name_for_orchestrator,
+                "stop",
+                {"skip_order_cancellation": skip_order_cancellation, "async_backend": True},
+                timeout=timeouts.stop_ack_timeout,
+            )
 
-            # Step 5: Stop the container with monitoring
+            if not stop_result.get("published"):
+                # The stop request never reached the broker: the bot may still be
+                # trading. Leave the run row untouched (fail-closed) and do NOT
+                # touch the container.
+                logger.error(f"Failed to publish stop command for {bot_name_for_orchestrator}")
+                evidence["failure"] = "stop command could not be published to the broker"
+                await self._persist_retirement_evidence(bot_name, evidence)
+                return
+
+            evidence["stop_requested_at"] = self._utc_iso()
+            if not skip_order_cancellation:
+                evidence["cancellation_requested_at"] = evidence["stop_requested_at"]
+            # Clear performance data after the stop request so status reflects it.
+            self.mqtt_manager.clear_bot_controller_reports(bot_name_for_orchestrator)
+
+            if stop_result.get("response") is not None:
+                evidence["stop_ack_at"] = self._utc_iso()
+                evidence["stop_ack"] = str(stop_result["response"])[:500]
+            else:
+                logger.warning(
+                    f"No stop acknowledgement from {bot_name_for_orchestrator} within "
+                    f"{timeouts.stop_ack_timeout}s — retirement cannot be verified"
+                )
+            await self._persist_retirement_evidence(bot_name, evidence)
+
+            # Step 3: Exchange-confirmed zero open orders + final-fill drain
+            # (bounded polling replaces the old fixed 15 s sleep).
+            await self._await_zero_open_orders(account_name, evidence, timeouts)
+            if evidence.get("zero_open_orders_confirmed_at"):
+                await asyncio.sleep(timeouts.fill_drain_seconds)
+                remaining = await self._active_order_count(account_name)
+                if remaining == 0:
+                    evidence["fills_drained_at"] = self._utc_iso()
+                else:
+                    evidence["orders_active_after_drain"] = remaining
+                    logger.warning(
+                        f"Active orders reappeared (or were unreadable) during the fill drain "
+                        f"for {bot_name}: {remaining!r} — retirement cannot be verified"
+                    )
+            await self._persist_retirement_evidence(bot_name, evidence)
+
+            # Step 4: Stop the container with monitoring
             max_retries = 10
             retry_interval = 2
             container_stopped = False
+            exit_code = None
 
             for i in range(max_retries):
                 logger.info(f"Attempting to stop container {container_name} (attempt {i+1}/{max_retries})")
@@ -675,18 +885,38 @@ class BotsOrchestrator:
 
                 # Check if container is already stopped
                 container_status = docker_manager.get_container_status(container_name)
-                if container_status.get("state", {}).get("status") == "exited":
+                state = container_status.get("state", {}) if container_status.get("success") else {}
+                if state.get("status") == "exited":
                     container_stopped = True
-                    logger.info(f"Container {container_name} is already stopped")
+                    exit_code = state.get("exit_code")
+                    logger.info(f"Container {container_name} is already stopped (exit code {exit_code!r})")
                     break
 
                 await asyncio.sleep(retry_interval)
 
             if not container_stopped:
+                # The bot process may still be alive; leave the run row untouched
+                # (fail-closed) rather than recording a stop that did not happen.
                 logger.error(f"Failed to stop container {container_name} after {max_retries} attempts")
+                evidence["failure"] = f"container did not exit after {max_retries} stop attempts"
+                await self._persist_retirement_evidence(bot_name, evidence)
                 return
 
-            # Step 6: Archive the bot data
+            evidence["process_exited_at"] = self._utc_iso()
+            evidence["container_exit_code"] = exit_code
+            if exit_code == 0:
+                # A clean exit means the engine's graceful-shutdown path — which
+                # flushes/checkpoints strategy state — ran to completion. A dirty
+                # or unknown exit code cannot claim a flushed state.
+                evidence["state_flushed_at"] = evidence["process_exited_at"]
+            else:
+                logger.warning(
+                    f"Container {container_name} exited with code {exit_code!r} — "
+                    f"state flush unconfirmed, retirement cannot be verified"
+                )
+            await self._persist_retirement_evidence(bot_name, evidence)
+
+            # Step 5: Archive the bot data
             instance_dir = os.path.join('bots', 'instances', container_name)
             logger.info(f"Archiving bot data from {instance_dir}")
 
@@ -695,12 +925,14 @@ class BotsOrchestrator:
                     bot_archiver.archive_locally(container_name, instance_dir)
                 else:
                     bot_archiver.archive_and_upload(container_name, instance_dir, bucket_name=s3_bucket)
+                evidence["archived_at"] = self._utc_iso()
                 logger.info(f"Successfully archived bot data for {container_name}")
             except Exception as e:
                 logger.error(f"Archive failed: {str(e)}")
+                evidence["archive_error"] = str(e)[:500]
                 # Continue with removal even if archive fails
 
-            # Step 7: Remove the container
+            # Step 6: Remove the container
             logging.info(f"Removing container {container_name}")
             remove_response = docker_manager.remove_container(container_name, force=False)
 
@@ -712,7 +944,9 @@ class BotsOrchestrator:
             if remove_response.get("success"):
                 logging.info(f"Successfully completed stop-and-archive for bot {bot_name}")
 
-                # Step 8: Update bot run deployment status to ARCHIVED
+                # Step 7: Finalize retirement (STOPPED + VERIFIED/UNVERIFIED from
+                # the evidence), then flip deployment status to ARCHIVED.
+                await self._finalize_retirement(bot_name, evidence, final_status=final_status)
                 try:
                     async with self.db_manager.get_session_context() as session:
                         bot_run_repo = BotRunRepository(session)
@@ -722,33 +956,18 @@ class BotsOrchestrator:
                     logger.error(f"Failed to update bot run to archived: {e}")
             else:
                 logging.error(f"Failed to remove container {container_name}")
-
-                # Update bot run with error status (but keep stopped_at timestamp from earlier)
-                try:
-                    async with self.db_manager.get_session_context() as session:
-                        bot_run_repo = BotRunRepository(session)
-                        await bot_run_repo.update_bot_run_stopped(
-                            bot_name,
-                            error_message="Failed to remove container during archive process"
-                        )
-                        logger.info(f"Updated bot run with error status for {bot_name}")
-                except Exception as e:
-                    logger.error(f"Failed to update bot run with error: {e}")
+                await self._finalize_retirement(
+                    bot_name,
+                    evidence,
+                    final_status=final_status,
+                    error_message="Failed to remove container during archive process",
+                )
 
         except Exception as e:
             logging.error(f"Error in background stop-and-archive for {bot_name}: {str(e)}")
-
-            # Update bot run with error status
-            try:
-                async with self.db_manager.get_session_context() as session:
-                    bot_run_repo = BotRunRepository(session)
-                    await bot_run_repo.update_bot_run_stopped(
-                        bot_name,
-                        error_message=str(e)
-                    )
-                    logger.info(f"Updated bot run with error status for {bot_name}")
-            except Exception as db_error:
-                logger.error(f"Failed to update bot run with error: {db_error}")
+            # Terminal error: the run is over but nothing more can be confirmed —
+            # finalize as ERROR / UNVERIFIED with the evidence gathered so far.
+            await self._finalize_retirement(bot_name, evidence, error_message=str(e))
         finally:
             # Always clear the stopping status when the background task completes
             self.clear_bot_stopping(bot_name_for_orchestrator)

@@ -254,7 +254,10 @@ def graceful_repo(*names):
     repo.get_bot_runs = AsyncMock(
         return_value=[
             SimpleNamespace(
-                instance_name=n, run_status="STOPPED", stopped_at=datetime(2026, 7, 10, 12, 0, 0)
+                instance_name=n,
+                run_status="STOPPED",
+                stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+                retirement_status="VERIFIED",  # CDX-005: STOPPED alone is untrusted
             )
             for n in names
         ]

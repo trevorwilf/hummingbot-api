@@ -490,11 +490,12 @@ class TestPreviewNoWrites:
         docker_client = MagicMock()
         docker_client.containers.get.side_effect = DockerNotFound("x")
 
-        # Graceful bot run
+        # Graceful bot run (CDX-005: requires VERIFIED retirement)
         fake_run = SimpleNamespace(
             instance_name="SRC-20260710-101010",
             run_status="STOPPED",
             stopped_at="2026-07-10",
+            retirement_status="VERIFIED",
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])
@@ -579,7 +580,8 @@ class TestPreviewResumeService:
         docker_client.containers.get.side_effect = DockerNotFound("x")
 
         fake_run = SimpleNamespace(
-            instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10"
+            instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10",
+            retirement_status="VERIFIED",  # CDX-005
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])
@@ -682,7 +684,8 @@ class TestPreviewResumeService:
         docker_client.containers.get.side_effect = DockerNotFound("x")
 
         fake_run = SimpleNamespace(
-            instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10"
+            instance_name="SRC-20260710-101010", run_status="STOPPED", stopped_at="2026-07-10",
+            retirement_status="VERIFIED",  # CDX-005
         )
         fake_repo = AsyncMock()
         fake_repo.get_bot_runs = AsyncMock(return_value=[fake_run])

@@ -197,12 +197,16 @@ def make_deployment(**overrides):
 
 
 def graceful_repo(*names):
-    """A bot_run_repo whose lineage rows are all gracefully stopped."""
+    """A bot_run_repo whose lineage rows are all gracefully stopped
+    (STOPPED + VERIFIED retirement — CDX-005)."""
     repo = MagicMock()
     repo.get_bot_runs = AsyncMock(
         return_value=[
             SimpleNamespace(
-                instance_name=n, run_status="STOPPED", stopped_at=datetime(2026, 7, 10, 12, 0, 0)
+                instance_name=n,
+                run_status="STOPPED",
+                stopped_at=datetime(2026, 7, 10, 12, 0, 0),
+                retirement_status="VERIFIED",
             )
             for n in names
         ]

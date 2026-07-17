@@ -380,6 +380,51 @@ class MQTTManager:
             self._pending_responses.pop(reply_to_topic, None)
             return None
 
+    async def publish_command_with_ack(
+        self, bot_id: str, command: str, data: Dict[str, Any], timeout: float = 30.0, qos: int = 1
+    ) -> Dict[str, Any]:
+        """Publish a command and wait for the bot's own RPC response,
+        reporting publication and acknowledgement SEPARATELY.
+
+        ``publish_command``'s True return proves only that the broker took the
+        message — not that the bot received or acted on it (CDX-005). Callers
+        that need evidence of bot behavior must use the ``response`` field
+        here, which carries the bot's actual reply message.
+
+        Returns:
+            ``{"published": False, "response": None}`` — never reached the broker.
+            ``{"published": True,  "response": None}`` — published, but the bot
+            did not answer within ``timeout`` (NOT evidence of anything).
+            ``{"published": True,  "response": <msg>}`` — the bot's response.
+        """
+        if not self._connected or not self._client:
+            logger.error("Not connected to MQTT broker")
+            return {"published": False, "response": None}
+
+        # Unique reply_to topic, mirroring publish_command_and_wait.
+        timestamp = int(time.time() * 1000)
+        reply_to_topic = f"hummingbot-api/response/{timestamp}"
+        future = asyncio.Future()
+        self._pending_responses[reply_to_topic] = future
+
+        try:
+            published = await self._publish_command_with_reply_to(bot_id, command, data, reply_to_topic, qos)
+            if not published:
+                return {"published": False, "response": None}
+            try:
+                response = await asyncio.wait_for(future, timeout=timeout)
+                return {"published": True, "response": response}
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"⏰ Timeout waiting for ack from {bot_id} for command '{command}' on {reply_to_topic}"
+                )
+                return {"published": True, "response": None}
+        except Exception as e:
+            logger.error(f"Error sending command and waiting for ack: {e}")
+            return {"published": False, "response": None}
+        finally:
+            self._pending_responses.pop(reply_to_topic, None)
+
     async def _publish_command_with_reply_to(
         self, bot_id: str, command: str, data: Dict[str, Any], reply_to: str, qos: int = 1
     ) -> bool:

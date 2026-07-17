@@ -82,11 +82,13 @@ def make_repo(rows=None, *, error=None):
 
 
 def graceful_row(instance_name):
-    """A bot_runs row for a clean, graceful stop (STOPPED + end marker)."""
+    """A bot_runs row for a clean, graceful stop: STOPPED + end marker +
+    VERIFIED retirement (CDX-005 — STOPPED alone is no longer trusted)."""
     return SimpleNamespace(
         instance_name=instance_name,
         run_status="STOPPED",
         stopped_at=datetime(2026, 7, 12, 23, 5, 0),
+        retirement_status="VERIFIED",
     )
 
 
