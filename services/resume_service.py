@@ -1449,8 +1449,10 @@ def _validate_staged_controller_ids(new_instance_dir: Path) -> List[tuple]:
         new_instance_dir: The staged instance directory.
 
     Returns:
-        ``[(config, canonical_id), ...]`` for the range-ladder controllers only,
-        in staging order, each id C2-canonical (stripped).
+        ``[(config, canonical_id, config_name), ...]`` for the range-ladder
+        controllers only, in staging order, each id C2-canonical (stripped).
+        ``config_name`` is the staged YAML's filename — the key a flag-driven
+        resume filters on (§5: only flagged controllers are copied).
 
     Raises:
         ResumeError: ``CONTROLLER_ID_INVALID`` on the first C2 violation. The
@@ -1469,8 +1471,43 @@ def _validate_staged_controller_ids(new_instance_dir: Path) -> List[tuple]:
                 f"deploy (CONTRACT C2, fail-closed). Deploying without this "
                 f"controller's ledger would re-seed it from the wallet.",
             )
-        staged.append((config, verdict.canonical))
+        staged.append((config, verdict.canonical, yaml_path.name))
     return staged
+
+
+def _record_skipped_not_flagged(
+    config: dict, controller_id: str, source: "ResolvedSource", plan: CopyPlan
+) -> None:
+    """Flag-driven resume, §5: a staged controller WITHOUT ``resume_mode: latest``
+    is NOT resumed, even when the resolved source holds its ledger. Record the
+    decision ``skipped_not_flagged`` plus a structured warning naming the
+    controller and the ledger left behind (the operator's fix is adding the flag).
+
+    Read-only and never aborts: the controller's C1 ``state_file_name`` is read
+    through the REUSED :func:`classify_state_file_name` only to NAME the ledger
+    in the warning, never to enforce containment — nothing of this controller's
+    is copied, so there is no destination path to guard. An absolute/invalid name
+    simply falls back to the default ledger name for the message text.
+    """
+    sfn_verdict = classify_state_file_name(config.get("state_file_name"))
+    canonical_sfn = (
+        sfn_verdict.canonical if sfn_verdict.status is StateFileStatus.RELATIVE_OK else None
+    )
+    ledger_name = _expected_ledger_name(controller_id, canonical_sfn)
+    present = (source.data_dir / ledger_name).exists()
+    plan.decisions[controller_id] = "skipped_not_flagged"
+    plan._warn_structured(
+        "RESUME_SKIPPED_NOT_FLAGGED",
+        f"Controller '{controller_id}' is NOT flagged resume_mode: latest, so this "
+        f"flag-driven resume did not copy its ledger '{ledger_name}' "
+        f"({'present in' if present else 'absent from'} source instance "
+        f"'{source.instance_name}'). It starts fresh (re-seeds from the wallet). "
+        f"Add resume_mode: latest to its controller config to carry it forward.",
+        controller_id=controller_id,
+        ledger_name=ledger_name,
+        source_instance=source.instance_name,
+        ledger_present=present,
+    )
 
 
 _DB_ENGINE_SQLITE = "sqlite"
@@ -1996,7 +2033,13 @@ def _plan_extra_paths(deployment, source: "ResolvedSource", new_data_dir: Path, 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) -> CopyPlan:
+def compute_copy_plan(
+    new_instance_dir,
+    source: "ResolvedSource",
+    deployment,
+    *,
+    flagged_config_names: "Optional[set]" = None,
+) -> CopyPlan:
     """Compute the config-derived copy set for a resume (design §6).
 
     Read-only: inspects the staged controller YAMLs under
@@ -2010,6 +2053,13 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
         source: The :class:`ResolvedSource` from :func:`resolve_source` (P2).
         deployment: The deploy model (reads ``resume_extra_paths`` and the
             CONTRACT C1 opt-out ``allow_absolute_state_file_name``).
+        flagged_config_names: For a FLAG-DRIVEN resume (§5), the set of staged
+            controller YAML filenames that carried ``resume_mode: latest``. A
+            staged controller whose filename is NOT in this set is NOT copied even
+            when the source holds its ledger — it is recorded
+            ``skipped_not_flagged`` with a structured warning. ``None`` (the
+            request-level default) copies every staged controller exactly as
+            today — zero regression on the ``explicit``/``latest`` paths.
 
     Returns:
         A :class:`CopyPlan` (items, per-controller decisions, warnings).
@@ -2039,8 +2089,16 @@ def compute_copy_plan(new_instance_dir, source: "ResolvedSource", deployment) ->
     # Per-controller: range-ladder controllers in the new deploy (staged YAMLs).
     # ``controller_id`` is C2-canonical and drives every identity derivation from
     # here down — deployed_ids, the ledger filename, the '.owner' match.
-    for config, controller_id in staged_controllers:
+    for config, controller_id, config_name in staged_controllers:
         deployed_ids.add(controller_id)
+        # Flag-driven resume (§5): a staged controller WITHOUT the flag is not
+        # copied even if the source carries its ledger — record the intent
+        # loudly and move on. ``deployed_ids`` still carries it (it IS deployed,
+        # just fresh-seeded), so the orphan scan below does not double-classify
+        # its source ledger. Request-level resumes pass ``None`` and skip this.
+        if flagged_config_names is not None and config_name not in flagged_config_names:
+            _record_skipped_not_flagged(config, controller_id, source, plan)
+            continue
         handled = _plan_controller(config, controller_id, source, new_data_dir, plan, allow_absolute)
         if handled:
             handled_names.add(handled)
@@ -2834,8 +2892,18 @@ async def _seed(
     docker_client,
     bot_run_repo,
     new_instance_name: str,
+    controller_resume_flags: "Optional[Dict[str, str]]" = None,
 ) -> dict:
-    """The hook body: resolve → guards → plan → copy → drift → manifest → events.
+    """Dispatch the resume by PRECEDENCE (§3), then run the shared pipeline.
+
+    Precedence, exactly per spec §3:
+      * request ``resume_mode != "off"`` -> the request wins outright; any
+        controller ``resume_mode: latest`` flags are IGNORED (logged at info),
+        and the request path is byte-for-byte what it was before this feature.
+      * request ``resume_mode == "off"`` with >=1 flagged controller -> the
+        controller-identity resolver (§4) runs. A TRUE first run proceeds WITHOUT
+        resume and writes NO manifest, surfacing one
+        ``RESUME_FIRST_RUN_FRESH_SEED`` warning per flagged controller.
 
     ``new_instance_name`` is the instance's LOGICAL name and is deliberately not
     derived from ``new_instance_dir.name``: the deploy path builds in a staging
@@ -2843,23 +2911,131 @@ async def _seed(
     the instance name. Using the directory name for identity would make
     ``latest`` strip the wrong base and find no lineage at all.
     """
+    flagged_latest = sorted(
+        name for name, mode in (controller_resume_flags or {}).items() if mode == "latest"
+    )
+
+    if deployment.resume_mode != "off":
+        # Request wins outright (§3): controller flags are ignored, only logged.
+        if flagged_latest:
+            logger.info(
+                "Request-level resume_mode=%r wins outright; ignoring %d controller "
+                "resume_mode: latest flag(s): %s (§3 precedence).",
+                deployment.resume_mode, len(flagged_latest), flagged_latest,
+            )
+        source = await resolve_source(deployment, new_instance_name, bots_path, bot_run_repo)
+        return await _seed_from_source(
+            deployment, new_instance_dir, docker_client, bot_run_repo, new_instance_name,
+            source, resolution="request", flagged_controllers=None, flagged_config_names=None,
+        )
+
+    # Flag-driven resume (§3/§4): request off + >=1 controller flagged latest.
+    # Identity is read from the STAGED controller ymls (resume_mode already
+    # stripped by phase 1; the identity fields are unchanged), keyed by the same
+    # config filenames phase 1 collected.
+    resolution = resolve_controller_flag_source(
+        controller_resume_flags,
+        new_instance_name,
+        bots_path,
+        controllers_dir=new_instance_dir / "conf" / "controllers",
+    )
+    if resolution.first_run:
+        return _controller_flag_first_run(resolution, new_instance_name)
+    return await _seed_from_source(
+        deployment, new_instance_dir, docker_client, bot_run_repo, new_instance_name,
+        resolution.source, resolution="controller_flag",
+        flagged_controllers=resolution.flagged,
+        flagged_config_names={fc.config_name for fc in resolution.flagged},
+    )
+
+
+def _controller_flag_first_run(resolution, new_instance_name: str) -> dict:
+    """TRUE first run of a flag-driven resume (§4/§5): no flagged controller's
+    ledger exists in any prior instance, so the deploy proceeds WITHOUT resume.
+
+    Returns a dict carrying a structured ``RESUME_FIRST_RUN_FRESH_SEED`` warning
+    per flagged controller — ``create_hummingbot_instance`` lifts its
+    ``warnings`` onto the deploy response, so the fresh seed is loud, not just
+    logged (§3). NO manifest is written: nothing was resumed, so there is no copy
+    to audit, and writing one would trip the DEST_NOT_EMPTY double-resume
+    detector of a later re-seed.
+    """
+    flagged_ids = [fc.controller_id for fc in resolution.flagged]
+    warnings = []
+    for fc in resolution.flagged:
+        message = (
+            f"Controller '{fc.controller_id}' is flagged resume_mode: latest but no "
+            f"prior instance carries its ledger '{fc.ledger_name}'. This is a true "
+            f"first run: the controller starts fresh (seeds from the wallet) and no "
+            f"state was copied."
+        )
+        logger.warning(message)
+        warnings.append({
+            "code": "RESUME_FIRST_RUN_FRESH_SEED",
+            "message": message,
+            "controller_id": fc.controller_id,
+            "ledger_name": fc.ledger_name,
+        })
+    logger.info(
+        "bot_resume_first_run: instance=%s flagged=%s — deploy proceeds without "
+        "resume; no manifest written.",
+        new_instance_name, flagged_ids,
+        extra={
+            "event": "bot_resume_first_run",
+            "resume_instance": new_instance_name,
+            "resume_flagged_controllers": flagged_ids,
+        },
+    )
+    return {
+        "resolution": "controller_flag",
+        "first_run": True,
+        "resumed": False,
+        "flagged_controllers": flagged_ids,
+        "warnings": warnings,
+    }
+
+
+async def _seed_from_source(
+    deployment,
+    new_instance_dir: Path,
+    docker_client,
+    bot_run_repo,
+    new_instance_name: str,
+    source: "ResolvedSource",
+    *,
+    resolution: str,
+    flagged_controllers,
+    flagged_config_names,
+) -> dict:
+    """The shared hook body for a resolved source: guards → plan → copy → drift →
+    manifest → events. Byte-for-byte today's behavior for the request path.
+
+    ``resolution`` is ``"request"`` (the request-level ``explicit``/``latest``
+    strategies) or ``"controller_flag"``. For a flag-driven resume,
+    ``flagged_config_names`` restricts the copy set to the flagged controllers
+    (non-flagged ones are recorded ``skipped_not_flagged``, §5), and the manifest
+    gains the ``resolution`` label plus the ``flagged_controllers`` ids.
+    ``ResolvedSource`` itself is UNCHANGED, so everything downstream is untouched.
+    """
     from datetime import datetime, timezone
 
     new_data_dir = new_instance_dir / "data"
 
-    # 1. Which prior instance to copy from (P2, §5).
-    source = await resolve_source(deployment, new_instance_name, bots_path, bot_run_repo)
-
-    # 2. Fail-closed preconditions (P4, §7).
+    # 1. Fail-closed preconditions (P4, §7). ``resume_accept_ungraceful`` is read
+    #    from the deploy REQUEST only (never the yml, §3/invariant 4): a
+    #    flag-driven resume off an ungraceful source aborts unless the operator
+    #    made the deliberate request-level override.
     guard_report = await run_guards(source, new_data_dir, deployment, docker_client, bot_run_repo)
 
-    # 3. Config-derived copy set (P3, §6).
-    plan = compute_copy_plan(new_instance_dir, source, deployment)
+    # 2. Config-derived copy set (P3, §6). Flag-driven: only flagged controllers.
+    plan = compute_copy_plan(
+        new_instance_dir, source, deployment, flagged_config_names=flagged_config_names
+    )
 
-    # 4. Execute the copies, containment-guarded, fail-closed on I/O error.
+    # 3. Execute the copies, containment-guarded, fail-closed on I/O error.
     files = _execute_copy_plan(plan, new_data_dir)
 
-    # 5. Config-drift diff (§12) — warn + record; template wins.
+    # 4. Config-drift diff (§12) — warn + record; template wins.
     drift = _diff_controller_configs(source, new_instance_dir)
     # CLA-M01: sizing-critical drift also rides the response, not just the log.
     # Ordered before the manifest is built so plan.structured_warnings (which
@@ -2867,7 +3043,7 @@ async def _seed(
     # deploy response) already carries these entries.
     _warn_sizing_critical_drift(drift, plan)
 
-    # 6. Audit manifest (§13) — also the double-resume detector: it lands in
+    # 5. Audit manifest (§13) — also the double-resume detector: it lands in
     #    data/ and trips the DEST_NOT_EMPTY guard of any later re-seed attempt.
     manifest = {
         "source_instance": source.instance_name,
@@ -2883,12 +3059,21 @@ async def _seed(
         "guard_report": guard_report.to_dict(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if resolution == "controller_flag":
+        # §5: identify HOW the source was resolved and WHICH controllers drove
+        # it. ``mode`` stays the REQUEST mode ("off" for a flag-driven resume) so
+        # the request path's manifest is byte-for-byte unchanged; ``resolution``
+        # is what disambiguates a flag-driven seed.
+        manifest["resolution"] = "controller_flag"
+        manifest["flagged_controllers"] = sorted(
+            fc.controller_id for fc in flagged_controllers
+        )
     new_data_dir.mkdir(parents=True, exist_ok=True)
     (new_data_dir / "resume.manifest.json").write_text(
         json.dumps(manifest, indent=2, default=str), encoding="utf-8"
     )
 
-    # 7. Structured events + the §13 one-liner.
+    # 6. Structured events + the §13 one-liner.
     decision_summary = {
         decision: sum(1 for d in plan.decisions.values() if d == decision)
         for decision in sorted(set(plan.decisions.values()))
@@ -2920,13 +3105,15 @@ async def seed_resume_state(
     bot_run_repo=None,
     new_instance_name: Optional[str] = None,
     created_by_this_attempt: bool = False,
+    controller_resume_flags: "Optional[Dict[str, str]]" = None,
 ) -> dict:
     """Seed a new instance's ``data/`` from a prior run — the copy-forward hook.
 
     Called by ``docker_service.create_hummingbot_instance`` after config
     staging and strictly before ``containers.run``, gated on
-    ``deployment.resume_mode != "off"`` (when off, this function is never
-    invoked and the deploy path is byte-identical to pre-hook behavior).
+    ``deployment.resume_mode != "off" or <any controller flagged latest>`` (when
+    neither holds, this function is never invoked and the deploy path is
+    byte-identical to pre-hook behavior).
 
     Args:
         deployment: The deploy model (``V2ControllerDeployment`` /
@@ -2953,6 +3140,11 @@ async def seed_resume_state(
             it up. Defaults to ``False`` — a directory this attempt did not
             create is never deleted (CDX-001), because its ``data/`` may be the
             operator's only copy of a ledger.
+        controller_resume_flags: Phase 1's staging collection,
+            ``{controller_file: "latest" | "off"}``. Drives the flag-driven
+            resume (§3/§4) when the request is ``off``; ``None`` / all-``off``
+            means request-only behavior. When the request itself resumes, these
+            are IGNORED (logged) — the request wins outright.
 
     Returns:
         The resume manifest dict (also written to ``data/resume.manifest.json``).
@@ -2975,10 +3167,11 @@ async def seed_resume_state(
                 return await _seed(
                     deployment, new_instance_dir, bots_path, docker_client,
                     BotRunRepository(session), new_instance_name,
+                    controller_resume_flags,
                 )
         return await _seed(
             deployment, new_instance_dir, bots_path, docker_client, bot_run_repo,
-            new_instance_name,
+            new_instance_name, controller_resume_flags,
         )
     except ResumeError as err:
         _log_resume_failed(new_instance_name, err.reason.value, err.message)
@@ -3127,19 +3320,34 @@ async def preview_resume(
     with tempfile.TemporaryDirectory() as _tmpdir:
         tmp_instance_dir = Path(_tmpdir)
 
-        # Stage template controller YAMLs so compute_copy_plan can read them.
+        # Stage template controller YAMLs so compute_copy_plan can read them, and
+        # collect the controller resume flags through the SAME phase-1 helper the
+        # deploy staging uses (§3/§4): flags come from the SOURCE ymls, so preview
+        # and deploy cannot disagree on which controllers are flagged. A flagged
+        # template is staged STRIPPED — byte-for-byte what the deploy stages — so
+        # the copy plan and the config-drift diff match the deploy's; a non-flagged
+        # one keeps today's plain copy. An invalid/unstrippable flag raises
+        # RESUME_FLAG_INVALID here, exactly as the deploy would (fail-closed).
+        controller_resume_flags: Dict[str, str] = {}
         controllers_dst = tmp_instance_dir / "conf" / "controllers"
         controllers_dst.mkdir(parents=True)
         for ctrl_name in ctrl_names:
             src = bots_path / "conf" / "controllers" / ctrl_name
-            if src.is_file():
-                shutil.copy2(src, controllers_dst / ctrl_name)
-            else:
+            if not src.is_file():
                 logger.warning(
                     "preview_resume: template '%s' not found at '%s' — "
                     "controller skipped in copy plan.",
                     ctrl_name, src,
                 )
+                continue
+            source_text = src.read_bytes().decode("utf-8")
+            staged_text, flag = stage_controller_config(source_text, controller_name=ctrl_name)
+            controller_resume_flags[ctrl_name] = flag.mode
+            if flag.present:
+                with open(controllers_dst / ctrl_name, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(staged_text)
+            else:
+                shutil.copy2(src, controllers_dst / ctrl_name)
 
         # Stage conf_client.yml for the sqlite-mode check.
         credentials_profile = getattr(deployment, "credentials_profile", None)
@@ -3155,8 +3363,46 @@ async def preview_resume(
         # ``latest`` strips the same base and excludes self exactly as the deploy
         # will — the old code passed the pre-stamp name here, which stripped a
         # DIFFERENT base whenever the operator's name itself ended in a stamp.
+        #
+        # Returns an ``outcome`` dict; its ``kind`` selects the response shape:
+        #   * "resumed" — a source resolved; guards/plan/drift ran (request-level
+        #     or flag-driven).
+        #   * "first_run" — flag-driven true first run: deploy would proceed
+        #     WITHOUT resume; carries the per-controller fresh-seed warnings.
+        #   * "no_resume" — request off and nothing flagged: no resume at all.
         async def _preview_run(repo):
-            source = await resolve_source(deployment, candidate_name, bots_path, repo)
+            flagged_latest = [n for n, m in controller_resume_flags.items() if m == "latest"]
+
+            # Precedence §3 — the SAME order the deploy applies.
+            if deployment.resume_mode != "off":
+                if flagged_latest:
+                    logger.info(
+                        "Preview: request-level resume_mode=%r wins; ignoring %d "
+                        "controller resume_mode: latest flag(s): %s.",
+                        deployment.resume_mode, len(flagged_latest), sorted(flagged_latest),
+                    )
+                source = await resolve_source(deployment, candidate_name, bots_path, repo)
+                resolution_label = "request"
+                flagged = None
+                flagged_config_names = None
+            elif flagged_latest:
+                # Flag-driven (§4): identity read from the SOURCE ymls (the default
+                # controllers_dir), the same fields the deploy reads from its
+                # stripped staged copies — only resume_mode differs, and the
+                # resolver ignores it.
+                res = resolve_controller_flag_source(
+                    controller_resume_flags, candidate_name, bots_path
+                )
+                if res.first_run:
+                    return {"kind": "first_run", "flagged": res.flagged}
+                source = res.source
+                resolution_label = "controller_flag"
+                flagged = res.flagged
+                flagged_config_names = {fc.config_name for fc in res.flagged}
+            else:
+                # Request off and nothing flagged: the deploy would not resume.
+                return {"kind": "no_resume"}
+
             # Guards run against the real target dir and its real ``data/``:
             # ``target_dir`` adds the §7.0 exclusive-creation check (DEST_EXISTS),
             # and DEST_NOT_EMPTY now inspects the path the deploy would actually
@@ -3170,7 +3416,10 @@ async def preview_resume(
                 target_dir=target_dir,
             )
             _preview_base_name_collision(bots_path, base_name, guard_report)
-            plan = compute_copy_plan(tmp_instance_dir, source, deployment)
+            plan = compute_copy_plan(
+                tmp_instance_dir, source, deployment,
+                flagged_config_names=flagged_config_names,
+            )
             # CLA-M01: the same diff the deploy runs, against the same two
             # inputs — the source instance's live YAMLs and the staged templates
             # (which is exactly what ``tmp_instance_dir/conf/controllers`` holds
@@ -3178,15 +3427,100 @@ async def preview_resume(
             # learning about it from the deploy response is learning too late.
             drift = _diff_controller_configs(source, tmp_instance_dir)
             _warn_sizing_critical_drift(drift, plan)
-            return source, guard_report, plan, drift
+            return {
+                "kind": "resumed",
+                "source": source,
+                "guard_report": guard_report,
+                "plan": plan,
+                "drift": drift,
+                "resolution": resolution_label,
+                "flagged": flagged,
+            }
 
         if bot_run_repo is None and db_manager is not None:
             from database import BotRunRepository
 
             async with db_manager.get_session_context() as session:
-                source, guard_report, plan, drift = await _preview_run(BotRunRepository(session))
+                outcome = await _preview_run(BotRunRepository(session))
         else:
-            source, guard_report, plan, drift = await _preview_run(bot_run_repo)
+            outcome = await _preview_run(bot_run_repo)
+
+        target_block = {
+            "base_name": base_name,
+            "instance_name": candidate_name,
+            "path": str(target_dir),
+            # Honesty, not a disclaimer: the deploy mints its own name (with fresh
+            # entropy) when it runs, so this exact name is not the one that will
+            # exist. The guards ran against the real tree under this name's real
+            # path; what they cannot do is reserve it.
+            "name_is_representative": True,
+            "note": (
+                "The deploy generates a fresh unique instance name at deploy "
+                "time, so the final name will differ in its timestamp and "
+                "random suffix. Guards above were evaluated against the real "
+                "bots/instances/ tree."
+            ),
+        }
+
+        if outcome["kind"] == "no_resume":
+            # Request off and nothing flagged — the deploy would resume nothing.
+            return {
+                "resolved_source": None,
+                "target": target_block,
+                "files": [],
+                "decisions": {},
+                "warnings": [],
+                "drift": [],
+                "guard_report": GuardReport().to_dict(),
+                "resolution": "none",
+                "would_succeed": True,
+                "note": (
+                    "No request-level resume and no controller resume_mode: latest "
+                    "flag — this deploy would not resume any prior state."
+                ),
+            }
+
+        if outcome["kind"] == "first_run":
+            # Flag-driven true first run (§3): the deploy proceeds WITHOUT resume.
+            # Surface the RESUME_FIRST_RUN_FRESH_SEED warnings on the response —
+            # loud, not just logged. The only deploy-time guard that runs without a
+            # source is target availability, so run just that (DEST_EXISTS still
+            # aborts, matching the deploy).
+            report = GuardReport()
+            guard_target_available(target_dir, report)
+            _preview_base_name_collision(bots_path, base_name, report)
+            warnings = []
+            for fc in outcome["flagged"]:
+                warnings.append({
+                    "code": "RESUME_FIRST_RUN_FRESH_SEED",
+                    "message": (
+                        f"Controller '{fc.controller_id}' is flagged resume_mode: "
+                        f"latest but no prior instance carries its ledger "
+                        f"'{fc.ledger_name}'. This is a true first run: the "
+                        f"controller would start fresh (seed from the wallet) and "
+                        f"no state would be copied."
+                    ),
+                    "controller_id": fc.controller_id,
+                    "ledger_name": fc.ledger_name,
+                })
+            return {
+                "resolved_source": None,
+                "target": target_block,
+                "files": [],
+                "decisions": {},
+                "warnings": warnings,
+                "drift": [],
+                "guard_report": report.to_dict(),
+                "resolution": "controller_flag",
+                "first_run": True,
+                "flagged_controllers": sorted(fc.controller_id for fc in outcome["flagged"]),
+                "would_succeed": True,
+            }
+
+        source = outcome["source"]
+        guard_report = outcome["guard_report"]
+        plan = outcome["plan"]
+        drift = outcome["drift"]
 
         # Build the files list from the planned (not executed) copy set.
         # Sizes and sha256 are computed from the SOURCE files — no copy occurs.
@@ -3208,35 +3542,20 @@ async def preview_resume(
                 pass  # best-effort; guard already validated the ledger
             files.append(entry)
 
-        return {
+        response = {
             "resolved_source": {
                 "instance_name": source.instance_name,
                 "data_dir": str(source.data_dir),
                 "origin": source.origin,
             },
-            "target": {
-                "base_name": base_name,
-                "instance_name": candidate_name,
-                "path": str(target_dir),
-                # Honesty, not a disclaimer: the deploy mints its own name (with
-                # fresh entropy) when it runs, so this exact name is not the one
-                # that will exist. The guards above ran against the real tree
-                # under this name's real path; what they cannot do is reserve it.
-                "name_is_representative": True,
-                "note": (
-                    "The deploy generates a fresh unique instance name at deploy "
-                    "time, so the final name will differ in its timestamp and "
-                    "random suffix. Guards above were evaluated against the real "
-                    "bots/instances/ tree."
-                ),
-            },
+            "target": target_block,
             "files": files,
             "decisions": dict(plan.decisions),
             # Structured, machine-readable warnings (C1 opt-out skips land here,
-            # CLA-M01's sizing-critical drift entries alongside them). The preview
-            # is a pre-deploy check: a skip — or a silent resize — the deploy
-            # would perform is exactly what an operator needs to see BEFORE
-            # deploying.
+            # CLA-M01's sizing-critical drift entries alongside them, and a
+            # flag-driven resume's skipped_not_flagged entries). The preview is a
+            # pre-deploy check: a skip — or a silent resize — the deploy would
+            # perform is exactly what an operator needs to see BEFORE deploying.
             "warnings": list(plan.structured_warnings),
             # The full field-level diff (CLA-M01), classified. The warnings above
             # are the sizing-critical subset; this is everything, for an operator
@@ -3245,3 +3564,12 @@ async def preview_resume(
             "guard_report": guard_report.to_dict(),
             "would_succeed": True,
         }
+        if outcome["resolution"] == "controller_flag":
+            # Preview parity with the flag-driven deploy manifest (§5): report how
+            # the source was resolved and which controllers drove it. Request-level
+            # previews are byte-for-byte unchanged (these keys are absent).
+            response["resolution"] = "controller_flag"
+            response["flagged_controllers"] = sorted(
+                fc.controller_id for fc in outcome["flagged"]
+            )
+        return response

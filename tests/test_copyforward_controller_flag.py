@@ -47,20 +47,30 @@ import json
 import logging
 import os
 import pathlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
 
 import pytest
+from docker.errors import NotFound as DockerNotFound
 
+from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
+from ledger_fixtures import valid_ledger_payload
 from models.bot_orchestration import V2ControllerDeployment
 from services.docker_service import DockerService
 from services.resume_service import (
     ControllerResumeFlag,
+    CopyPlan,
     ResolvedSource,
     ResumeAbortReason,
     ResumeError,
+    compute_copy_plan,
     parse_controller_resume_flag,
+    preview_resume,
     resolve_controller_flag_source,
+    seed_resume_state,
     stage_controller_config,
 )
 
@@ -1050,3 +1060,513 @@ class TestResolverIndeterminateProbes:
         with pytest.raises(ResumeError) as ei:
             resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
         assert ei.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+
+
+# ===========================================================================
+# Phase 3 — §3 activation/precedence, §5 downstream intent, preview parity
+# ===========================================================================
+#
+# Every expected value here is derived from the SPEC:
+#   * precedence: request resume_mode != "off" wins outright and IGNORES flags;
+#     request "off" + >=1 flagged latest runs the resolver; neither -> no hook.
+#   * a non-flagged controller in a flag-driven resume is NOT copied even when
+#     the source holds its ledger (decision "skipped_not_flagged" + warning).
+#   * a true first run proceeds WITHOUT resume, warns RESUME_FIRST_RUN_FRESH_SEED
+#     on the response, and writes NO manifest.
+#   * resume_accept_ungraceful stays REQUEST-ONLY (never a yml key).
+#   * preview reports the SAME source and plan the deploy uses (shared helper).
+# Filesystem via tmp_path; Docker is a MagicMock (containers.run is a spy, never
+# a real daemon); DB is fake repos.
+
+# Dashboard reality (spec §4): the controller id is stable; instance names embed
+# the API timestamp, so the two deploys share NO base name.
+P3_CID = "k_range_inventory_ladder_flag_a_V1"
+P3_CID2 = "k_range_inventory_ladder_flag_b_V1"
+P3_LEDGER = f"range_inventory_ladder_{P3_CID}.json"
+P3_LEDGER2 = f"range_inventory_ladder_{P3_CID2}.json"
+P3_FLAGGED_FILE = "flagged_ctrl.yml"
+P3_PLAIN_FILE = "plain_ctrl.yml"
+P3_SRC = "KRAKEN_LADDER_V1-20260101-010000"
+P3_SRC_OLD = "KRAKEN_LADDER_V1-20250101-010000"
+P3_NEW = "DASH_DEPLOY_V1-20260701-020000"
+P3_SCRIPT = f"{P3_NEW}.yml"
+P3_IMAGE = "hummingbot/hummingbot:v2.9"
+P3_PASSWORD = "test-password"
+
+_P3_RETIREMENT_TS = "2026-07-10T12:00:00+00:00"
+_P3_VERIFIED_EVIDENCE_JSON = json.dumps({
+    **{k: _P3_RETIREMENT_TS for k in REQUIRED_RETIREMENT_EVIDENCE},
+    "skip_order_cancellation": False,
+    "cancellation_requested_at": _P3_RETIREMENT_TS,
+})
+
+
+def _p3_template_doc(cid, *, flagged, connector="nonkyc", pair="XMR-USDT", state_file_name=None):
+    doc = {
+        "id": cid,
+        "controller_name": "range_inventory_ladder",
+        "controller_type": "market_making",
+        "connector_name": connector,
+        "trading_pair": pair,
+    }
+    if flagged:
+        doc["resume_mode"] = "latest"
+    if state_file_name is not None:
+        doc["state_file_name"] = state_file_name
+    return doc
+
+
+def _p3_write_template(bots, filename, cid, *, flagged, **kw):
+    cdir = bots / "conf" / "controllers"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / filename).write_text(
+        yaml.safe_dump(_p3_template_doc(cid, flagged=flagged, **kw)), encoding="utf-8"
+    )
+
+
+def _p3_write_source(bots, name, ledgers, *, tree="instances"):
+    """Fabricate a stopped source instance carrying ``ledgers`` — a list of
+    ``(ledger_name, cid)`` pairs, each with a valid envelope + matching .owner.
+    No conf/controllers is written, so the drift diff stays empty."""
+    inst = bots / tree / name
+    data = inst / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    for ledger_name, cid in ledgers:
+        data.joinpath(ledger_name).write_bytes(json.dumps(valid_ledger_payload(cid)).encode())
+        data.joinpath(f"{ledger_name}.owner").write_text(
+            json.dumps({"controller_id": cid}), encoding="utf-8"
+        )
+    return inst
+
+
+def _p3_write_script(bots, controller_files, script_name=P3_SCRIPT):
+    scripts = bots / "conf" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / script_name).write_text(
+        yaml.safe_dump(
+            {"script_file_name": "v2_with_controllers.py", "controllers_config": controller_files}
+        ),
+        encoding="utf-8",
+    )
+
+
+def _p3_write_credentials(bots):
+    creds = bots / "credentials" / "master_account"
+    creds.mkdir(parents=True, exist_ok=True)
+    # Postgres db_mode -> the copy plan adds no per-instance sqlite (this operator).
+    (creds / "conf_client.yml").write_text(
+        yaml.safe_dump({"db_mode": {"db_engine": "postgres+asyncpg"}}), encoding="utf-8"
+    )
+    (creds / "connectors").mkdir(exist_ok=True)
+
+
+@pytest.fixture
+def p3_bots(tmp_path, monkeypatch):
+    """A chdir'd bots/ tree with credentials only — tests add templates/sources."""
+    monkeypatch.chdir(tmp_path)
+    bots = tmp_path / "bots"
+    _p3_write_credentials(bots)
+    return bots
+
+
+@pytest.fixture
+def p3_security(monkeypatch, tmp_path):
+    from config import settings
+
+    monkeypatch.setattr(settings.security, "config_password", P3_PASSWORD)
+    monkeypatch.setattr("services.docker_service.ensure_gateway_certs", MagicMock())
+    monkeypatch.setattr(
+        "services.docker_service.gateway_certs_dir",
+        MagicMock(return_value=str(tmp_path / "certs")),
+    )
+
+
+def _p3_client(*, src_not_found=True, src_status="exited", on_run=None):
+    client = MagicMock()
+    if src_not_found:
+        client.containers.get.side_effect = DockerNotFound("x")
+    else:
+        container = MagicMock()
+        container.status = src_status
+        client.containers.get.return_value = container
+    if on_run is not None:
+        client.containers.run.side_effect = on_run
+    return client
+
+
+def _p3_service(client, db_manager=None):
+    service = DockerService.__new__(DockerService)
+    service.SOURCE_PATH = os.getcwd()
+    service.db_manager = db_manager
+    service._pull_status = {}
+    service._cleanup_thread = None
+    service.client = client
+    return service
+
+
+def _p3_deployment(**overrides):
+    kwargs = dict(
+        instance_name=P3_NEW,
+        credentials_profile="master_account",
+        controllers_config=[P3_FLAGGED_FILE],
+        script_config=P3_SCRIPT,
+        image=P3_IMAGE,
+        resume_mode="off",  # what a dashboard deploy sends
+        # No DB is wired in these tests -> unknown history is ungraceful; the
+        # request-level override opts in (the guard itself is P4-tested). The
+        # override is REQUEST-ONLY on purpose (invariant 4) — never a yml key.
+        resume_accept_ungraceful=True,
+    )
+    kwargs.update(overrides)
+    return V2ControllerDeployment(**kwargs)
+
+
+def _p3_read_manifest(bots, name=P3_NEW):
+    return json.loads(
+        (bots / "instances" / name / "data" / "resume.manifest.json").read_text(encoding="utf-8")
+    )
+
+
+def _p3_new_data(bots, name=P3_NEW):
+    return bots / "instances" / name / "data"
+
+
+# ---------------------------------------------------------------------------
+# §5 copy-plan filter — compute_copy_plan(flagged_config_names=...) (unit)
+# ---------------------------------------------------------------------------
+
+class TestCopyPlanFlaggedFilter:
+    """Direct unit coverage of the skipped_not_flagged branch — cheaper and more
+    pinpoint than the e2e path, and it kills the mutation 'ignore the filter and
+    copy everyone'."""
+
+    def _source(self, bots, ledgers, name=P3_SRC):
+        inst = _p3_write_source(bots, name, ledgers)
+        return ResolvedSource(
+            instance_name=name, data_dir=inst / "data", instance_dir=inst, origin="instances"
+        )
+
+    def _new_with(self, bots, controllers, name=P3_NEW):
+        cdir = bots / "instances" / name / "conf" / "controllers"
+        cdir.mkdir(parents=True, exist_ok=True)
+        for filename, cid, flagged in controllers:
+            (cdir / filename).write_text(
+                yaml.safe_dump(_p3_template_doc(cid, flagged=flagged)), encoding="utf-8"
+            )
+        # Postgres conf_client so no sqlite is planned.
+        (bots / "instances" / name / "conf" / "conf_client.yml").write_text(
+            yaml.safe_dump({"db_mode": {"db_engine": "postgres+asyncpg"}}), encoding="utf-8"
+        )
+        return bots / "instances" / name
+
+    def _dep(self):
+        return SimpleNamespace(resume_extra_paths=None, allow_absolute_state_file_name=False)
+
+    def test_non_flagged_controller_is_skipped_not_flagged(self, tmp_path):
+        bots = tmp_path / "bots"
+        source = self._source(bots, [(P3_LEDGER, P3_CID), (P3_LEDGER2, P3_CID2)])
+        new = self._new_with(
+            bots, [(P3_FLAGGED_FILE, P3_CID, True), (P3_PLAIN_FILE, P3_CID2, False)]
+        )
+
+        plan = compute_copy_plan(
+            new, source, self._dep(), flagged_config_names={P3_FLAGGED_FILE}
+        )
+
+        assert plan.decisions == {P3_CID: "copied", P3_CID2: "skipped_not_flagged"}
+        # The flagged controller's ledger is planned; the non-flagged one's is NOT.
+        copied_dsts = {it.dst.name for it in plan.files_to_copy}
+        assert P3_LEDGER in copied_dsts
+        assert P3_LEDGER2 not in copied_dsts
+        # ...and the intent is a STRUCTURED warning naming the controller + ledger.
+        skipped = [w for w in plan.structured_warnings if w["code"] == "RESUME_SKIPPED_NOT_FLAGGED"]
+        assert len(skipped) == 1
+        assert skipped[0]["controller_id"] == P3_CID2
+        assert skipped[0]["ledger_name"] == P3_LEDGER2
+        assert skipped[0]["ledger_present"] is True
+
+    def test_none_filter_copies_every_controller(self, tmp_path):
+        # flagged_config_names=None is the request-level path: unchanged, both copy.
+        bots = tmp_path / "bots"
+        source = self._source(bots, [(P3_LEDGER, P3_CID), (P3_LEDGER2, P3_CID2)])
+        new = self._new_with(
+            bots, [(P3_FLAGGED_FILE, P3_CID, True), (P3_PLAIN_FILE, P3_CID2, False)]
+        )
+
+        plan = compute_copy_plan(new, source, self._dep(), flagged_config_names=None)
+
+        assert plan.decisions == {P3_CID: "copied", P3_CID2: "copied"}
+        assert not any(
+            w["code"] == "RESUME_SKIPPED_NOT_FLAGGED" for w in plan.structured_warnings
+        )
+
+    def test_skipped_warning_notes_absent_ledger(self, tmp_path):
+        # Source holds ONLY the flagged controller's ledger; the skipped one's is
+        # absent -> the warning says so (ledger_present False), still not copied.
+        bots = tmp_path / "bots"
+        source = self._source(bots, [(P3_LEDGER, P3_CID)])
+        new = self._new_with(
+            bots, [(P3_FLAGGED_FILE, P3_CID, True), (P3_PLAIN_FILE, P3_CID2, False)]
+        )
+
+        plan = compute_copy_plan(
+            new, source, self._dep(), flagged_config_names={P3_FLAGGED_FILE}
+        )
+
+        assert plan.decisions[P3_CID2] == "skipped_not_flagged"
+        skipped = [w for w in plan.structured_warnings if w["code"] == "RESUME_SKIPPED_NOT_FLAGGED"]
+        assert skipped[0]["ledger_present"] is False
+
+
+# ---------------------------------------------------------------------------
+# §3 precedence + activation, via the real deploy entry point
+# ---------------------------------------------------------------------------
+
+class TestFlagDrivenDeploy:
+    @pytest.mark.asyncio
+    async def test_flag_driven_resume_copies_flagged_ledger(self, p3_bots, p3_security):
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])
+
+        client = _p3_client()
+        service = _p3_service(client)
+        response = await service.create_hummingbot_instance(_p3_deployment())
+
+        assert response["success"] is True
+        client.containers.run.assert_called_once()
+        manifest = _p3_read_manifest(p3_bots)
+        # Resolved by the controller flag, off the identity-keyed source.
+        assert manifest["resolution"] == "controller_flag"
+        assert manifest["flagged_controllers"] == [P3_CID]
+        assert manifest["source_instance"] == P3_SRC
+        assert manifest["mode"] == "off"  # request mode is unchanged
+        assert manifest["decisions"] == {P3_CID: "copied"}
+        # The ledger landed byte-identical before launch.
+        landed = (_p3_new_data(p3_bots) / P3_LEDGER).read_bytes()
+        assert landed == json.dumps(valid_ledger_payload(P3_CID)).encode()
+
+    @pytest.mark.asyncio
+    async def test_request_mode_wins_and_ignores_flags(self, p3_bots, p3_security, caplog):
+        # The template is flagged, but the request asks for an EXPLICIT source
+        # DIFFERENT from (and older than) the flag winner. Request wins outright:
+        # the explicit source is used, the flag is ignored, and the manifest is
+        # the request-path shape (mode=explicit, no "resolution" key).
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC_OLD, [(P3_LEDGER, P3_CID)])   # explicit target
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])       # newer flag winner
+
+        client = _p3_client()
+        service = _p3_service(client)
+        with caplog.at_level(logging.INFO, logger="services.resume_service"):
+            response = await service.create_hummingbot_instance(
+                _p3_deployment(resume_mode="explicit", resume_from=P3_SRC_OLD)
+            )
+
+        assert response["success"] is True
+        manifest = _p3_read_manifest(p3_bots)
+        assert manifest["mode"] == "explicit"
+        assert manifest["source_instance"] == P3_SRC_OLD  # NOT the newer flag winner
+        assert "resolution" not in manifest
+        assert "flagged_controllers" not in manifest
+        # The ignore is logged (info), not silent.
+        assert any("ignoring" in r.getMessage() and "flag" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_no_request_no_flags_does_not_invoke_hook(self, p3_bots, p3_security):
+        # A NON-flagged template + request off: the resume hook is never entered,
+        # and the new data/ is empty (byte-for-byte pre-feature behavior).
+        _p3_write_template(p3_bots, P3_PLAIN_FILE, P3_CID, flagged=False)
+        _p3_write_script(p3_bots, [P3_PLAIN_FILE])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])
+
+        client = _p3_client()
+        service = _p3_service(client)
+        with patch("services.docker_service.seed_resume_state", new=AsyncMock()) as spy:
+            response = await service.create_hummingbot_instance(
+                _p3_deployment(controllers_config=[P3_PLAIN_FILE], resume_accept_ungraceful=False)
+            )
+
+        spy.assert_not_called()
+        assert response["success"] is True
+        assert list((_p3_new_data(p3_bots)).iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_non_flagged_controller_not_copied_in_flag_driven(self, p3_bots, p3_security):
+        # Two controllers staged, only one flagged; the source holds BOTH ledgers.
+        # The non-flagged one is skipped_not_flagged (its ledger left behind) even
+        # though the source has it — with a structured warning on the response.
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_template(p3_bots, P3_PLAIN_FILE, P3_CID2, flagged=False)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE, P3_PLAIN_FILE])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID), (P3_LEDGER2, P3_CID2)])
+
+        client = _p3_client()
+        service = _p3_service(client)
+        response = await service.create_hummingbot_instance(
+            _p3_deployment(controllers_config=[P3_FLAGGED_FILE, P3_PLAIN_FILE])
+        )
+
+        assert response["success"] is True
+        manifest = _p3_read_manifest(p3_bots)
+        assert manifest["decisions"] == {P3_CID: "copied", P3_CID2: "skipped_not_flagged"}
+        # The flagged ledger landed; the non-flagged one did NOT (left behind).
+        assert (_p3_new_data(p3_bots) / P3_LEDGER).exists()
+        assert not (_p3_new_data(p3_bots) / P3_LEDGER2).exists()
+        codes = [(w["code"], w.get("controller_id")) for w in response.get("resume_warnings", [])]
+        assert ("RESUME_SKIPPED_NOT_FLAGGED", P3_CID2) in codes
+
+    @pytest.mark.asyncio
+    async def test_true_first_run_proceeds_without_resume_or_manifest(self, p3_bots, p3_security):
+        # Flagged controller, but NO prior instance carries its ledger -> true
+        # first run: deploy proceeds, RESUME_FIRST_RUN_FRESH_SEED on the response,
+        # data/ empty, and NO manifest written.
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        # A prior instance that carries a DIFFERENT controller's ledger only.
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER2, P3_CID2)])
+
+        client = _p3_client()
+        service = _p3_service(client)
+        response = await service.create_hummingbot_instance(_p3_deployment())
+
+        assert response["success"] is True
+        client.containers.run.assert_called_once()
+        # No manifest: nothing was resumed.
+        assert not (_p3_new_data(p3_bots) / "resume.manifest.json").exists()
+        assert not (_p3_new_data(p3_bots) / P3_LEDGER).exists()
+        # ...but the fresh seed is LOUD on the response.
+        warns = response.get("resume_warnings", [])
+        first_run = [w for w in warns if w["code"] == "RESUME_FIRST_RUN_FRESH_SEED"]
+        assert len(first_run) == 1
+        assert first_run[0]["controller_id"] == P3_CID
+        assert first_run[0]["ledger_name"] == P3_LEDGER
+
+    @pytest.mark.asyncio
+    async def test_flag_driven_ungraceful_source_aborts_request_only(self, p3_bots, p3_security):
+        # A flag-driven resume off an ungraceful source (no DB history, no request
+        # override) MUST abort UNGRACEFUL_SOURCE. There is no yml route to the
+        # override — it is REQUEST-ONLY (invariant 4) — so the dashboard deploy is
+        # refused rather than silently disarming the money-guard.
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])
+
+        client = _p3_client()
+        service = _p3_service(client)
+        with pytest.raises(ResumeError) as ei:
+            await service.create_hummingbot_instance(
+                _p3_deployment(resume_accept_ungraceful=False)
+            )
+        assert ei.value.reason == ResumeAbortReason.UNGRACEFUL_SOURCE
+        client.containers.run.assert_not_called()
+        # No half-seeded instance left behind.
+        assert not (p3_bots / "instances" / P3_NEW).exists()
+
+
+# ---------------------------------------------------------------------------
+# Preview parity — the same source + plan the deploy uses (§4/§5)
+# ---------------------------------------------------------------------------
+
+def _p3_graceful_repo(instance_name):
+    run = SimpleNamespace(
+        instance_name=instance_name,
+        run_status="STOPPED",
+        stopped_at="2026-07-10",
+        retirement_status="VERIFIED",
+        retirement_evidence=_P3_VERIFIED_EVIDENCE_JSON,
+    )
+    repo = AsyncMock()
+    repo.get_bot_runs = AsyncMock(return_value=[run])
+    return repo
+
+
+class TestPreviewFlagParity:
+    @pytest.mark.asyncio
+    async def test_preview_flag_driven_matches_deploy_source_and_plan(self, p3_bots, p3_security):
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])
+
+        # Preview (read-only): source container absent -> guard passes; graceful
+        # repo so the ungraceful guard is clean without the override.
+        preview = await preview_resume(
+            deployment=_p3_deployment(resume_accept_ungraceful=False),
+            bots_path=p3_bots,
+            docker_client=_p3_client(),
+            bot_run_repo=_p3_graceful_repo(P3_SRC),
+        )
+        assert preview["would_succeed"] is True
+        assert preview["resolution"] == "controller_flag"
+        assert preview["flagged_controllers"] == [P3_CID]
+        assert preview["resolved_source"]["instance_name"] == P3_SRC
+        assert preview["decisions"] == {P3_CID: "copied"}
+        assert P3_LEDGER in {os.path.basename(f["dst"]) for f in preview["files"]}
+
+        # Deploy the SAME tree and confirm it resolves to the SAME source.
+        service = _p3_service(_p3_client())
+        response = await service.create_hummingbot_instance(_p3_deployment())
+        assert response["success"] is True
+        manifest = _p3_read_manifest(p3_bots)
+        assert manifest["source_instance"] == preview["resolved_source"]["instance_name"]
+        assert manifest["resolution"] == "controller_flag"
+        assert manifest["decisions"] == preview["decisions"]
+
+    @pytest.mark.asyncio
+    async def test_preview_true_first_run_reports_fresh_seed(self, p3_bots, p3_security):
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        # No carrier for the flagged controller anywhere.
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER2, P3_CID2)])
+
+        preview = await preview_resume(
+            deployment=_p3_deployment(resume_accept_ungraceful=False),
+            bots_path=p3_bots,
+            docker_client=_p3_client(),
+            bot_run_repo=AsyncMock(get_bot_runs=AsyncMock(return_value=[])),
+        )
+        assert preview["would_succeed"] is True
+        assert preview.get("first_run") is True
+        assert preview["resolved_source"] is None
+        first_run = [w for w in preview["warnings"] if w["code"] == "RESUME_FIRST_RUN_FRESH_SEED"]
+        assert len(first_run) == 1
+        assert first_run[0]["controller_id"] == P3_CID
+
+    @pytest.mark.asyncio
+    async def test_preview_request_mode_ignores_flags(self, p3_bots, p3_security):
+        # Request explicit + flagged template: preview follows the request path
+        # (no "resolution" key), resolving the explicitly named source.
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC_OLD, [(P3_LEDGER, P3_CID)])
+        _p3_write_source(p3_bots, P3_SRC, [(P3_LEDGER, P3_CID)])
+
+        preview = await preview_resume(
+            deployment=_p3_deployment(resume_mode="explicit", resume_from=P3_SRC_OLD),
+            bots_path=p3_bots,
+            docker_client=_p3_client(),
+            bot_run_repo=_p3_graceful_repo(P3_SRC_OLD),
+        )
+        assert preview["would_succeed"] is True
+        assert preview["resolved_source"]["instance_name"] == P3_SRC_OLD
+        assert "resolution" not in preview  # request-path response unchanged
+
+    @pytest.mark.asyncio
+    async def test_preview_no_resume_no_flags(self, p3_bots, p3_security):
+        # Request off, non-flagged template: the deploy would resume nothing.
+        _p3_write_template(p3_bots, P3_PLAIN_FILE, P3_CID, flagged=False)
+        _p3_write_script(p3_bots, [P3_PLAIN_FILE])
+
+        preview = await preview_resume(
+            deployment=_p3_deployment(
+                controllers_config=[P3_PLAIN_FILE], resume_accept_ungraceful=False
+            ),
+            bots_path=p3_bots,
+            docker_client=_p3_client(),
+            bot_run_repo=AsyncMock(get_bot_runs=AsyncMock(return_value=[])),
+        )
+        assert preview["would_succeed"] is True
+        assert preview["resolution"] == "none"
+        assert preview["resolved_source"] is None
+        assert preview["files"] == []
