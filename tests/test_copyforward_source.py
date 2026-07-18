@@ -10,6 +10,11 @@ Covers services.resume_service.resolve_source for the ``explicit`` and
   * latest: directory-listing fallback on DB error
   * latest: exclude the instance being created
   * latest: timestamp tie -> abort; zero candidates -> abort
+  * latest: archive fall-through — archived winner resolves; instances/
+    precedence (archive never consulted, even when ambiguously nested);
+    nested-archive abort; compressed-only and hollow (conf-only) archives ->
+    not-found naming both roots with the not-resumable caveat; DB-down
+    fallback discovers archived/ (incl. singly-nested) with a deduped union
 
 All filesystem via ``tmp_path``; the bot-run repo is mocked via ``AsyncMock``.
 No Docker, no DB, no network.
@@ -255,3 +260,134 @@ class TestLatest:
         with pytest.raises(ResumeError) as exc:
             await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
         assert exc.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+
+    @pytest.mark.asyncio
+    async def test_archived_winner_resolves_when_instance_moved(self, tmp_path):
+        # The default stop flow moves instances/<name> -> archived/<name>;
+        # latest must fall through to the archive.
+        winner = "BASE-20260101-000000"
+        seed_instance(tmp_path, winner, tree="archived")  # nothing in instances/
+        repo = make_repo([winner])
+        dep = make_deployment(resume_mode="latest")
+        result = await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert result.instance_name == winner
+        assert result.origin == "archived"
+        assert result.instance_dir == tmp_path / "archived" / winner
+        assert result.data_dir == tmp_path / "archived" / winner / "data"
+
+    @pytest.mark.asyncio
+    async def test_instances_precedence_when_both_trees_have_winner(self, tmp_path):
+        # instances/ always wins if present; the archive is not even consulted.
+        # The archived copy is deliberately an AMBIGUOUS nest (base + nested
+        # same-name, both with data/): if the implementation consulted the
+        # archive despite live data/ existing, it would raise ARCHIVE_NESTED
+        # instead of returning the live source.
+        winner = "BASE-20260101-000000"
+        seed_instance(tmp_path, winner)
+        seed_instance(tmp_path, winner, tree="archived")
+        (tmp_path / "archived" / winner / winner / "data").mkdir(parents=True)
+        repo = make_repo([winner])
+        dep = make_deployment(resume_mode="latest")
+        result = await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert result.origin == "instances"
+        assert result.data_dir == tmp_path / "instances" / winner / "data"
+        assert result.instance_dir == tmp_path / "instances" / winner
+
+    @pytest.mark.asyncio
+    async def test_archived_nested_ambiguous_aborts(self, tmp_path):
+        # Same nesting pathology as the explicit path: both the base and its
+        # nested same-name copy look complete -> refuse, never pick one.
+        winner = "BASE-20260101-000000"
+        (tmp_path / "archived" / winner / "data").mkdir(parents=True)
+        (tmp_path / "archived" / winner / winner / "data").mkdir(parents=True)
+        repo = make_repo([winner])
+        dep = make_deployment(resume_mode="latest")
+        with pytest.raises(ResumeError) as exc:
+            await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert exc.value.reason == ResumeAbortReason.ARCHIVE_NESTED
+
+    @pytest.mark.asyncio
+    async def test_archived_compressed_only_aborts_naming_both_roots(self, tmp_path):
+        # Only a compressed tarball exists: not resumable (no extract path).
+        # The error must name BOTH searched roots and the compressed/S3 caveat.
+        winner = "BASE-20260101-000000"
+        archived = tmp_path / "archived"
+        archived.mkdir(parents=True)
+        (archived / f"{winner}_archive.tar.gz").write_bytes(b"gzip-stub")
+        repo = make_repo([winner])
+        dep = make_deployment(resume_mode="latest")
+        with pytest.raises(ResumeError) as exc:
+            await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert exc.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+        assert str(tmp_path / "instances" / winner / "data") in exc.value.message
+        assert str(tmp_path / "archived" / winner) in exc.value.message
+        # The caveat must carry its full meaning, not just mention S3: the
+        # compressed marker AND the "not resumable" refusal (§ spec: "notes
+        # compressed/S3 archives are not resumable").
+        assert "*_archive.tar.gz" in exc.value.message
+        assert "S3" in exc.value.message
+        assert "not resumable" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_archived_hollow_dir_aborts_source_not_found(self, tmp_path):
+        # An archived dir that LOOKS like an instance (conf/ present) but has
+        # no data/ must fail closed: the resolver returns the base dir, and the
+        # post-resolution data/ guard refuses. Never resolve a dataless source.
+        winner = "BASE-20260101-000000"
+        seed_instance(tmp_path, winner, tree="archived", with_data=False, with_conf=True)
+        repo = make_repo([winner])
+        dep = make_deployment(resume_mode="latest")
+        with pytest.raises(ResumeError) as exc:
+            await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert exc.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+        assert str(tmp_path / "instances" / winner / "data") in exc.value.message
+        assert str(tmp_path / "archived" / winner) in exc.value.message
+        assert "not resumable" in exc.value.message
+
+    @pytest.mark.asyncio
+    async def test_directory_fallback_discovers_archived_winner(self, tmp_path):
+        # DB down: the directory fallback must list archived/ too, so an
+        # archived winner is still discoverable.
+        older = "BASE-20260101-000000"
+        newest = "BASE-20260103-000000"
+        seed_instance(tmp_path, older)
+        seed_instance(tmp_path, newest, tree="archived")
+        repo = make_repo(error=RuntimeError("db down"))
+        dep = make_deployment(resume_mode="latest")
+        result = await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert result.instance_name == newest
+        assert result.origin == "archived"
+        assert result.data_dir == tmp_path / "archived" / newest / "data"
+
+    @pytest.mark.asyncio
+    async def test_directory_fallback_discovers_singly_nested_archived_winner(self, tmp_path):
+        # DB down, and the ONLY source is a singly-nested archive:
+        # archived/<name>/<name>/data with NOTHING at the base level. The base
+        # dir fails _looks_like_instance(), so any plausibility pre-filter at
+        # collection time would make this winner undiscoverable — the spec
+        # forbids that filter; plausibility is judged at resolution time by
+        # the shared archive resolver, which resolves the nested level.
+        winner = "BASE-20260103-000000"
+        (tmp_path / "archived" / winner / winner / "data").mkdir(parents=True)
+        repo = make_repo(error=RuntimeError("db down"))
+        dep = make_deployment(resume_mode="latest")
+        result = await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert result.instance_name == winner
+        assert result.origin == "archived"
+        assert result.instance_dir == tmp_path / "archived" / winner / winner
+        assert result.data_dir == tmp_path / "archived" / winner / winner / "data"
+
+    @pytest.mark.asyncio
+    async def test_directory_fallback_same_name_both_trees_not_ambiguous(self, tmp_path):
+        # DB down, same name in BOTH trees: one instance in two places, not
+        # duplicated lineage -> deduped union resolves with instances/
+        # precedence instead of aborting LATEST_AMBIGUOUS.
+        winner = "BASE-20260101-000000"
+        seed_instance(tmp_path, winner)
+        seed_instance(tmp_path, winner, tree="archived")
+        repo = make_repo(error=RuntimeError("db down"))
+        dep = make_deployment(resume_mode="latest")
+        result = await resolve_source(dep, "BASE-20260305-000000", tmp_path, repo)
+        assert result.instance_name == winner
+        assert result.origin == "instances"
+        assert result.data_dir == tmp_path / "instances" / winner / "data"
