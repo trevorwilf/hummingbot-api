@@ -34,12 +34,16 @@ WORKDIR /hummingbot-api
 
 # Copy only necessary application files
 # alembic.ini + alembic/ MUST ship in the image (CDX-013/CDX-R01): the migrate
-# service runs `cd /hummingbot-api && [ -f alembic.ini ] && alembic upgrade head`
-# and SKIPS silently when alembic.ini is absent, and the API's own startup
-# schema check imports the scaffold — without these the whole migration
-# mechanism is inert in production.
+# service runs `bash scripts/run-migrations.sh` (see below), which needs alembic.ini
+# and alembic/versions present, and the API's own startup schema check imports the
+# scaffold — without these the whole migration mechanism is inert in production.
 COPY main.py config.py deps.py alembic.ini ./
 COPY alembic ./alembic
+# scripts/run-migrations.sh is the migrate init container's entrypoint. It ships in the image
+# so it stays versioned with the alembic revisions above (CDX-013): the stack's migrate
+# service runs `bash scripts/run-migrations.sh`, which adopts a legacy DB (stamp baseline)
+# before upgrading, and is a plain `upgrade head` for fresh or already-tracked databases.
+COPY scripts ./scripts
 COPY models ./models
 COPY routers ./routers
 COPY services ./services

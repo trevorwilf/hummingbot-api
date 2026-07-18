@@ -23,6 +23,10 @@ sync sqlite Connection (the pattern established in test_retirement_fsm.py) —
 the real check function runs against a real database.
 """
 import asyncio
+import os
+import shutil
+import stat
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -467,9 +471,10 @@ class TestDeadCodeRemoved:
 class TestMigrateServiceCompatibility:
 
     def test_alembic_ini_is_at_the_invocation_root(self):
-        """The stacks run `cd /hummingbot-api && [ -f alembic.ini ] && alembic
-        upgrade head` ("hummingbot stack - no vpn":227-229, "- vpn":347-349).
-        alembic.ini must therefore sit at the repo root, which is that CWD.
+        """The stacks' migrate service runs `bash scripts/run-migrations.sh`,
+        which `cd`s to the app root and checks `[ -f alembic.ini ]` before doing
+        anything. alembic.ini and the alembic/ scaffold must therefore sit at
+        the repo root, which is that CWD in the built image.
         """
         assert (REPO_ROOT / "alembic.ini").is_file()
         assert (REPO_ROOT / "alembic" / "env.py").is_file()
@@ -549,6 +554,152 @@ class TestMigrateServiceCompatibility:
         from config import DatabaseSettings
 
         assert DatabaseSettings().url == target
+
+
+# ===========================================================================
+# The migrate entrypoint script — scripts/run-migrations.sh (CDX-013 adoption)
+# ===========================================================================
+
+MIGRATE_SCRIPT = REPO_ROOT / "scripts" / "run-migrations.sh"
+
+
+def _resolve_working_bash():
+    """Return the FULL path of a bash that can actually execute, or None.
+
+    `shutil.which("bash")` alone is not enough on Windows: it may resolve to the
+    WSL launcher (System32\\bash.exe) with no distro behind it, which fails to
+    exec. Worse, invoking the bare name "bash" via subprocess uses Windows'
+    CreateProcess search (System32 BEFORE PATH), so the guard and the test could
+    pick different bashes. Resolving to one full path and using it in BOTH the
+    probe and the test call keeps them consistent: the tests run wherever bash
+    really works (Linux CI, Git Bash) and skip cleanly where it does not.
+    """
+    exe = shutil.which("bash")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, "-c", "echo ok"], capture_output=True,
+                              text=True, timeout=15)
+    except OSError:
+        return None
+    return exe if (proc.returncode == 0 and proc.stdout.strip() == "ok") else None
+
+
+_BASH = _resolve_working_bash()
+
+
+class TestMigrateScriptWiring:
+    """Static cross-checks: the script ships in the image and stays consistent
+    with the alembic revisions it drives. These are the mirror-drift tripwires
+    for the parts a Linux-only behavioural run cannot assert on every platform.
+    """
+
+    def test_script_ships_in_the_image(self):
+        """The migrate service runs `bash scripts/run-migrations.sh` from the
+        BUILT image (nothing mounts the repo), so the Dockerfile must COPY the
+        scripts/ directory. Mutation this catches: deleting `COPY scripts
+        ./scripts` — the service would then find nothing to run.
+        """
+        assert MIGRATE_SCRIPT.is_file()
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        copy_lines = [ln.strip() for ln in dockerfile.splitlines()
+                      if ln.strip().upper().startswith("COPY")]
+        # A COPY whose source list (everything but the destination) names scripts/.
+        assert any("scripts" in ln.split()[1:-1] for ln in copy_lines), \
+            "Dockerfile must COPY the scripts/ directory into the image."
+
+    def test_script_stamps_the_real_baseline_revision(self):
+        """The adopt path stamps a HARDCODED revision. It must be the baseline
+        alembic actually knows, or a legacy database gets stamped at a bogus
+        revision and the upgrade chain breaks. Mutation this catches: renaming
+        0001_baseline in alembic/ without updating the script (or vice versa).
+        """
+        text = MIGRATE_SCRIPT.read_text(encoding="utf-8")
+        assert f'BASELINE_REVISION="{BASELINE_REVISION}"' in text
+
+    def test_script_stamps_only_untracked_existing_schema(self):
+        """The safety invariant of the adopt decision, asserted on the probe's
+        own predicate: it may signal a stamp ONLY when there is no
+        alembic_version table AND the schema already exists. Stamping a database
+        alembic already tracks, or a fresh empty one, is the bug this guards.
+        """
+        text = MIGRATE_SCRIPT.read_text(encoding="utf-8")
+        assert "not has_version and has_schema" in text
+
+
+@pytest.mark.skipif(_BASH is None,
+                    reason="a working bash is required to exercise the migrate shell script")
+class TestMigrateScriptBehavior:
+    """Drive the REAL scripts/run-migrations.sh through every branch with the
+    database probe and alembic CLI stubbed, asserting the exact command
+    sequence. This is the orchestration the production migrate service performs;
+    only the probe's SQL (Postgres to_regclass) and the alembic CLI are stubbed.
+    """
+
+    @staticmethod
+    def _write_exec(path: Path, body: str) -> None:
+        path.write_text(body, encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    def _run(self, tmp_path, probe_out="no", probe_fail=False, with_ini=True):
+        appdir = tmp_path / "app"
+        appdir.mkdir()
+        if with_ini:
+            (appdir / "alembic.ini").write_text("", encoding="utf-8")
+
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        calls = tmp_path / "alembic_calls.log"
+        # Stub alembic: record each invocation, one per line.
+        self._write_exec(bindir / "alembic",
+                         '#!/usr/bin/env bash\necho "alembic $*" >> "$ALEMBIC_LOG"\n')
+        # Stub python: consume the heredoc probe on stdin, then emit yes/no (or fail).
+        py = '#!/usr/bin/env bash\ncat > /dev/null\n'
+        py += 'echo "boom" >&2\nexit 1\n' if probe_fail else f'echo "{probe_out}"\n'
+        self._write_exec(bindir / "python", py)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+        env["HBOT_API_DIR"] = str(appdir)          # test seam: point the script at appdir
+        env["DATABASE_URL"] = "postgresql+asyncpg://u:p@h:5432/db"
+        env["ALEMBIC_LOG"] = str(calls)
+
+        proc = subprocess.run([_BASH, str(MIGRATE_SCRIPT)],
+                              env=env, capture_output=True, text=True)
+        log = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        return proc, [ln for ln in log.splitlines() if ln.strip()]
+
+    def test_legacy_db_is_stamped_then_upgraded(self, tmp_path):
+        """Probe says the schema exists but is untracked -> adopt: stamp the
+        baseline, THEN upgrade to head. Order matters (a stamp after upgrade is
+        meaningless)."""
+        proc, calls = self._run(tmp_path, probe_out="yes")
+        assert proc.returncode == 0, proc.stderr
+        assert calls == [f"alembic stamp {BASELINE_REVISION}", "alembic upgrade head"]
+
+    def test_fresh_or_tracked_db_upgrades_without_a_stamp(self, tmp_path):
+        """Probe says no adoption needed (empty DB, or already tracked) ->
+        plain `upgrade head`, never a stamp."""
+        proc, calls = self._run(tmp_path, probe_out="no")
+        assert proc.returncode == 0, proc.stderr
+        assert calls == ["alembic upgrade head"]
+
+    def test_probe_failure_aborts_before_touching_the_database(self, tmp_path):
+        """If the state probe fails (DB unreachable / DATABASE_URL wrong), the
+        script must exit non-zero and run NO alembic command — never guess a
+        branch. Mutation this catches: dropping the `if ! NEED_STAMP=...` guard
+        so a failed probe falls through to an unconditional upgrade."""
+        proc, calls = self._run(tmp_path, probe_fail=True)
+        assert proc.returncode != 0
+        assert calls == []
+
+    def test_absent_scaffold_skips_cleanly(self, tmp_path):
+        """No alembic.ini in the image (old build) -> graceful skip, exit 0, no
+        alembic invocation. This is what lets the new stack command deploy
+        against an image built before the script existed."""
+        proc, calls = self._run(tmp_path, with_ini=False)
+        assert proc.returncode == 0
+        assert calls == []
 
 
 # ===========================================================================
