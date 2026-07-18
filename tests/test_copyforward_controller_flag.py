@@ -20,15 +20,21 @@ Phase 2 (spec §4 "Controller-identity resolution"):
 
   * ``resolve_controller_flag_source`` — identity-keyed search across
     ``instances/`` AND ``archived/`` (incl. a singly-nested archive; an
-    ambiguous nest aborts ``ARCHIVE_NESTED``); ordering by the containing
+    ambiguous nest aborts ``ARCHIVE_NESTED``, even behind a live namesake —
+    every archived name is resolved, never skipped); ordering by the containing
     instance's NAME timestamp, never mtime (deliberately perturbed mtimes);
-    newest tie -> ``LATEST_AMBIGUOUS``; divergent per-controller winners ->
-    ``CONTROLLER_SOURCES_DIVERGENT``; identity verified on the WINNER ONLY
+    newest tie -> ``LATEST_AMBIGUOUS`` (incl. a live/archived same-name pair);
+    divergent per-config winners -> ``CONTROLLER_SOURCES_DIVERGENT``, with
+    coherence compared on the PHYSICAL directory (split ledgers across a
+    same-basename live/archived pair diverge) and winners kept per CONFIG so
+    duplicate-id configs cannot collapse; identity verified on the WINNER ONLY
     (mismatched/corrupt ``.owner`` aborts with NO fallback to an older
     candidate); zero candidates for ALL flagged controllers -> the true
     first-run signal (the ONLY fresh-seed); found-but-unrankable history is a
-    refusal, never a fresh seed; absolute ``state_file_name`` on a flagged
-    controller aborts; the instance being created is excluded.
+    refusal, never a fresh seed; an INDETERMINATE filesystem probe (stat error
+    that is not definite absence) is a refusal, never absence; absolute
+    ``state_file_name`` on a flagged controller aborts; the instance being
+    created is excluded.
 
 All expected values are derived from the SPEC (accepted values are exactly
 ``"latest"`` and ``"off"``; the staged file is byte-identical to the source
@@ -36,9 +42,11 @@ minus the removed line), never captured by running the implementation. All
 filesystem via ``tmp_path``; no Docker, no DB, no network.
 """
 
+import errno
 import json
 import logging
 import os
+import pathlib
 
 import yaml
 
@@ -737,23 +745,53 @@ class TestResolverSearchAndOrdering:
         assert res.source.instance_name == stamped
         assert any("NOSTAMP" in r.getMessage() for r in caplog.records)
 
-    def test_instances_precedence_same_name_both_trees(self, tmp_path):
-        # Same name in both trees: live instances/<name>/data wins outright and
-        # the archive is NOT consulted — the archived copy is deliberately an
-        # ambiguous nest, so consulting it would raise ARCHIVE_NESTED instead
-        # of resolving. Byte-consistent with the request-level latest path.
+    def test_same_name_both_trees_ambiguous_nest_still_aborts(self, tmp_path):
+        # Same name in both trees: the archive is ALWAYS resolved (spec §4 —
+        # every name under archived/ goes through _resolve_archive_instance_dir)
+        # and this one is deliberately an ambiguous nest -> ARCHIVE_NESTED. A
+        # live namesake must NOT suppress that (CDX-R01: the old live-precedence
+        # skip silently picked a tree, which the fail-closed spine forbids).
         _seed_config(tmp_path, "a.yml", CID)
         name = "SRC-20260101-000000"
-        live_dir = _seed_carrier(tmp_path, name, LEDGER, owner_id=CID)
+        _seed_carrier(tmp_path, name, LEDGER, owner_id=CID)
         _seed_carrier(tmp_path, name, LEDGER, tree="archived", owner_id=CID)
         _seed_carrier(
             tmp_path, name, LEDGER, owner_id=CID,
             instance_dir=tmp_path / "archived" / name / name,
         )
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.ARCHIVE_NESTED
+
+    def test_same_name_both_trees_both_carrying_is_ambiguous(self, tmp_path):
+        # A clean (un-nested) archived namesake AND a live copy both carry the
+        # ledger: one name timestamp, two physical histories — 'latest' cannot
+        # rank them. LATEST_AMBIGUOUS, naming both origins; never a silent
+        # tree preference (CDX-R01).
+        _seed_config(tmp_path, "a.yml", CID)
+        name = "SRC-20260101-000000"
+        _seed_carrier(tmp_path, name, LEDGER, owner_id=CID)
+        _seed_carrier(tmp_path, name, LEDGER, tree="archived", owner_id=CID)
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.LATEST_AMBIGUOUS
+        assert "[instances]" in ei.value.message
+        assert "[archived]" in ei.value.message
+
+    def test_same_name_live_without_carriage_finds_archived_ledger(self, tmp_path):
+        # The live namesake has a data/ dir but NOT the flagged ledger; the
+        # clean archived copy carries it. The archived history must be found —
+        # hiding it behind the live dir would fresh-seed over real state
+        # (CDX-R01's data-loss variant).
+        _seed_config(tmp_path, "a.yml", CID)
+        name = "SRC-20260101-000000"
+        (tmp_path / "instances" / name / "data").mkdir(parents=True)
+        archived_dir = _seed_carrier(tmp_path, name, LEDGER, tree="archived", owner_id=CID)
         res = resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
-        assert res.source.origin == "instances"
-        assert res.source.instance_dir == live_dir
-        assert res.source.data_dir == live_dir / "data"
+        assert res.first_run is False
+        assert res.source.origin == "archived"
+        assert res.source.instance_dir == archived_dir
+        assert res.source.data_dir == archived_dir / "data"
 
 
 class TestResolverWinnerVerification:
@@ -876,6 +914,60 @@ class TestResolverAgreement:
         assert res.first_run is False
         assert res.source.instance_name == winner
 
+    def test_split_ledgers_same_basename_are_divergent(self, tmp_path):
+        # Controller A's ledger lives only in the LIVE copy of a name and
+        # controller B's only in the ARCHIVED copy of the SAME name. No single
+        # physical directory holds both histories, so coherence must compare
+        # the resolved physical source, not the basename (CDX-R01) ->
+        # CONTROLLER_SOURCES_DIVERGENT, naming both origins.
+        _seed_config(tmp_path, "a.yml", CID)
+        _seed_config(tmp_path, "b.yml", CID_B)
+        name = "SRC-20260101-000000"
+        _seed_carrier(tmp_path, name, LEDGER, owner_id=CID)
+        _seed_carrier(tmp_path, name, LEDGER_B, tree="archived", owner_id=CID_B)
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source(
+                {"a.yml": "latest", "b.yml": "latest"}, NEW_NAME, tmp_path
+            )
+        assert ei.value.reason == ResumeAbortReason.CONTROLLER_SOURCES_DIVERGENT
+        assert "[instances]" in ei.value.message
+        assert "[archived]" in ei.value.message
+
+    def test_duplicate_id_configs_with_divergent_winners_abort(self, tmp_path):
+        # TWO flagged config FILES canonicalize to the SAME controller id but
+        # declare different custom ledgers whose newest carriers are different
+        # instances. Winners are kept per CONFIG, not per id (CDX-R02):
+        # collapsing them by id would let the last config win and silently
+        # fresh-seed the other's state. Divergence must name both config files.
+        _seed_config(tmp_path, "a.yml", CID, state_file_name="a_ladder.json")
+        _seed_config(tmp_path, "b.yml", CID, state_file_name="b_ladder.json")
+        inst_a = "AAA-20260101-000000"
+        inst_b = "BBB-20260201-000000"
+        _seed_carrier(tmp_path, inst_a, "a_ladder.json", owner_id=CID)
+        _seed_carrier(tmp_path, inst_b, "b_ladder.json", owner_id=CID)
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source(
+                {"a.yml": "latest", "b.yml": "latest"}, NEW_NAME, tmp_path
+            )
+        assert ei.value.reason == ResumeAbortReason.CONTROLLER_SOURCES_DIVERGENT
+        for token in ("a.yml", "b.yml", inst_a, inst_b):
+            assert token in ei.value.message
+
+    def test_duplicate_id_configs_agreeing_still_resolve(self, tmp_path):
+        # Same duplicate-id shape, but both ledgers' newest carriers are the
+        # SAME instance -> coherent, resolves; duplicate ids are not refused
+        # outright, only divergent sources are.
+        _seed_config(tmp_path, "a.yml", CID, state_file_name="a_ladder.json")
+        _seed_config(tmp_path, "b.yml", CID, state_file_name="b_ladder.json")
+        winner = "SRC-20260201-000000"
+        _seed_carrier(tmp_path, winner, "a_ladder.json", owner_id=CID)
+        _seed_carrier(tmp_path, winner, "b_ladder.json", owner_id=CID)
+        res = resolve_controller_flag_source(
+            {"a.yml": "latest", "b.yml": "latest"}, NEW_NAME, tmp_path
+        )
+        assert res.first_run is False
+        assert res.source.instance_name == winner
+
     def test_off_entries_do_not_constrain_resolution(self, tmp_path):
         # b.yml is staged but NOT flagged latest; its ledger lives in a NEWER
         # different instance. It must not participate: no divergence, and the
@@ -890,3 +982,71 @@ class TestResolverAgreement:
         )
         assert res.source.instance_name == a_winner
         assert [fc.controller_id for fc in res.flagged] == [CID]
+
+
+class TestResolverIndeterminateProbes:
+    """CDX-R03: pathlib's boolean probes collapse SOME OSErrors to False
+    (EBADF/ELOOP on Python 3.12, EVERY OSError on 3.13+), so unreadable
+    history could read as absent — and absence feeds the ONLY fresh seed.
+    Indeterminate probes must be structured fail-closed refusals."""
+
+    @staticmethod
+    def _block_stat(monkeypatch, blocked, exc):
+        real_stat = pathlib.Path.stat
+
+        def guarded(self, **kwargs):
+            if self == blocked:
+                raise exc
+            return real_stat(self, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "stat", guarded)
+
+    def test_unreadable_ledger_probe_aborts_not_first_run(self, tmp_path, monkeypatch):
+        # History exists but the exact expected ledger path cannot be stat'ed
+        # (PermissionError): a structured refusal naming the path — never
+        # first_run, never a raw traceback.
+        _seed_config(tmp_path, "a.yml", CID)
+        inst = _seed_carrier(tmp_path, "SRC-20260101-000000", LEDGER, owner_id=CID)
+        blocked = inst / "data" / LEDGER
+        self._block_stat(monkeypatch, blocked, PermissionError(13, "denied"))
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+        assert CID in ei.value.message
+        assert str(blocked) in ei.value.message
+
+    def test_swallowed_errno_class_also_aborts(self, tmp_path, monkeypatch):
+        # The errnos pathlib's own probes SWALLOW on 3.12 (e.g. ELOOP): under
+        # a bare .is_file() these silently became first_run — the demonstrated
+        # fresh-seed-over-real-state path. Checked probes refuse instead.
+        _seed_config(tmp_path, "a.yml", CID)
+        inst = _seed_carrier(tmp_path, "SRC-20260101-000000", LEDGER, owner_id=CID)
+        blocked = inst / "data" / LEDGER
+        self._block_stat(monkeypatch, blocked, OSError(errno.ELOOP, "symlink loop"))
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+
+    def test_unreadable_instances_tree_aborts_not_first_run(self, tmp_path, monkeypatch):
+        # The instances/ tree itself cannot be stat'ed: NOT the missing-tree
+        # fresh-install case — refuse rather than enumerate an empty candidate
+        # set that ends in a first-run fresh seed.
+        _seed_config(tmp_path, "a.yml", CID)
+        _seed_carrier(tmp_path, "SRC-20260101-000000", LEDGER, owner_id=CID)
+        blocked = tmp_path / "instances"
+        self._block_stat(monkeypatch, blocked, PermissionError(13, "denied"))
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND
+
+    def test_unreadable_owner_sidecar_aborts_not_unverified_accept(self, tmp_path, monkeypatch):
+        # The winner's DEFAULT-named ledger would be acceptable with no
+        # sidecar — but "sidecar unreadable" is not "no sidecar". Waving the
+        # winner through unverified would be fail-open; refuse instead.
+        _seed_config(tmp_path, "a.yml", CID)
+        inst = _seed_carrier(tmp_path, "SRC-20260101-000000", LEDGER, owner_id=CID)
+        blocked = inst / "data" / f"{LEDGER}.owner"
+        self._block_stat(monkeypatch, blocked, PermissionError(13, "denied"))
+        with pytest.raises(ResumeError) as ei:
+            resolve_controller_flag_source({"a.yml": "latest"}, NEW_NAME, tmp_path)
+        assert ei.value.reason == ResumeAbortReason.SOURCE_NOT_FOUND

@@ -26,6 +26,7 @@ import logging
 import re
 import secrets
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -936,14 +937,50 @@ def _derive_flagged_controller(config_path: Path, config_name: str) -> FlaggedCo
     )
 
 
+def _stat_or_absent(path: Path, *, context: str):
+    """``stat`` that refuses to guess: definite absence -> ``None``, any other
+    ``OSError`` -> fail-closed :class:`ResumeError`.
+
+    ``Path.is_file()``/``is_dir()`` are unusable as resolver probes: they
+    collapse SOME ``OSError``\\ s to ``False`` (``EBADF``/``ELOOP`` on Python
+    3.12, EVERY ``OSError`` on 3.13+), so inaccessible history would read as
+    absent — and absence is exactly what feeds the true-first-run fresh seed.
+    Indeterminate history must be a refusal, never absence (the fail-closed
+    spine). ``FileNotFoundError``/``NotADirectoryError`` ARE definite absence
+    and return ``None``, so the fresh-install case keeps counting as empty.
+    """
+    try:
+        return path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise ResumeError(
+            ResumeAbortReason.SOURCE_NOT_FOUND,
+            f"{context}: cannot determine whether '{path}' exists ({exc!r}). "
+            f"Refusing to treat an unreadable path as absent (fail-closed).",
+        )
+
+
+def _is_dir_checked(path: Path, *, context: str) -> bool:
+    """Checked directory probe — see :func:`_stat_or_absent`."""
+    st = _stat_or_absent(path, context=context)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
+def _is_file_checked(path: Path, *, context: str) -> bool:
+    """Checked regular-file probe — see :func:`_stat_or_absent`."""
+    st = _stat_or_absent(path, context=context)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
 def _enumerate_candidate_instances(
     bots_path: Path, new_instance_name: str
-) -> "Dict[str, tuple]":
-    """Enumerate candidate prior instances: ``name -> (instance_dir, origin)``.
+) -> List[tuple]:
+    """Enumerate candidate prior instances as ``(name, instance_dir, origin)``.
 
     Spec §4 candidate rules:
       * every dir under ``bots/instances/`` plus every name under
-        ``bots/archived/``, the latter resolved through
+        ``bots/archived/``, the latter ALWAYS resolved through
         :func:`_resolve_archive_instance_dir` (REUSED — ``ARCHIVE_NESTED``
         propagates: an ambiguous nest is a refusal, never a pick, even when the
         nested name turns out to carry no flagged ledger — its carrying cannot
@@ -953,36 +990,35 @@ def _enumerate_candidate_instances(
         install) — the CLA-M02 bots-path coupling check remains the guard
         against a wrongly-rooted bots path masquerading as empty.
 
-    A name present in BOTH trees resolves with the same precedence as the
-    request-level ``latest`` path (:func:`_resolve_latest`): live
-    ``instances/<name>/data`` wins outright and the archive is not consulted
-    for that name; without live data the resolution falls through to the
-    archive. Compressed ``*_archive.tar.gz`` entries are files, which the
-    archive resolver rejects as implausible (dropped — they have no extract
-    path and can carry no ledger the hook could read).
+    A name present in BOTH trees contributes BOTH physical directories — a live
+    namesake never suppresses archive resolution (CDX-R01: skipping it hid
+    archived-only ledgers behind a fresh seed and swallowed ``ARCHIVE_NESTED``).
+    The pair shares one name timestamp, so when both carry a flagged ledger the
+    ranking refuses as ``LATEST_AMBIGUOUS`` — a duplicated instance is resolved
+    by the operator, never by a silent tree preference. Compressed
+    ``*_archive.tar.gz`` entries are files, which the archive resolver rejects
+    as implausible (dropped — they have no extract path and can carry no ledger
+    the hook could read).
     """
-    candidates: Dict[str, tuple] = {}
+    candidates: List[tuple] = []
+    context = "Controller-flag candidate enumeration"
 
     instances_dir = bots_path / "instances"
-    if instances_dir.is_dir():
+    if _is_dir_checked(instances_dir, context=context):
         for entry in sorted(instances_dir.iterdir()):
-            if not entry.is_dir() or entry.name == new_instance_name:
+            if entry.name == new_instance_name or not _is_dir_checked(entry, context=context):
                 continue
-            candidates[entry.name] = (entry, "instances")
+            candidates.append((entry.name, entry, "instances"))
 
     archived_dir = bots_path / "archived"
-    if archived_dir.is_dir():
+    if _is_dir_checked(archived_dir, context=context):
         for entry in sorted(archived_dir.iterdir()):
             name = entry.name
             if name == new_instance_name:
                 continue
-            if name in candidates and (candidates[name][0] / "data").is_dir():
-                # Live-tree precedence, byte-consistent with _resolve_latest:
-                # instances/<name>/data exists -> the archive is not consulted.
-                continue
             resolved = _resolve_archive_instance_dir(archived_dir / name, name)
             if resolved is not None:
-                candidates[name] = (resolved, "archived")
+                candidates.append((name, resolved, "archived"))
 
     return candidates
 
@@ -1042,12 +1078,15 @@ def _pick_newest_carrier(flagged: FlaggedController, carriers: List[tuple]) -> t
     max_ts = max(ts for ts, _, _, _ in ranked)
     top = [(name, d, o) for ts, name, d, o in ranked if ts == max_ts]
     if len(top) > 1:
+        # Origins are named because a live/archived pair of the SAME name is a
+        # legitimate tie (one name timestamp, two physical histories).
         raise ResumeError(
             ResumeAbortReason.LATEST_AMBIGUOUS,
             f"Controller '{flagged.controller_id}': {len(top)} candidate "
             f"instances share the newest timestamp: "
-            f"{sorted(name for name, _, _ in top)!r}. Use a request-level "
-            f"resume_mode='explicit' to name the exact source.",
+            f"{sorted(f'{name} [{origin}]' for name, _, origin in top)!r}. "
+            f"Use a request-level resume_mode='explicit' to name the exact "
+            f"source.",
         )
     return top[0]
 
@@ -1076,7 +1115,20 @@ def _verify_winner_identity(flagged: FlaggedController, winner: tuple) -> None:
     src_ledger = instance_dir / "data" / flagged.ledger_name
     src_owner = instance_dir / "data" / f"{flagged.ledger_name}.owner"
 
-    if src_owner.exists():
+    # Checked probe (CDX-R03): an unreadable sidecar must refuse, not read as
+    # "no sidecar" — that would wave a default-named ledger through unverified.
+    owner_st = _stat_or_absent(
+        src_owner,
+        context=f"Controller '{flagged.controller_id}': sidecar probe on winner '{name}'",
+    )
+    if owner_st is not None:
+        if not stat.S_ISREG(owner_st.st_mode):
+            raise ResumeError(
+                ResumeAbortReason.OWNER_MISMATCH,
+                f"Sidecar '{src_owner}' in winning instance '{name}' exists but "
+                f"is not a regular file; controller identity cannot be verified "
+                f"— failing closed; never falling back to an older candidate.",
+            )
         owner_id = _read_owner_controller_id(src_owner)  # OWNER_MISMATCH if corrupt
         if owner_id != flagged.controller_id:
             raise ResumeError(
@@ -1169,13 +1221,25 @@ def resolve_controller_flag_source(
     # ARCHIVE_NESTED propagates from here — never swallowed, never picked-around.
     candidates = _enumerate_candidate_instances(bots_path, new_instance_name)
 
-    # Per flagged controller: carriers -> newest wins -> verify the winner ONLY.
-    winners: Dict[str, tuple] = {}
+    # Per flagged CONFIG: carriers -> newest wins -> verify the winner ONLY.
+    # Keyed by config_name (the collection's key, unique by construction), NOT
+    # by controller_id, which two flagged configs may legitimately share with
+    # different custom ledgers (CDX-R02): every flagged config keeps its own
+    # winner, so duplicate-id configs whose ledgers live in different instances
+    # are caught as divergence below — never silently collapsed to whichever
+    # config happened to be processed last.
+    winners: Dict[str, tuple] = {}  # config_name -> (FlaggedController, winner)
     for fc in flagged:
         carriers = [
             (name, instance_dir, origin)
-            for name, (instance_dir, origin) in candidates.items()
-            if (instance_dir / "data" / fc.ledger_name).is_file()
+            for name, instance_dir, origin in candidates
+            if _is_file_checked(
+                instance_dir / "data" / fc.ledger_name,
+                context=(
+                    f"Controller '{fc.controller_id}': ledger probe in "
+                    f"candidate instance '{name}'"
+                ),
+            )
         ]
         if not carriers:
             # No candidate holds this controller's ledger. Alone this does NOT
@@ -1185,7 +1249,7 @@ def resolve_controller_flag_source(
             continue
         winner = _pick_newest_carrier(fc, carriers)
         _verify_winner_identity(fc, winner)
-        winners[fc.controller_id] = winner
+        winners[fc.config_name] = (fc, winner)
 
     if not winners:
         # TRUE FIRST RUN — no flagged controller's ledger exists anywhere. The
@@ -1197,11 +1261,15 @@ def resolve_controller_flag_source(
         )
         return ControllerFlagResolution(source=None, flagged=flagged)
 
-    distinct_winner_names = {name for name, _, _ in winners.values()}
-    if len(distinct_winner_names) > 1:
+    # Coherence is PHYSICAL: two winners in different directories cannot be
+    # copied as one source even when the directory BASENAMES match — a live
+    # instances/<name> and an archived/<name> are distinct histories (CDX-R01).
+    distinct_winner_dirs = {winner[1] for _fc, winner in winners.values()}
+    if len(distinct_winner_dirs) > 1:
         details = "; ".join(
-            f"controller '{controller_id}' -> instance '{name}'"
-            for controller_id, (name, _, _) in sorted(winners.items())
+            f"controller '{fc.controller_id}' ({config_name}) -> "
+            f"instance '{name}' [{origin}]"
+            for config_name, (fc, (name, _dir, origin)) in sorted(winners.items())
         )
         raise ResumeError(
             ResumeAbortReason.CONTROLLER_SOURCES_DIVERGENT,
@@ -1210,7 +1278,7 @@ def resolve_controller_flag_source(
             f"instance; use a request-level resume_mode='explicit' to name it.",
         )
 
-    winner_name, winner_dir, winner_origin = next(iter(winners.values()))
+    _fc, (winner_name, winner_dir, winner_origin) = next(iter(winners.values()))
     resolved = ResolvedSource(
         instance_name=winner_name,
         data_dir=winner_dir / "data",
@@ -1223,7 +1291,7 @@ def resolve_controller_flag_source(
         resolved.instance_name,
         resolved.origin,
         resolved.data_dir,
-        sorted(winners),
+        sorted({fc.controller_id for fc, _ in winners.values()}),
     )
     return ControllerFlagResolution(source=resolved, flagged=flagged)
 
