@@ -401,7 +401,16 @@ async def _resolve_latest(
     """Resolve ``resume_mode == 'latest'`` — newest prior run of the same bot.
 
     Lineage comes from Postgres (``bot_runs.instance_name``). Directory listing
-    over ``bots/instances/`` is the fallback ONLY when the DB is unavailable.
+    over ``bots/instances/`` and ``bots/archived/`` is the fallback ONLY when
+    the DB is unavailable.
+
+    The winner is resolved with ``instances/`` precedence: if
+    ``bots/instances/<winner>/data`` exists it wins outright; otherwise the
+    resolution falls through to the local-move archive at
+    ``bots/archived/<winner>`` (archiving is the DEFAULT on stop, so the common
+    stop-then-redeploy flow moves the source there). Compressed
+    (``*_archive.tar.gz``) and S3 archives have no extract path and are not
+    resumable — that case fails closed as ``SOURCE_NOT_FOUND``.
     """
     target_base = _strip_api_suffix(new_instance_name)
 
@@ -422,17 +431,36 @@ async def _resolve_latest(
 
     instance_dir = bots_path / "instances" / winner
     data_dir = instance_dir / "data"
-    if not data_dir.is_dir():
-        raise ResumeError(
-            ResumeAbortReason.SOURCE_NOT_FOUND,
-            f"Resolved latest source '{winner}' but its data directory "
-            f"'{data_dir}' is missing on disk.",
+    if data_dir.is_dir():
+        return ResolvedSource(
+            instance_name=winner,
+            data_dir=data_dir,
+            instance_dir=instance_dir,
+            origin="instances",
         )
-    return ResolvedSource(
-        instance_name=winner,
-        data_dir=data_dir,
-        instance_dir=instance_dir,
-        origin="instances",
+
+    # instances/ is gone -> fall through to the local-move archive, with the
+    # same nested-archive handling as the explicit path (§5). ARCHIVE_NESTED
+    # from the helper propagates — an ambiguous nest is a refusal, never a pick.
+    archive_base = bots_path / "archived" / winner
+    archived_instance_dir = _resolve_archive_instance_dir(archive_base, winner)
+    if archived_instance_dir is not None:
+        archived_data_dir = archived_instance_dir / "data"
+        if archived_data_dir.is_dir():
+            return ResolvedSource(
+                instance_name=winner,
+                data_dir=archived_data_dir,
+                instance_dir=archived_instance_dir,
+                origin="archived",
+            )
+
+    raise ResumeError(
+        ResumeAbortReason.SOURCE_NOT_FOUND,
+        f"Resolved latest source '{winner}' but no data directory was found "
+        f"on disk. Searched '{data_dir}' and archived path '{archive_base}'. "
+        f"Note: the source may have been archived compressed "
+        f"(*_archive.tar.gz) or to S3 — those archives are not resumable "
+        f"(the repo has no download/extract path).",
     )
 
 
@@ -460,14 +488,24 @@ async def _collect_latest_candidates(
     except Exception as exc:  # DB unavailable -> directory fallback (same rules).
         logger.warning(
             "bot_runs lineage query failed (%s); falling back to directory "
-            "listing over instances/ for latest resolution.",
+            "listing over instances/ and archived/ for latest resolution.",
             exc,
         )
-        instances_dir = bots_path / "instances"
-        names = []
-        if instances_dir.is_dir():
-            names = [d.name for d in instances_dir.iterdir() if d.is_dir()]
-        candidates = _match_candidates(names, new_instance_name, target_base)
+        # Set-union DEDUPE across the two trees: the same name in both
+        # instances/ and archived/ is ONE instance in two places, not
+        # duplicated lineage — without the dedupe it would spuriously trip the
+        # LATEST_AMBIGUOUS tie check in _pick_newest. DB lineage rows above
+        # keep their duplicate-preserving behavior. Compressed
+        # ``*_archive.tar.gz`` archives are files, so ``is_dir()`` drops them.
+        # No ``_looks_like_instance()`` pre-filter here: a singly-nested
+        # archive fails it at the base level but is still resolvable —
+        # plausibility is judged at resolution time.
+        unique_names = set()
+        for tree in ("instances", "archived"):
+            tree_dir = bots_path / tree
+            if tree_dir.is_dir():
+                unique_names.update(d.name for d in tree_dir.iterdir() if d.is_dir())
+        candidates = _match_candidates(sorted(unique_names), new_instance_name, target_base)
         return candidates, True
 
 
