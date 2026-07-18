@@ -26,6 +26,7 @@ import logging
 import re
 import secrets
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -106,6 +107,15 @@ class ResumeAbortReason(str, Enum):
     # fail-closed refusals of the deploy — the value is never guessed and the key
     # is never allowed to reach the engine unstripped.
     RESUME_FLAG_INVALID = "RESUME_FLAG_INVALID"
+    # CTRLRESUME P2: two or more latest-flagged controllers resolved to DIFFERENT
+    # newest source instances. A flag-driven resume copies from exactly ONE prior
+    # instance (the sqlite half is whole-instance), so divergent winners mean the
+    # controllers' history is split across instances and ANY single pick would
+    # silently resume older/foreign state for the other controller(s). The message
+    # names each controller and its winning instance so the operator can settle it
+    # with a request-level resume_mode='explicit'. A NEW member — never overload
+    # an existing reason for this.
+    CONTROLLER_SOURCES_DIVERGENT = "CONTROLLER_SOURCES_DIVERGENT"
 
 
 class ResumeError(Exception):
@@ -778,6 +788,512 @@ def _pick_newest(candidate_names: List[str], target_base: str) -> str:
             f"Use resume_mode='explicit' to name the exact source.",
         )
     return top[0]
+
+
+# ---------------------------------------------------------------------------
+# CTRLRESUME P2 — controller-identity resolution (spec §4)
+# ---------------------------------------------------------------------------
+#
+# A NEW resolution strategy in front of the EXISTING pipeline: dashboards cannot
+# send request-level resume fields, and dashboard instance names embed a
+# timestamp so base-name lineage never matches across deploys. The controller
+# ``id`` is the one identity that IS stable, so this resolver keys off it: for
+# every ``resume_mode: latest``-flagged controller it searches ALL prior
+# instances (live and archived) for that controller's expected ledger and picks
+# the newest carrier. It returns the SAME :class:`ResolvedSource` shape as
+# :func:`resolve_source`, so ``run_guards`` -> ``compute_copy_plan`` -> copy ->
+# manifest downstream is untouched.
+#
+# The fail-closed spine holds: the ONLY fresh-seed this resolver can signal is a
+# TRUE first run (no flagged controller's ledger exists in ANY candidate).
+# Found-but-unusable history — an unrankable carrier, a corrupt ``.owner`` on
+# the winner, an ambiguous nested archive, divergent winners — is ALWAYS a
+# refusal, never a fallback and never a fresh seed.
+#
+# This phase only defines the resolver; the deploy/preview gate wiring is
+# phase 3's. Nothing here writes to disk.
+
+@dataclass(frozen=True)
+class FlaggedController:
+    """One ``resume_mode: latest``-flagged controller's derived identity.
+
+    Attributes:
+        config_name: The controller yml filename — the key in the staging
+            loop's ``{controller_file: mode}`` collection (phase 1's shape).
+        controller_id: The C2-CANONICAL id from :func:`classify_controller_id`.
+        ledger_name: The expected ledger filename from
+            :func:`_expected_ledger_name` (C1-canonical ``state_file_name`` if
+            set, else the default ``range_inventory_ladder_<id>.json``).
+        custom_named: True when ``state_file_name`` was set (C1 ``RELATIVE_OK``).
+            Drives the winner identity rule: a custom-named ledger with no
+            ``.owner`` sidecar is unverifiable (abort), while a default-named
+            one embeds the id in its filename (accept) — the same rule as
+            :func:`_plan_controller`.
+    """
+
+    config_name: str
+    controller_id: str
+    ledger_name: str
+    custom_named: bool
+
+
+@dataclass
+class ControllerFlagResolution:
+    """The outcome of :func:`resolve_controller_flag_source`.
+
+    Attributes:
+        source: The single agreed :class:`ResolvedSource` (SAME shape as the
+            request-level strategies produce — downstream is untouched), or
+            ``None`` for a TRUE first run: no flagged controller's ledger exists
+            in any candidate instance, so the deploy proceeds WITHOUT resume
+            (phase 3 surfaces the ``RESUME_FIRST_RUN_FRESH_SEED`` structured
+            warnings, one per entry in ``flagged``).
+        flagged: The derived identity of every latest-flagged controller, in
+            collection order. Phase 3 feeds these to the first-run warnings and
+            the manifest's flagged-controller-ids field.
+    """
+
+    source: Optional[ResolvedSource]
+    flagged: List[FlaggedController]
+
+    @property
+    def first_run(self) -> bool:
+        """True when no prior state exists anywhere — the ONLY fresh-seed."""
+        return self.source is None
+
+
+def _derive_flagged_controller(config_path: Path, config_name: str) -> FlaggedController:
+    """Derive one flagged controller's canonical identity from its config yml.
+
+    REUSES the contracts — C2 via :func:`classify_controller_id`, C1 via
+    :func:`classify_state_file_name`, and the ledger-name derivation via
+    :func:`_expected_ledger_name` — never reimplements them.
+
+    Raises:
+        ResumeError:
+            * ``CONTROLLER_ID_INVALID`` — the config cannot be read/parsed as a
+              mapping (identity underivable), or its ``id`` fails C2. The
+              operator FLAGGED this controller for identity-keyed resume; an
+              identity we cannot derive is a refusal, not a skip.
+            * ``STATE_FILE_PATH_INVALID`` — ``state_file_name`` fails C1, or is
+              ABSOLUTE. The flag is an explicit resume request on a ledger the
+              hook cannot manage — a contradiction, so the C1 opt-out's
+              skip-and-warn path must NOT swallow it (spec §4); there is no
+              opt-out parameter here on purpose.
+    """
+    try:
+        config = _load_yaml(config_path)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ResumeError(
+            ResumeAbortReason.CONTROLLER_ID_INVALID,
+            f"Flagged controller '{config_name}': config '{config_path}' could "
+            f"not be read or parsed ({exc}); its identity cannot be derived — "
+            f"failing closed (CONTRACT C2).",
+        )
+    if not isinstance(config, dict):
+        raise ResumeError(
+            ResumeAbortReason.CONTROLLER_ID_INVALID,
+            f"Flagged controller '{config_name}': config '{config_path}' is not "
+            f"a mapping; its identity cannot be derived — failing closed "
+            f"(CONTRACT C2).",
+        )
+
+    id_verdict = classify_controller_id(config.get("id"))
+    if not id_verdict.is_valid:
+        raise ResumeError(
+            ResumeAbortReason.CONTROLLER_ID_INVALID,
+            f"Flagged controller '{config_name}': {id_verdict.reason} Refusing "
+            f"to resolve a flag-driven resume for an identity outside CONTRACT "
+            f"C2 (fail-closed).",
+        )
+
+    sfn_verdict = classify_state_file_name(config.get("state_file_name"))
+    if sfn_verdict.status is StateFileStatus.INVALID:
+        raise ResumeError(
+            ResumeAbortReason.STATE_FILE_PATH_INVALID,
+            f"Flagged controller '{id_verdict.canonical}': {sfn_verdict.reason} "
+            f"Refusing to deploy (CONTRACT C1, fail-closed).",
+        )
+    if sfn_verdict.status is StateFileStatus.ABSOLUTE:
+        # Spec §4: a flagged controller whose state_file_name is ABSOLUTE is a
+        # contradiction — resume_mode: latest asks the hook to carry a ledger
+        # the hook cannot manage. Unconditional abort; the request-level
+        # allow_absolute opt-out (which permits a SKIP, not a resume) does not
+        # apply to a controller that explicitly asked to be resumed.
+        raise ResumeError(
+            ResumeAbortReason.STATE_FILE_PATH_INVALID,
+            f"Flagged controller '{id_verdict.canonical}': state_file_name "
+            f"'{sfn_verdict.canonical}' is an absolute path the resume hook "
+            f"cannot manage, yet resume_mode: latest explicitly requests a "
+            f"resume — a contradiction. Remove the flag or make the "
+            f"state_file_name data/-relative (CONTRACT C1, fail-closed).",
+        )
+
+    return FlaggedController(
+        config_name=config_name,
+        controller_id=id_verdict.canonical,
+        ledger_name=_expected_ledger_name(id_verdict.canonical, sfn_verdict.canonical),
+        custom_named=sfn_verdict.canonical is not None,
+    )
+
+
+def _stat_or_absent(path: Path, *, context: str):
+    """``stat`` that refuses to guess: definite absence -> ``None``, any other
+    ``OSError`` -> fail-closed :class:`ResumeError`.
+
+    ``Path.is_file()``/``is_dir()`` are unusable as resolver probes: they
+    collapse SOME ``OSError``\\ s to ``False`` (``EBADF``/``ELOOP`` on Python
+    3.12, EVERY ``OSError`` on 3.13+), so inaccessible history would read as
+    absent — and absence is exactly what feeds the true-first-run fresh seed.
+    Indeterminate history must be a refusal, never absence (the fail-closed
+    spine). ``FileNotFoundError``/``NotADirectoryError`` ARE definite absence
+    and return ``None``, so the fresh-install case keeps counting as empty.
+    """
+    try:
+        return path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise ResumeError(
+            ResumeAbortReason.SOURCE_NOT_FOUND,
+            f"{context}: cannot determine whether '{path}' exists ({exc!r}). "
+            f"Refusing to treat an unreadable path as absent (fail-closed).",
+        )
+
+
+def _is_dir_checked(path: Path, *, context: str) -> bool:
+    """Checked directory probe — see :func:`_stat_or_absent`."""
+    st = _stat_or_absent(path, context=context)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
+def _is_file_checked(path: Path, *, context: str) -> bool:
+    """Checked regular-file probe — see :func:`_stat_or_absent`."""
+    st = _stat_or_absent(path, context=context)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _enumerate_candidate_instances(
+    bots_path: Path, new_instance_name: str
+) -> List[tuple]:
+    """Enumerate candidate prior instances as ``(name, instance_dir, origin)``.
+
+    Spec §4 candidate rules:
+      * every dir under ``bots/instances/`` plus every name under
+        ``bots/archived/``, the latter ALWAYS resolved through
+        :func:`_resolve_archive_instance_dir` (REUSED — ``ARCHIVE_NESTED``
+        propagates: an ambiguous nest is a refusal, never a pick, even when the
+        nested name turns out to carry no flagged ledger — its carrying cannot
+        be checked without first picking a level).
+      * the instance being created is excluded (both trees).
+      * missing ``instances/``/``archived/`` dirs count as empty (fresh
+        install) — the CLA-M02 bots-path coupling check remains the guard
+        against a wrongly-rooted bots path masquerading as empty.
+
+    A name present in BOTH trees contributes BOTH physical directories — a live
+    namesake never suppresses archive resolution (CDX-R01: skipping it hid
+    archived-only ledgers behind a fresh seed and swallowed ``ARCHIVE_NESTED``).
+    The pair shares one name timestamp, so when both carry a flagged ledger the
+    ranking refuses as ``LATEST_AMBIGUOUS`` — a duplicated instance is resolved
+    by the operator, never by a silent tree preference. Compressed
+    ``*_archive.tar.gz`` entries are files, which the archive resolver rejects
+    as implausible (dropped — they have no extract path and can carry no ledger
+    the hook could read).
+    """
+    candidates: List[tuple] = []
+    context = "Controller-flag candidate enumeration"
+
+    instances_dir = bots_path / "instances"
+    if _is_dir_checked(instances_dir, context=context):
+        for entry in sorted(instances_dir.iterdir()):
+            if entry.name == new_instance_name or not _is_dir_checked(entry, context=context):
+                continue
+            candidates.append((entry.name, entry, "instances"))
+
+    archived_dir = bots_path / "archived"
+    if _is_dir_checked(archived_dir, context=context):
+        for entry in sorted(archived_dir.iterdir()):
+            name = entry.name
+            if name == new_instance_name:
+                continue
+            resolved = _resolve_archive_instance_dir(archived_dir / name, name)
+            if resolved is not None:
+                candidates.append((name, resolved, "archived"))
+
+    return candidates
+
+
+def _pick_newest_carrier(flagged: FlaggedController, carriers: List[tuple]) -> tuple:
+    """Pick the unique newest carrier of one controller's ledger.
+
+    Mirrors :func:`_pick_newest`'s semantics on purpose — ordering by the
+    CONTAINING INSTANCE's :func:`_parse_api_timestamp` (REUSED; NEVER file
+    mtime, which archiving perturbs), unparseable names dropped as unrankable
+    with a warning, a tie on the newest timestamp -> ``LATEST_AMBIGUOUS``. It is
+    a separate function only because the subject differs: ``_pick_newest`` ranks
+    base-name lineage and its messages talk about base names; here the subject
+    is a controller and the operator needs the controller named. The request-
+    level path stays byte-for-byte untouched.
+
+    Args:
+        flagged: The controller whose ledger the carriers hold.
+        carriers: ``[(instance_name, instance_dir, origin), ...]`` — non-empty.
+
+    Returns:
+        The winning ``(instance_name, instance_dir, origin)``.
+
+    Raises:
+        ResumeError:
+            * ``SOURCE_NOT_FOUND`` — carriers exist but NONE is rankable. The
+              ledger provably exists on disk, so this is found-but-unusable
+              history: a refusal, NEVER a first-run fresh seed.
+            * ``LATEST_AMBIGUOUS`` — two carriers share the newest timestamp.
+    """
+    ranked = []
+    unrankable: List[str] = []
+    for name, instance_dir, origin in carriers:
+        ts = _parse_api_timestamp(name)
+        if ts is None:
+            logger.warning(
+                "Flagged controller '%s': carrier instance '%s' has no "
+                "parseable API timestamp suffix; dropping it as unrankable.",
+                flagged.controller_id,
+                name,
+            )
+            unrankable.append(name)
+            continue
+        ranked.append((ts, name, instance_dir, origin))
+
+    if not ranked:
+        raise ResumeError(
+            ResumeAbortReason.SOURCE_NOT_FOUND,
+            f"Controller '{flagged.controller_id}': its ledger "
+            f"'{flagged.ledger_name}' exists in {sorted(unrankable)!r} but none "
+            f"of those instance names carries a parseable API timestamp, so "
+            f"'latest' cannot be ranked. Found-but-unrankable history is a "
+            f"refusal, not a fresh seed. Use a request-level "
+            f"resume_mode='explicit' to name the exact source.",
+        )
+
+    max_ts = max(ts for ts, _, _, _ in ranked)
+    top = [(name, d, o) for ts, name, d, o in ranked if ts == max_ts]
+    if len(top) > 1:
+        # Origins are named because a live/archived pair of the SAME name is a
+        # legitimate tie (one name timestamp, two physical histories).
+        raise ResumeError(
+            ResumeAbortReason.LATEST_AMBIGUOUS,
+            f"Controller '{flagged.controller_id}': {len(top)} candidate "
+            f"instances share the newest timestamp: "
+            f"{sorted(f'{name} [{origin}]' for name, _, origin in top)!r}. "
+            f"Use a request-level resume_mode='explicit' to name the exact "
+            f"source.",
+        )
+    return top[0]
+
+
+def _verify_winner_identity(flagged: FlaggedController, winner: tuple) -> None:
+    """Verify one controller's identity ON THE WINNER ONLY (spec §4).
+
+    Applies :func:`_plan_controller`'s ``.owner`` identity rules, via the REUSED
+    :func:`_read_owner_controller_id`:
+
+      * sidecar present -> it must parse and its ``controller_id`` must match
+        the C2-canonical id (mismatch/corrupt -> ``OWNER_MISMATCH``);
+      * no sidecar + custom ``state_file_name`` -> identity unverifiable ->
+        ``OWNER_MISMATCH``;
+      * no sidecar + default-named ledger -> the filename embeds the id ->
+        acceptable (``compute_copy_plan`` re-verifies and warns at plan time).
+
+    ANY failure here aborts the whole resolution. Deliberately NO fallback to
+    the second-newest carrier: that would silently resume older state, which is
+    the exact failure mode the fail-closed spine forbids. Ledger ENVELOPE
+    validation is not duplicated here — the winner flows into the unchanged
+    ``compute_copy_plan``, whose ``_validate_ledger`` aborts the deploy on a
+    bad envelope (still a refusal, never a fallback).
+    """
+    name, instance_dir, _origin = winner
+    src_ledger = instance_dir / "data" / flagged.ledger_name
+    src_owner = instance_dir / "data" / f"{flagged.ledger_name}.owner"
+
+    # Checked probe (CDX-R03): an unreadable sidecar must refuse, not read as
+    # "no sidecar" — that would wave a default-named ledger through unverified.
+    owner_st = _stat_or_absent(
+        src_owner,
+        context=f"Controller '{flagged.controller_id}': sidecar probe on winner '{name}'",
+    )
+    if owner_st is not None:
+        if not stat.S_ISREG(owner_st.st_mode):
+            raise ResumeError(
+                ResumeAbortReason.OWNER_MISMATCH,
+                f"Sidecar '{src_owner}' in winning instance '{name}' exists but "
+                f"is not a regular file; controller identity cannot be verified "
+                f"— failing closed; never falling back to an older candidate.",
+            )
+        owner_id = _read_owner_controller_id(src_owner)  # OWNER_MISMATCH if corrupt
+        if owner_id != flagged.controller_id:
+            raise ResumeError(
+                ResumeAbortReason.OWNER_MISMATCH,
+                f"Owner mismatch for ledger '{src_ledger}' in winning instance "
+                f"'{name}': sidecar claims controller '{owner_id}' but the "
+                f"flagged controller is '{flagged.controller_id}'. Wrong ledger "
+                f"— failing closed; never falling back to an older candidate.",
+            )
+        return
+
+    if flagged.custom_named:
+        raise ResumeError(
+            ResumeAbortReason.OWNER_MISMATCH,
+            f"Ledger '{src_ledger}' in winning instance '{name}' has a custom "
+            f"state_file_name but no '.owner' sidecar; controller identity "
+            f"cannot be verified — failing closed; never falling back to an "
+            f"older candidate.",
+        )
+    # Default-named ledger, no sidecar: the filename embeds the id — identity
+    # is acceptable per _plan_controller's rule (which will log the warning at
+    # plan time when the copy is actually made).
+
+
+def resolve_controller_flag_source(
+    controller_resume_flags: "Dict[str, str]",
+    new_instance_name: str,
+    bots_path,
+    controllers_dir=None,
+) -> ControllerFlagResolution:
+    """Resolve the single prior instance a flag-driven resume copies from.
+
+    The controller-identity resolution strategy (spec §4), keyed off the one
+    identity that is stable across dashboard deploys: the controller ``id``.
+    NOT yet wired to the deploy gate — phase 3 activates it (request-level
+    resume always wins outright; this runs only when the request says ``off``
+    and at least one staged controller is flagged ``latest``).
+
+    Args:
+        controller_resume_flags: Phase 1's staging collection,
+            ``{controller_file: "latest" | "off"}``. Only ``"latest"`` entries
+            participate; ``"off"`` entries are non-flagged and constrain
+            nothing.
+        new_instance_name: The instance being created — excluded from the
+            candidates (both trees).
+        bots_path: The ``bots/`` directory containing ``instances/`` and
+            ``archived/``.
+        controllers_dir: Where the flagged controllers' config ymls are read
+            from. Defaults to the SOURCE tree ``<bots_path>/conf/controllers``
+            (what the preview reads); the deploy call site may pass its staged
+            ``conf/controllers`` instead — the identity fields are identical by
+            phase 1's fail-closed strip verification (only ``resume_mode`` may
+            differ).
+
+    Returns:
+        A :class:`ControllerFlagResolution`: either the ONE agreed
+        :class:`ResolvedSource` every flagged controller resolves to, or the
+        TRUE-first-run signal (``source=None``) when NO flagged controller's
+        ledger exists in any candidate — the only fresh-seed in the feature.
+
+    Raises:
+        ResumeError: fail-closed on any resolution failure — see the helpers
+            for the per-reason conditions (``CONTROLLER_ID_INVALID``,
+            ``STATE_FILE_PATH_INVALID``, ``ARCHIVE_NESTED``,
+            ``SOURCE_NOT_FOUND``, ``LATEST_AMBIGUOUS``, ``OWNER_MISMATCH``,
+            ``CONTROLLER_SOURCES_DIVERGENT``).
+        ValueError: if NO entry is flagged ``latest`` (programmer error — the
+            phase-3 gate must check before calling, exactly as
+            :func:`resolve_source` refuses ``resume_mode='off'``).
+    """
+    bots_path = Path(bots_path)
+    if controllers_dir is None:
+        controllers_dir = bots_path / "conf" / "controllers"
+    controllers_dir = Path(controllers_dir)
+
+    flagged_names = [
+        name for name, mode in controller_resume_flags.items() if mode == "latest"
+    ]
+    if not flagged_names:
+        # The gate filters on the flags; reaching here without one is a wiring bug.
+        raise ValueError(
+            "resolve_controller_flag_source called with no latest-flagged controllers"
+        )
+
+    flagged = [
+        _derive_flagged_controller(controllers_dir / name, name)
+        for name in flagged_names
+    ]
+
+    # ARCHIVE_NESTED propagates from here — never swallowed, never picked-around.
+    candidates = _enumerate_candidate_instances(bots_path, new_instance_name)
+
+    # Per flagged CONFIG: carriers -> newest wins -> verify the winner ONLY.
+    # Keyed by config_name (the collection's key, unique by construction), NOT
+    # by controller_id, which two flagged configs may legitimately share with
+    # different custom ledgers (CDX-R02): every flagged config keeps its own
+    # winner, so duplicate-id configs whose ledgers live in different instances
+    # are caught as divergence below — never silently collapsed to whichever
+    # config happened to be processed last.
+    winners: Dict[str, tuple] = {}  # config_name -> (FlaggedController, winner)
+    for fc in flagged:
+        carriers = [
+            (name, instance_dir, origin)
+            for name, instance_dir, origin in candidates
+            if _is_file_checked(
+                instance_dir / "data" / fc.ledger_name,
+                context=(
+                    f"Controller '{fc.controller_id}': ledger probe in "
+                    f"candidate instance '{name}'"
+                ),
+            )
+        ]
+        if not carriers:
+            # No candidate holds this controller's ledger. Alone this does NOT
+            # decide anything: if EVERY flagged controller lands here it is a
+            # true first run; if others resolve, this controller fresh-seeds
+            # per compute_copy_plan's existing per-controller semantics.
+            continue
+        winner = _pick_newest_carrier(fc, carriers)
+        _verify_winner_identity(fc, winner)
+        winners[fc.config_name] = (fc, winner)
+
+    if not winners:
+        # TRUE FIRST RUN — no flagged controller's ledger exists anywhere. The
+        # ONLY fresh-seed this resolver can signal; every abort above outranks it.
+        logger.info(
+            "Controller-flag resume: no prior ledger found for any flagged "
+            "controller (%s) — true first run, deploy proceeds without resume.",
+            ", ".join(sorted(fc.controller_id for fc in flagged)),
+        )
+        return ControllerFlagResolution(source=None, flagged=flagged)
+
+    # Coherence is PHYSICAL: two winners in different directories cannot be
+    # copied as one source even when the directory BASENAMES match — a live
+    # instances/<name> and an archived/<name> are distinct histories (CDX-R01).
+    distinct_winner_dirs = {winner[1] for _fc, winner in winners.values()}
+    if len(distinct_winner_dirs) > 1:
+        details = "; ".join(
+            f"controller '{fc.controller_id}' ({config_name}) -> "
+            f"instance '{name}' [{origin}]"
+            for config_name, (fc, (name, _dir, origin)) in sorted(winners.items())
+        )
+        raise ResumeError(
+            ResumeAbortReason.CONTROLLER_SOURCES_DIVERGENT,
+            f"Flagged controllers resolve to different source instances: "
+            f"{details}. A flag-driven resume copies from exactly one prior "
+            f"instance; use a request-level resume_mode='explicit' to name it.",
+        )
+
+    _fc, (winner_name, winner_dir, winner_origin) = next(iter(winners.values()))
+    resolved = ResolvedSource(
+        instance_name=winner_name,
+        data_dir=winner_dir / "data",
+        instance_dir=winner_dir,
+        origin=winner_origin,
+    )
+    logger.info(
+        "Resume source resolved: mode=controller_flag instance=%s origin=%s "
+        "data_dir=%s controllers=%s",
+        resolved.instance_name,
+        resolved.origin,
+        resolved.data_dir,
+        sorted({fc.controller_id for fc, _ in winners.values()}),
+    )
+    return ControllerFlagResolution(source=resolved, flagged=flagged)
 
 
 # ===========================================================================
