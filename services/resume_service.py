@@ -99,6 +99,13 @@ class ResumeAbortReason(str, Enum):
     # successful self-inspection that disagrees), never on an unverified guess —
     # see ``DockerService._check_bots_path_coupling``.
     BOTS_PATH_MISCONFIGURED = "BOTS_PATH_MISCONFIGURED"
+    # CTRLRESUME P1: a controller config yml carried a top-level ``resume_mode``
+    # whose value is neither ``"latest"`` nor ``"off"``, or whose flag could not
+    # be safely stripped out of the staged copy the engine loads (the engine
+    # sets ``extra="forbid"``, so an unknown key fails its config load). Both are
+    # fail-closed refusals of the deploy — the value is never guessed and the key
+    # is never allowed to reach the engine unstripped.
+    RESUME_FLAG_INVALID = "RESUME_FLAG_INVALID"
 
 
 class ResumeError(Exception):
@@ -113,6 +120,147 @@ class ResumeError(Exception):
         self.reason = reason
         self.message = message
         super().__init__(f"{reason.value}: {message}")
+
+
+# ---------------------------------------------------------------------------
+# Controller-level resume flag (CTRLRESUME P1 — §1 "The flag" / §2 "Strip at
+# staging"). ONE shared parser, TWO call sites: the staging strip in
+# ``DockerService`` (this phase) and the resume-preview endpoint reading SOURCE
+# ymls (phase 3). Both go through ``parse_controller_resume_flag`` so the flag a
+# preview reports and the flag a deploy acts on can never drift.
+# ---------------------------------------------------------------------------
+
+CONTROLLER_RESUME_MODE_KEY = "resume_mode"
+
+# A top-level ``resume_mode:`` key (column 0, no leading indentation), matched
+# against a single physical line. A nested/indented ``resume_mode:`` or a
+# ``resume_mode_*`` key does NOT match — only the exact top-level key is a flag.
+_TOP_LEVEL_RESUME_MODE_LINE = re.compile(r"^resume_mode[ \t]*:")
+
+
+@dataclass(frozen=True)
+class ControllerResumeFlag:
+    """The parsed, validated controller-level ``resume_mode`` flag.
+
+    Attributes:
+        present: Whether the SOURCE yml carried a top-level ``resume_mode`` key
+            at all. Drives staging: a present key is stripped (the engine's
+            ``extra="forbid"`` rejects it), an absent key means a plain
+            byte-identical copy with the strip filter never touching the file.
+        mode: The validated flag — ``"latest"`` or ``"off"``. ``"off"`` also
+            stands for an absent key, so callers can branch on ``mode`` alone.
+    """
+
+    present: bool
+    mode: str
+
+
+def parse_controller_resume_flag(source_text: str, *, controller_name: str) -> ControllerResumeFlag:
+    """Read and validate a controller config yml's optional top-level
+    ``resume_mode`` flag from its raw text.
+
+    Accepted values are EXACTLY ``"latest"`` and ``"off"``; an absent key is
+    ``"off"``. YAML 1.1 coerces an unquoted ``off`` to the boolean ``False``, so
+    that (the documented ``off`` spelling) is accepted as ``"off"`` too. ANY
+    other value aborts fail-closed with ``RESUME_FLAG_INVALID`` — never guessed,
+    never silently ignored (§1).
+
+    A yml whose text does not parse as YAML is reported as NON-flagged
+    (``present=False``): staging then falls through to today's plain copy and the
+    engine's own config load remains the backstop, so a malformed non-flagged yml
+    behaves byte-for-byte as it does today. A malformed yml that did carry the key
+    is caught downstream — the unstripped key trips the engine's ``extra="forbid"``
+    and the deploy still fails closed.
+    """
+    try:
+        data = yaml.safe_load(source_text)
+    except yaml.YAMLError:
+        return ControllerResumeFlag(present=False, mode="off")
+    if not isinstance(data, dict) or CONTROLLER_RESUME_MODE_KEY not in data:
+        return ControllerResumeFlag(present=False, mode="off")
+    raw = data[CONTROLLER_RESUME_MODE_KEY]
+    if raw == "latest":
+        return ControllerResumeFlag(present=True, mode="latest")
+    # ``raw is False`` is the YAML 1.1 coercion of an unquoted ``off``; ``raw ==
+    # "off"`` is the quoted string form. Identity (``is False``) is used so a
+    # numeric ``0`` (which ``== False``) does NOT sneak through as off.
+    if raw == "off" or raw is False:
+        return ControllerResumeFlag(present=True, mode="off")
+    raise ResumeError(
+        ResumeAbortReason.RESUME_FLAG_INVALID,
+        f"Controller '{controller_name}' has resume_mode={raw!r}; the only "
+        f"accepted values are 'latest' and 'off'.",
+    )
+
+
+def _strip_top_level_resume_mode(source_text: str) -> str:
+    """Return ``source_text`` with every top-level ``resume_mode:`` line removed,
+    every other byte preserved exactly.
+
+    Splitting and rejoining on ``"\\n"`` keeps original line endings (LF and
+    CRLF alike — a CRLF line keeps its trailing ``\\r`` as line content) and the
+    final-newline state byte-for-byte; dropping a matched element removes exactly
+    that line and its one separator. Only column-0 ``resume_mode:`` lines match,
+    so comments (``# resume_mode: ...``), nested keys and ``resume_mode_*`` keys
+    are untouched.
+    """
+    lines = source_text.split("\n")
+    kept = [line for line in lines if not _TOP_LEVEL_RESUME_MODE_LINE.match(line)]
+    return "\n".join(kept)
+
+
+def _verify_resume_mode_stripped(source_text: str, staged_text: str, *, controller_name: str) -> None:
+    """Fail-closed post-strip verification (§2): the staged copy must yaml-parse,
+    must contain NO ``resume_mode`` key, and must equal ``safe_load(source)``
+    minus that one key. Any mismatch — including a flow-style mapping the
+    line-strip cannot touch — aborts with ``RESUME_FLAG_INVALID`` rather than
+    letting an unstripped or corrupted config reach the engine."""
+    try:
+        staged_data = yaml.safe_load(staged_text)
+    except yaml.YAMLError as exc:
+        raise ResumeError(
+            ResumeAbortReason.RESUME_FLAG_INVALID,
+            f"Controller '{controller_name}' did not parse after the resume_mode "
+            f"strip: {exc}",
+        )
+    staged_map = staged_data or {}
+    if not isinstance(staged_map, dict):
+        raise ResumeError(
+            ResumeAbortReason.RESUME_FLAG_INVALID,
+            f"Controller '{controller_name}' is not a mapping after the "
+            f"resume_mode strip.",
+        )
+    if CONTROLLER_RESUME_MODE_KEY in staged_map:
+        raise ResumeError(
+            ResumeAbortReason.RESUME_FLAG_INVALID,
+            f"Controller '{controller_name}' still carries a resume_mode key "
+            f"after staging; the strip could not remove it (e.g. flow style).",
+        )
+    source_map = yaml.safe_load(source_text) or {}
+    expected = {k: v for k, v in source_map.items() if k != CONTROLLER_RESUME_MODE_KEY}
+    if staged_map != expected:
+        raise ResumeError(
+            ResumeAbortReason.RESUME_FLAG_INVALID,
+            f"Controller '{controller_name}' staging changed more than the "
+            f"resume_mode key; refusing to deploy a mutated config.",
+        )
+
+
+def stage_controller_config(source_text: str, *, controller_name: str) -> "tuple[str, ControllerResumeFlag]":
+    """Produce the staged controller yml and its resume flag for the staging loop.
+
+    Returns ``(staged_text, flag)``. A NON-flagged yml is returned UNCHANGED —
+    the filter never runs on it, so the caller can (and does) keep today's plain
+    byte-identical copy. A flagged yml is validated, passed through the
+    line-level strip that removes ONLY the top-level ``resume_mode:`` line(s)
+    (trailing comment included), then fail-closed verified before it is returned.
+    """
+    flag = parse_controller_resume_flag(source_text, controller_name=controller_name)
+    if not flag.present:
+        return source_text, flag
+    staged_text = _strip_top_level_resume_mode(source_text)
+    _verify_resume_mode_stripped(source_text, staged_text, controller_name=controller_name)
+    return staged_text, flag
 
 
 # ---------------------------------------------------------------------------
