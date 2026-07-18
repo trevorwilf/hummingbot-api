@@ -23,6 +23,7 @@ from services.resume_service import (
     guard_target_available,
     resolve_deploy_target,
     seed_resume_state,
+    stage_controller_config,
 )
 from utils.file_system import fs_util
 from utils.gateway_certs import ensure_gateway_certs, gateway_certs_dir
@@ -671,6 +672,61 @@ class DockerService:
             response["warnings"] = [coupling_warning]
         return response
 
+    @staticmethod
+    def _stage_controller_configs(
+        controllers_list, source_dir: str, dest_dir: str
+    ) -> Dict[str, str]:
+        """Stage each referenced controller yml into ``dest_dir`` (CTRLRESUME P1,
+        §2 "Strip at staging").
+
+        A yml carrying a top-level ``resume_mode`` flag is copied through the
+        shared ``stage_controller_config`` filter, which strips ONLY that line
+        (the engine sets ``extra="forbid"`` — an unknown key fails its config
+        load) and fail-closed verifies the result; an invalid or unstrippable
+        flag raises ``ResumeError(RESUME_FLAG_INVALID)`` and aborts the deploy. A
+        NON-flagged yml keeps today's plain ``shutil.copy2`` — byte-identical,
+        metadata preserved, the filter never touching it.
+
+        Returns ``{controller_file: resume_mode}`` for every controller staged
+        (absent flag -> ``"off"``), the single collection point phase 3 feeds to
+        the resume gate. Missing source files are warned-and-skipped, exactly as
+        before.
+        """
+        resume_flags: Dict[str, str] = {}
+        for controller_file in controllers_list:
+            source_controller_file = os.path.join(source_dir, controller_file)
+            destination_controller_file = os.path.join(dest_dir, controller_file)
+
+            if not os.path.exists(source_controller_file):
+                logger.warning(
+                    f"Controller config file {controller_file} not found in {source_dir}"
+                )
+                continue
+
+            # Read as bytes and decode utf-8 (YAML's mandated encoding) so the
+            # flag can be parsed; the source file itself is never mutated.
+            with open(source_controller_file, "rb") as fh:
+                source_text = fh.read().decode("utf-8")
+            staged_text, flag = stage_controller_config(
+                source_text, controller_name=controller_file
+            )
+
+            if flag.present:
+                # ``newline=""`` disables newline translation so the stripped
+                # copy is byte-identical to the source outside the removed line.
+                with open(destination_controller_file, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(staged_text)
+                logger.info(
+                    "Staged controller config %s (resume_mode='%s' stripped for the engine)",
+                    controller_file,
+                    flag.mode,
+                )
+            else:
+                shutil.copy2(source_controller_file, destination_controller_file)
+                logger.info(f"Copied controller config: {controller_file}")
+            resume_flags[controller_file] = flag.mode
+        return resume_flags
+
     async def _stage_instance(
         self,
         config: V2ControllerDeployment,
@@ -698,6 +754,12 @@ class DockerService:
         destination_credentials_dir = os.path.join(staging_dir, 'conf')
         shutil.copytree(source_credentials_dir, destination_credentials_dir)
 
+        # CTRLRESUME P1 — single collection point for the controller-level
+        # resume_mode flags gathered while staging their ymls. Kept inert this
+        # phase (built and returned to no one who acts on it yet); phase 3 reads
+        # it at the resume gate below to activate a flag-driven resume.
+        controller_resume_flags: Dict[str, str] = {}
+
         # Copy specific script config and referenced controllers if provided
         if config.script_config:
             script_config_dir = os.path.join("bots", 'conf', 'scripts')
@@ -724,21 +786,18 @@ class DockerService:
                     # If there are controllers referenced, copy them
                     if controllers_list:
                         os.makedirs(destination_controllers_config_dir, exist_ok=True)
+                        controller_resume_flags = self._stage_controller_configs(
+                            controllers_list,
+                            controllers_config_dir,
+                            destination_controllers_config_dir,
+                        )
 
-                        for controller_file in controllers_list:
-                            source_controller_file = os.path.join(controllers_config_dir, controller_file)
-                            destination_controller_file = os.path.join(
-                                destination_controllers_config_dir, controller_file
-                            )
-
-                            if os.path.exists(source_controller_file):
-                                shutil.copy2(source_controller_file, destination_controller_file)
-                                logger.info(f"Copied controller config: {controller_file}")
-                            else:
-                                logger.warning(
-                                    f"Controller config file {controller_file} not found in {controllers_config_dir}"
-                                )
-
+                # A RESUME_FLAG_INVALID (or any other ResumeError) from the
+                # staging strip is a fail-closed refusal and MUST abort the
+                # deploy — it must not be swallowed by the lenient handler below,
+                # which exists only to tolerate an unreadable script config.
+                except ResumeError:
+                    raise
                 except Exception as e:
                     logger.error(f"Error reading script config file {config.script_config}: {e}")
             else:
