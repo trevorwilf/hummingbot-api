@@ -137,6 +137,10 @@ CONTROLLER_RESUME_MODE_KEY = "resume_mode"
 # ``resume_mode_*`` key does NOT match — only the exact top-level key is a flag.
 _TOP_LEVEL_RESUME_MODE_LINE = re.compile(r"^resume_mode[ \t]*:")
 
+# Sentinel: no top-level ``resume_mode`` key at all (or the document is not a
+# top-level mapping). Distinct from a present-but-invalid value.
+_FLAG_ABSENT = object()
+
 
 @dataclass(frozen=True)
 class ControllerResumeFlag:
@@ -155,41 +159,87 @@ class ControllerResumeFlag:
     mode: str
 
 
+def _top_level_resume_mode_spelling(source_text: str):
+    """Return the RAW scalar spelling of the top-level ``resume_mode`` value.
+
+    Uses ``yaml.compose`` (NOT ``safe_load``) so the flag is validated on the
+    exact characters the operator wrote, BEFORE YAML 1.1 type coercion collapses
+    every false-y spelling (``off``, ``false``, ``no``, ``OFF`` ...) onto the
+    single Python ``False`` — ``safe_load`` alone cannot tell the documented
+    ``off`` apart from an invalid ``false``/``no``/``OFF``.
+
+    Returns one of:
+      * ``_FLAG_ABSENT`` — no top-level ``resume_mode`` key (or not a mapping).
+      * the raw scalar string (e.g. ``"off"``, ``"false"``, ``"latest"``, ``"0"``)
+        when the value is a scalar — quoting is transparent, so ``"off"`` (quoted)
+        and ``off`` (plain) both yield ``"off"``.
+      * ``None`` — the key is present but its value is a collection, not a scalar.
+    Raises ``yaml.YAMLError`` on malformed input (the caller decides the policy).
+    """
+    node = yaml.compose(source_text)
+    if not isinstance(node, yaml.MappingNode):
+        return _FLAG_ABSENT
+    for key_node, value_node in node.value:
+        if (
+            isinstance(key_node, yaml.ScalarNode)
+            and key_node.value == CONTROLLER_RESUME_MODE_KEY
+        ):
+            if isinstance(value_node, yaml.ScalarNode):
+                return value_node.value
+            return None
+    return _FLAG_ABSENT
+
+
 def parse_controller_resume_flag(source_text: str, *, controller_name: str) -> ControllerResumeFlag:
     """Read and validate a controller config yml's optional top-level
     ``resume_mode`` flag from its raw text.
 
-    Accepted values are EXACTLY ``"latest"`` and ``"off"``; an absent key is
-    ``"off"``. YAML 1.1 coerces an unquoted ``off`` to the boolean ``False``, so
-    that (the documented ``off`` spelling) is accepted as ``"off"`` too. ANY
-    other value aborts fail-closed with ``RESUME_FLAG_INVALID`` — never guessed,
-    never silently ignored (§1).
+    Accepted values are EXACTLY the scalar spellings ``"latest"`` and ``"off"``
+    (quoting is transparent); an absent key is ``"off"``. Validation is on the
+    raw spelling, so YAML 1.1 false-aliases that are NOT ``off`` — ``false``,
+    ``no``, ``OFF``, ``NO`` — are rejected rather than silently coerced to off.
+    ANY other value aborts fail-closed with ``RESUME_FLAG_INVALID`` — never
+    guessed, never silently ignored (§1).
 
-    A yml whose text does not parse as YAML is reported as NON-flagged
-    (``present=False``): staging then falls through to today's plain copy and the
-    engine's own config load remains the backstop, so a malformed non-flagged yml
-    behaves byte-for-byte as it does today. A malformed yml that did carry the key
-    is caught downstream — the unstripped key trips the engine's ``extra="forbid"``
-    and the deploy still fails closed.
+    A yml whose text does not parse as YAML is NON-flagged (``present=False``)
+    ONLY when it carries no top-level ``resume_mode:`` line: staging then falls
+    through to today's plain copy and the engine's own config load stays the
+    backstop, so a malformed non-flagged yml behaves byte-for-byte as today. A
+    malformed yml that DOES carry a top-level ``resume_mode:`` line holds the
+    engine-forbidden key yet cannot be parsed or safely stripped, so it aborts
+    fail-closed HERE (``RESUME_FLAG_INVALID``) — the key must never reach the
+    engine unstripped.
     """
     try:
-        data = yaml.safe_load(source_text)
+        spelling = _top_level_resume_mode_spelling(source_text)
     except yaml.YAMLError:
+        if _source_has_top_level_resume_mode_line(source_text):
+            raise ResumeError(
+                ResumeAbortReason.RESUME_FLAG_INVALID,
+                f"Controller '{controller_name}' carries a top-level resume_mode "
+                f"line but does not parse as YAML; refusing to stage the "
+                f"engine-forbidden key.",
+            )
         return ControllerResumeFlag(present=False, mode="off")
-    if not isinstance(data, dict) or CONTROLLER_RESUME_MODE_KEY not in data:
+    if spelling is _FLAG_ABSENT:
         return ControllerResumeFlag(present=False, mode="off")
-    raw = data[CONTROLLER_RESUME_MODE_KEY]
-    if raw == "latest":
+    if spelling == "latest":
         return ControllerResumeFlag(present=True, mode="latest")
-    # ``raw is False`` is the YAML 1.1 coercion of an unquoted ``off``; ``raw ==
-    # "off"`` is the quoted string form. Identity (``is False``) is used so a
-    # numeric ``0`` (which ``== False``) does NOT sneak through as off.
-    if raw == "off" or raw is False:
+    if spelling == "off":
         return ControllerResumeFlag(present=True, mode="off")
     raise ResumeError(
         ResumeAbortReason.RESUME_FLAG_INVALID,
-        f"Controller '{controller_name}' has resume_mode={raw!r}; the only "
+        f"Controller '{controller_name}' has resume_mode={spelling!r}; the only "
         f"accepted values are 'latest' and 'off'.",
+    )
+
+
+def _source_has_top_level_resume_mode_line(source_text: str) -> bool:
+    """True iff any physical line is a top-level ``resume_mode:`` line. Used as a
+    lexical fallback when YAML parsing fails, to keep a malformed file that still
+    carries the engine-forbidden key from being routed to the plain-copy path."""
+    return any(
+        _TOP_LEVEL_RESUME_MODE_LINE.match(line) for line in source_text.split("\n")
     )
 
 
@@ -197,16 +247,25 @@ def _strip_top_level_resume_mode(source_text: str) -> str:
     """Return ``source_text`` with every top-level ``resume_mode:`` line removed,
     every other byte preserved exactly.
 
-    Splitting and rejoining on ``"\\n"`` keeps original line endings (LF and
-    CRLF alike — a CRLF line keeps its trailing ``\\r`` as line content) and the
-    final-newline state byte-for-byte; dropping a matched element removes exactly
-    that line and its one separator. Only column-0 ``resume_mode:`` lines match,
-    so comments (``# resume_mode: ...``), nested keys and ``resume_mode_*`` keys
-    are untouched.
+    Each line is split on ``"\\n"`` and carries its OWN ``\\n`` terminator (the
+    last element keeps none if the source did not end in a newline). Dropping a
+    matched line then removes exactly that line's content AND its own terminator
+    — never the PRECEDING line's, which is the byte-identity bug when the flag is
+    the final, unterminated line. CRLF endings survive (the ``\\r`` rides along as
+    line content). Splitting only on ``"\\n"`` (not ``str.splitlines``' full set
+    of Unicode breaks) keeps a ``resume_mode``-looking substring after an exotic
+    in-value separator from being mistaken for a top-level line. Only column-0
+    ``resume_mode:`` lines match, so comments (``# resume_mode: ...``), nested
+    keys and ``resume_mode_*`` keys are untouched.
     """
-    lines = source_text.split("\n")
+    parts = source_text.split("\n")
+    # Re-attach the separator '\n' that split() consumed to every line except the
+    # last, so each line owns its terminator.
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1] != "":
+        lines.append(parts[-1])  # trailing unterminated remainder, if any
     kept = [line for line in lines if not _TOP_LEVEL_RESUME_MODE_LINE.match(line)]
-    return "\n".join(kept)
+    return "".join(kept)
 
 
 def _verify_resume_mode_stripped(source_text: str, staged_text: str, *, controller_name: str) -> None:
