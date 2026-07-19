@@ -1090,6 +1090,16 @@ P3_SRC = "KRAKEN_LADDER_V1-20260101-010000"
 P3_SRC_OLD = "KRAKEN_LADDER_V1-20250101-010000"
 P3_NEW = "DASH_DEPLOY_V1-20260701-020000"
 P3_SCRIPT = f"{P3_NEW}.yml"
+# CDX-R04: the whole-instance sqlite executor DB carried by a source instance.
+P3_SQLITE = "controllers.sqlite"
+# CDX-R03: two carriers of the flagged ledger whose resolution DIVERGES by
+# strategy — P3_SRC_LINEAGE shares P3_NEW's base name (``DASH_DEPLOY_V1``), so a
+# request-level ``latest`` resolves to it via base-name lineage; P3_SRC_NEWER is
+# a newer, different-base carrier that controller-identity resolution (newest
+# carrier wins) would pick instead. Request precedence must choose the lineage
+# source, making a precedence inversion observable.
+P3_SRC_LINEAGE = "DASH_DEPLOY_V1-20260615-120000"
+P3_SRC_NEWER = "KRAKEN_LADDER_V1-20260801-010000"
 P3_IMAGE = "hummingbot/hummingbot:v2.9"
 P3_PASSWORD = "test-password"
 
@@ -1246,16 +1256,17 @@ class TestCopyPlanFlaggedFilter:
             instance_name=name, data_dir=inst / "data", instance_dir=inst, origin="instances"
         )
 
-    def _new_with(self, bots, controllers, name=P3_NEW):
+    def _new_with(self, bots, controllers, name=P3_NEW, db_engine="postgres+asyncpg"):
         cdir = bots / "instances" / name / "conf" / "controllers"
         cdir.mkdir(parents=True, exist_ok=True)
         for filename, cid, flagged in controllers:
             (cdir / filename).write_text(
                 yaml.safe_dump(_p3_template_doc(cid, flagged=flagged)), encoding="utf-8"
             )
-        # Postgres conf_client so no sqlite is planned.
+        # Default Postgres conf_client so no sqlite is planned; the sqlite test
+        # (CDX-R04) passes db_engine="sqlite" to exercise the whole-instance half.
         (bots / "instances" / name / "conf" / "conf_client.yml").write_text(
-            yaml.safe_dump({"db_mode": {"db_engine": "postgres+asyncpg"}}), encoding="utf-8"
+            yaml.safe_dump({"db_mode": {"db_engine": db_engine}}), encoding="utf-8"
         )
         return bots / "instances" / name
 
@@ -1296,6 +1307,16 @@ class TestCopyPlanFlaggedFilter:
         plan = compute_copy_plan(new, source, self._dep(), flagged_config_names=None)
 
         assert plan.decisions == {P3_CID: "copied", P3_CID2: "copied"}
+        # CDX-R01: the decisions dict says "copied", but the EXECUTOR runs over
+        # plan.files_to_copy — assert the physical copy set actually carries BOTH
+        # controllers' ledger + .owner. A filter that copied nobody
+        # (files_to_copy == []) would still satisfy the decisions/no-warning
+        # checks above; this set equality (spec-derived from the two seeded
+        # ledgers + their sidecars) is what makes that mutation fail.
+        assert {it.dst.name for it in plan.files_to_copy} == {
+            P3_LEDGER, f"{P3_LEDGER}.owner",
+            P3_LEDGER2, f"{P3_LEDGER2}.owner",
+        }
         assert not any(
             w["code"] == "RESUME_SKIPPED_NOT_FLAGGED" for w in plan.structured_warnings
         )
@@ -1316,6 +1337,41 @@ class TestCopyPlanFlaggedFilter:
         assert plan.decisions[P3_CID2] == "skipped_not_flagged"
         skipped = [w for w in plan.structured_warnings if w["code"] == "RESUME_SKIPPED_NOT_FLAGGED"]
         assert skipped[0]["ledger_present"] is False
+
+    def test_flag_driven_still_copies_whole_instance_sqlite(self, tmp_path):
+        # §5 / CDX-R04: the per-controller flag filter governs LEDGERS only. The
+        # instance-level sqlite executor DB is whole-instance history and copies
+        # whenever the resume runs — flagged or not. A sqlite deploy resolved via
+        # the controller flag MUST still carry the source .sqlite (+ -journal).
+        # Every other P3 fixture is Postgres, so this is the only coverage of the
+        # sqlite half under a NON-None flag filter (the mutation
+        # 'if flagged_config_names is None and _is_sqlite_deployment(...)' would
+        # silently drop the executor DB and pass all Postgres tests).
+        bots = tmp_path / "bots"
+        source = self._source(bots, [(P3_LEDGER, P3_CID)])
+        # Whole-instance executor DB (+ journal) sitting in the source data/.
+        source.data_dir.joinpath(P3_SQLITE).write_bytes(b"SQLITE-EXECUTOR-DB")
+        source.data_dir.joinpath(f"{P3_SQLITE}-journal").write_bytes(b"WAL-JOURNAL")
+        new = self._new_with(bots, [(P3_FLAGGED_FILE, P3_CID, True)], db_engine="sqlite")
+
+        plan = compute_copy_plan(
+            new, source, self._dep(), flagged_config_names={P3_FLAGGED_FILE}
+        )
+
+        copied = {it.dst.name for it in plan.files_to_copy}
+        # The flagged controller's ledger + sidecar copy...
+        assert P3_LEDGER in copied
+        assert f"{P3_LEDGER}.owner" in copied
+        # ...and the whole-instance sqlite half copies DESPITE the flag filter.
+        assert P3_SQLITE in copied
+        assert f"{P3_SQLITE}-journal" in copied
+        # The sqlite items are instance-level (no owning controller), proving they
+        # come from the unfiltered _plan_sqlite half, not the controller loop.
+        sqlite_items = [
+            it for it in plan.files_to_copy if it.kind in ("sqlite", "sqlite_journal")
+        ]
+        assert {it.dst.name for it in sqlite_items} == {P3_SQLITE, f"{P3_SQLITE}-journal"}
+        assert all(it.controller_id is None for it in sqlite_items)
 
 
 # ---------------------------------------------------------------------------
@@ -1371,6 +1427,44 @@ class TestFlagDrivenDeploy:
         assert "resolution" not in manifest
         assert "flagged_controllers" not in manifest
         # The ignore is logged (info), not silent.
+        assert any("ignoring" in r.getMessage() and "flag" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_request_latest_wins_over_flags(self, p3_bots, p3_security, caplog):
+        # CDX-R03 / §3: request resume_mode="latest" wins OUTRIGHT over controller
+        # flags — the required precedence case the explicit test above does not
+        # cover. Two carriers of the flagged ledger exist, chosen so the request
+        # strategy and the controller-identity strategy DIVERGE:
+        #   * P3_SRC_LINEAGE shares P3_NEW's base name -> request `latest`
+        #     (base-name lineage) resolves to it.
+        #   * P3_SRC_NEWER is a newer, different-base carrier -> controller-identity
+        #     resolution (newest carrier wins) would resolve to it instead.
+        # The request must win: the lineage source is used and the manifest is the
+        # request-path shape (mode=latest, NO resolution/flagged_controllers keys).
+        # A precedence inversion that let the flag drive a latest request would
+        # flip the source to P3_SRC_NEWER and stamp resolution="controller_flag".
+        _p3_write_template(p3_bots, P3_FLAGGED_FILE, P3_CID, flagged=True)
+        _p3_write_script(p3_bots, [P3_FLAGGED_FILE])
+        _p3_write_source(p3_bots, P3_SRC_LINEAGE, [(P3_LEDGER, P3_CID)])  # base-name lineage
+        _p3_write_source(p3_bots, P3_SRC_NEWER, [(P3_LEDGER, P3_CID)])    # newer identity carrier
+
+        client = _p3_client()
+        service = _p3_service(client)
+        with caplog.at_level(logging.INFO, logger="services.resume_service"):
+            response = await service.create_hummingbot_instance(
+                _p3_deployment(resume_mode="latest")
+            )
+
+        assert response["success"] is True
+        manifest = _p3_read_manifest(p3_bots)
+        assert manifest["mode"] == "latest"
+        # Request-lineage source, NOT the newer identity carrier the flag would pick.
+        assert manifest["source_instance"] == P3_SRC_LINEAGE
+        assert manifest["source_instance"] != P3_SRC_NEWER
+        # Request-path manifest shape: the flag-driven keys are absent.
+        assert "resolution" not in manifest
+        assert "flagged_controllers" not in manifest
+        # The ignored flag is logged (info), not silent.
         assert any("ignoring" in r.getMessage() and "flag" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -1502,9 +1596,16 @@ class TestPreviewFlagParity:
         assert preview["flagged_controllers"] == [P3_CID]
         assert preview["resolved_source"]["instance_name"] == P3_SRC
         assert preview["decisions"] == {P3_CID: "copied"}
-        assert P3_LEDGER in {os.path.basename(f["dst"]) for f in preview["files"]}
+        # CDX-R02: assert the COMPLETE preview file set, not just "ledger present".
+        # The source carries the ledger AND its .owner sidecar, so a spec-derived
+        # plan copies BOTH; an old `ledger in {...}` check still passed when the
+        # sidecar was dropped from the preview. Set equality catches that.
+        expected_files = {P3_LEDGER, f"{P3_LEDGER}.owner"}
+        preview_files = {os.path.basename(f["dst"]) for f in preview["files"]}
+        assert preview_files == expected_files
 
-        # Deploy the SAME tree and confirm it resolves to the SAME source.
+        # Deploy the SAME tree and confirm it resolves to the SAME source AND
+        # advertises the SAME physical file set the deploy actually copies.
         service = _p3_service(_p3_client())
         response = await service.create_hummingbot_instance(_p3_deployment())
         assert response["success"] is True
@@ -1512,6 +1613,9 @@ class TestPreviewFlagParity:
         assert manifest["source_instance"] == preview["resolved_source"]["instance_name"]
         assert manifest["resolution"] == "controller_flag"
         assert manifest["decisions"] == preview["decisions"]
+        manifest_files = {os.path.basename(f["name"]) for f in manifest["files"]}
+        assert manifest_files == expected_files
+        assert preview_files == manifest_files
 
     @pytest.mark.asyncio
     async def test_preview_true_first_run_reports_fresh_seed(self, p3_bots, p3_security):
