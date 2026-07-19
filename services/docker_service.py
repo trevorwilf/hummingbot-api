@@ -834,8 +834,14 @@ class DockerService:
         # logs bot_resume_failed, removes the staging dir it was told this attempt
         # created, and re-raises — the container never starts on a failed or
         # partial seed, and the promote never happens.
+        # CTRLRESUME P3 — activation gate (§3). The hook now runs when the request
+        # resumes OR when >=1 staged controller carried resume_mode: latest. When
+        # the request itself resumes, the flags are IGNORED downstream (request
+        # wins outright); with the request off, the flags drive a controller-
+        # identity resume. Neither -> hook not invoked, identical to today.
+        flagged = any(mode == "latest" for mode in controller_resume_flags.values())
         resume_manifest = None
-        if config.resume_mode != "off":
+        if config.resume_mode != "off" or flagged:
             resume_manifest = await seed_resume_state(
                 deployment=config,
                 new_instance_dir=Path(staging_dir),
@@ -846,6 +852,7 @@ class DockerService:
                 # name, which would strip to the wrong base and break `latest`.
                 new_instance_name=instance_name,
                 created_by_this_attempt=True,
+                controller_resume_flags=controller_resume_flags,
             )
 
         return gateway_certs_host_dir, resume_manifest
