@@ -31,6 +31,7 @@ Real tmp_path filesystems throughout; the Docker client is the only mock (the
 source-container guard's single read-only call).
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -47,7 +48,7 @@ from pydantic import ValidationError
 
 from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from models.bot_orchestration import V2ControllerDeployment, V2ScriptDeployment
-from ledger_fixtures import valid_ledger_payload
+from ledger_fixtures import valid_ledger_payload, valid_purse_payload
 from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
@@ -361,6 +362,13 @@ class TestPreviewC1:
         (src_data / f"{custom}.owner").write_text(
             json.dumps({"controller_id": CONTROLLER_ID}), encoding="utf-8"
         )
+        # hbpurseapi P1: the purse journal shares the state file's stem
+        # (custom_ladder.json -> custom_ladder.purse.json). A valid purse present
+        # is copied cleanly, so the accept path stays warning-free; were it absent
+        # the deploy would (correctly) emit a PURSE_BOOTSTRAP_PENDING warning.
+        (src_data / "custom_ladder.purse.json").write_text(
+            json.dumps(valid_purse_payload(CONTROLLER_ID)), encoding="utf-8"
+        )
         write_template(bots_tree, state_file_name=custom)
 
         result = await preview_resume(
@@ -375,6 +383,23 @@ class TestPreviewC1:
         assert result["warnings"] == []
         planned = {os.path.basename(f["dst"]) for f in result["files"]}
         assert custom in planned
+        # The purse rode along as a first-class copy item and was recorded copied.
+        assert "custom_ladder.purse.json" in planned
+        # CDX-R04: the recorded sha256 is the digest of the SOURCE bytes, computed
+        # INDEPENDENTLY here (not read back from the result) so a wrong/empty hash
+        # fails this test — the manifest's provenance claim is what's under test.
+        expected_purse_sha = hashlib.sha256(
+            (src_data / "custom_ladder.purse.json").read_bytes()
+        ).hexdigest()
+        assert result["purse"] == [
+            {
+                "controller_id": CONTROLLER_ID,
+                "kind": "purse",
+                "decision": "copied",
+                "purse_name": "custom_ladder.purse.json",
+                "sha256": expected_purse_sha,
+            }
+        ]
 
 
 # ===========================================================================
