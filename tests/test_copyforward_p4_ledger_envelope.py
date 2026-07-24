@@ -45,6 +45,7 @@ import yaml
 from ledger_fixtures import valid_ledger_payload
 from services.ledger_envelope_contract import (
     ENGINE_IDENTITY_DEFAULTS,
+    OPTIONAL_MONETARY_LEDGER_FIELDS,
     REQUIRED_LEDGER_KEYS,
     STATE_MAX_FUTURE_SKEW_SECONDS,
     SUPPORTED_LEDGER_SCHEMA_VERSIONS,
@@ -88,7 +89,7 @@ ENGINE_REQUIRED_KEYS = {
 # range_inventory_ladder.py:1386
 ENGINE_SUPPORTED_SCHEMA_VERSIONS = {6, 7, 8, 9, 10}
 
-# range_inventory_ladder.py:2033-2039
+# range_inventory_ladder.py:2507-2513
 ENGINE_NUMERIC_KEYS = [
     "reserve_quote_balance",
     "reserve_base_balance",
@@ -97,6 +98,11 @@ ENGINE_NUMERIC_KEYS = [
     "initial_reference_price",
     "initialized_timestamp",
 ]
+
+# F7 — range_inventory_ladder.py:2551. The v10 monetary fields the engine validates
+# at a SEPARATE site (after the v9->v10 migration derives absent ones :2531-2545):
+# finite, non-negative, but OPTIONAL — absent is valid.
+ENGINE_OPTIONAL_MONETARY_KEYS = ["owned_quote", "owned_base", "seed_value_quote"]
 
 # range_inventory_ladder.py:192-206 — the engine's RESOLVED config defaults. A
 # staged YAML that omits one of these does not make it unknowable: the engine
@@ -232,6 +238,13 @@ class TestMirrorMatchesEngine:
     def test_mirror_matches_engine_future_skew_limit(self):
         """range_inventory_ladder.py:1387."""
         assert STATE_MAX_FUTURE_SKEW_SECONDS == Decimal(ENGINE_MAX_FUTURE_SKEW_SECONDS)
+
+    def test_mirror_matches_engine_optional_monetary_fields(self):
+        """F7 — range_inventory_ladder.py:2551. These three are the widening: the
+        engine quarantines on a present-but-invalid one, so a mirror that drops any
+        of them lets the API bless a ledger the engine reseeds on. Order-independent
+        (it is a membership check downstream), so compare as sets."""
+        assert set(OPTIONAL_MONETARY_LEDGER_FIELDS) == set(ENGINE_OPTIONAL_MONETARY_KEYS)
 
     def test_shared_fixture_is_exactly_the_engines_required_keys(self):
         # Pins the shared spec artifact: minimal means minimal. If someone adds a
@@ -662,6 +675,122 @@ class TestNumericFields:
         assert verdict.is_valid, verdict.reason
 
 
+class TestOptionalMonetaryFields:
+    """F7 — the v10 monetary fields (owned_quote/owned_base/seed_value_quote). The
+    engine validates them at range_inventory_ladder.py:2551-2558 and quarantines on
+    a present-but-invalid one, then re-seeds from the wallet. The OLD six-field
+    mirror never looked at them — this is the widening that closes that gap."""
+
+    def test_absent_monetary_fields_still_valid(self):
+        """Backward compat: a minimal ledger omits all three; the engine's v9->v10
+        migration DERIVES them (:2531-2545), so absence must stay valid — the mirror
+        must not turn an absent (migration-derived) field into a false abort."""
+        payload = valid_ledger_payload(CANON_ID)
+        for field in ENGINE_OPTIONAL_MONETARY_KEYS:
+            assert field not in payload  # the fixture is minimal
+        assert classify(payload).is_valid
+
+    @pytest.mark.parametrize("field", ENGINE_OPTIONAL_MONETARY_KEYS)
+    def test_present_valid_monetary_field_accepted(self, field):
+        assert classify(valid_ledger_payload(CANON_ID, **{field: "12.5"})).is_valid
+
+    @pytest.mark.parametrize("field", ENGINE_OPTIONAL_MONETARY_KEYS)
+    def test_present_negative_monetary_field_rejected(self, field):
+        # :2556-2557 — 'must be non-negative'. Fails (accepts) if `field` were dropped
+        # from OPTIONAL_MONETARY_LEDGER_FIELDS — the reviewer's named mutation.
+        verdict = classify(valid_ledger_payload(CANON_ID, **{field: "-1"}))
+        assert not verdict.is_valid
+        assert field in verdict.reason
+
+    @pytest.mark.parametrize("field", ENGINE_OPTIONAL_MONETARY_KEYS)
+    @pytest.mark.parametrize(
+        "bad",
+        [pytest.param("abc", id="garbage"), pytest.param(float("nan"), id="nan"),
+         pytest.param(float("inf"), id="inf"), pytest.param(None, id="null"),
+         pytest.param("", id="blank"), pytest.param([1], id="list")],
+    )
+    def test_present_invalid_monetary_field_rejected(self, field, bad):
+        # :2553 — _safe_decimal parses it and raises on non-finite/garbage. A PRESENT
+        # null/blank is a rejection (the engine passes NO default at :2553, unlike the
+        # booked_fill_progress read), so this differs from the absent-key case above.
+        verdict = classify(valid_ledger_payload(CANON_ID, **{field: bad}))
+        assert not verdict.is_valid
+        assert field in verdict.reason
+
+
+class TestBookedFillProgress:
+    """CLA-M03 — booked_fill_progress. The engine validates it at
+    range_inventory_ladder.py:2571-2602: absent/None valid; a non-dict payload, a
+    non-string key, a non-dict entry, or a base/quote/fees that is non-finite/
+    negative quarantines; a MISSING base/quote/fees defaults to 0 (valid). One
+    poison entry silently kills booking engine-side while trading continues, and
+    rides copy-forward — so the API refuses the deploy first."""
+
+    def test_absent_progress_valid(self):
+        payload = valid_ledger_payload(CANON_ID)
+        assert "booked_fill_progress" not in payload
+        assert classify(payload).is_valid
+
+    def test_explicit_none_progress_valid(self):
+        assert classify(valid_ledger_payload(CANON_ID, booked_fill_progress=None)).is_valid
+
+    def test_valid_progress_accepted(self):
+        prog = {"exec-1": {"base": "1.5", "quote": "225", "fees": "0.3"}}
+        assert classify(valid_ledger_payload(CANON_ID, booked_fill_progress=prog)).is_valid
+
+    def test_entry_with_missing_subkeys_valid(self):
+        # The engine defaults a missing base/quote/fees to 0 (:2593, default="0"), so
+        # {} is a valid entry. Rejecting it would be a false abort on a ledger the
+        # engine loads clean — the mutation for THIS test is 'reject missing subkey'.
+        assert classify(valid_ledger_payload(CANON_ID, booked_fill_progress={"exec-1": {}})).is_valid
+
+    def test_partial_subkeys_valid(self):
+        prog = {"exec-1": {"base": "2"}}  # quote/fees default to 0
+        assert classify(valid_ledger_payload(CANON_ID, booked_fill_progress=prog)).is_valid
+
+    @pytest.mark.parametrize(
+        "progress",
+        [pytest.param([1, 2], id="list"), pytest.param("x", id="string"),
+         pytest.param(5, id="int")],
+    )
+    def test_non_dict_progress_rejected(self, progress):
+        verdict = classify(valid_ledger_payload(CANON_ID, booked_fill_progress=progress))
+        assert not verdict.is_valid
+        assert "booked_fill_progress" in verdict.reason
+
+    def test_non_string_key_rejected(self):
+        # JSON always yields string keys, but a hand-built dict off any code path must
+        # be refused as the engine refuses it (:2582-2585).
+        verdict = classify(valid_ledger_payload(CANON_ID, booked_fill_progress={7: {"base": "1"}}))
+        assert not verdict.is_valid
+
+    def test_non_dict_entry_rejected(self):
+        verdict = classify(valid_ledger_payload(CANON_ID, booked_fill_progress={"exec-1": "oops"}))
+        assert not verdict.is_valid
+        assert "exec-1" in verdict.reason
+
+    @pytest.mark.parametrize("money_key", ["base", "quote", "fees"])
+    @pytest.mark.parametrize(
+        "bad",
+        [pytest.param("garbage", id="garbage"), pytest.param(float("nan"), id="nan"),
+         pytest.param(float("inf"), id="inf")],
+    )
+    def test_non_finite_subkey_rejected(self, money_key, bad):
+        prog = {"exec-1": {"base": "1", "quote": "2", "fees": "0"}}
+        prog["exec-1"][money_key] = bad
+        verdict = classify(valid_ledger_payload(CANON_ID, booked_fill_progress=prog))
+        assert not verdict.is_valid
+        assert money_key in verdict.reason
+
+    @pytest.mark.parametrize("money_key", ["base", "quote", "fees"])
+    def test_negative_subkey_rejected(self, money_key):
+        prog = {"exec-1": {"base": "1", "quote": "2", "fees": "0"}}
+        prog["exec-1"][money_key] = "-0.01"
+        verdict = classify(valid_ledger_payload(CANON_ID, booked_fill_progress=prog))
+        assert not verdict.is_valid
+        assert money_key in verdict.reason
+
+
 # ===========================================================================
 # 3.  The real path — compute_copy_plan aborts the deploy
 # ===========================================================================
@@ -771,6 +900,51 @@ class TestComputeCopyPlanIntegration:
         with pytest.raises(ResumeError) as exc:
             compute_copy_plan(new, src, make_dep())
         assert exc.value.reason == ResumeAbortReason.LEDGER_INVALID
+
+    def test_negative_owned_quote_aborts(self, tmp_path):
+        """F7 through the real plan path: a v10 ledger the engine would quarantine on
+        (a negative owned_quote) is refused at the API — the case the old six-field
+        mirror copied forward, letting the bot silently wallet-reseed."""
+        src = make_source(tmp_path)
+        write_raw_ledger(src, payload=valid_ledger_payload(CANON_ID, owned_quote="-1"))
+        new = new_instance(tmp_path)
+        write_controller(new)
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason == ResumeAbortReason.LEDGER_INVALID
+        assert "owned_quote" in exc.value.message
+
+    def test_corrupt_booked_fill_progress_aborts(self, tmp_path):
+        """CLA-M03 through the real plan path: one poison entry (a non-numeric base)
+        would kill booking engine-side while trading continues and ride copy-forward,
+        so the API refuses the deploy."""
+        src = make_source(tmp_path)
+        payload = valid_ledger_payload(CANON_ID, booked_fill_progress={"exec-1": {"base": "garbage"}})
+        write_raw_ledger(src, payload=payload)
+        new = new_instance(tmp_path)
+        write_controller(new)
+
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason == ResumeAbortReason.LEDGER_INVALID
+        assert "booked_fill_progress" in exc.value.message
+
+    def test_valid_v10_ledger_with_monetary_and_progress_copies(self, tmp_path):
+        """The widening must not over-reject: a fuller v10 ledger carrying valid
+        owned_*/seed_value_quote AND a clean booked_fill_progress still copies."""
+        src = make_source(tmp_path)
+        payload = valid_ledger_payload(
+            CANON_ID,
+            owned_quote="100", owned_base="0", seed_value_quote="100",
+            booked_fill_progress={"exec-1": {"base": "1", "quote": "150", "fees": "0"}},
+        )
+        write_raw_ledger(src, payload=payload)
+        new = new_instance(tmp_path)
+        write_controller(new)
+
+        plan = compute_copy_plan(new, src, make_dep())
+        assert plan.decisions == {CANON_ID: "copied"}
 
     def test_identity_uses_the_c2_canonical_id(self, tmp_path):
         """C2 consistency: the staged id is ' ctrl_a ' (padded), whose canonical
