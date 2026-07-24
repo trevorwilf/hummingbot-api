@@ -116,6 +116,17 @@ class ResumeAbortReason(str, Enum):
     # with a request-level resume_mode='explicit'. A NEW member — never overload
     # an existing reason for this.
     CONTROLLER_SOURCES_DIVERGENT = "CONTROLLER_SOURCES_DIVERGENT"
+    # hbpurseapi P1 (F14): a source purse journal is PRESENT but fails the envelope
+    # check (bad schema version, foreign controller_id, non-monotonic seq, truncated
+    # JSON, ...). The fail-closed posture of an invalid ledger, applied to the money
+    # journal: never copy a doubtful purse forward and never resume without it. The
+    # minimal structural check here is swapped for the formal contract in P2.
+    PURSE_INVALID = "PURSE_INVALID"
+    # hbpurseapi P1 (F14, required change #3): the source purse journal is ABSENT but
+    # the source STATE file declares 'purse_initialized: true'. A post-bootstrap
+    # source that lost its journal is a data-loss event, not a fresh first run —
+    # resuming would silently drop inception accounting, so it aborts.
+    PURSE_MISSING = "PURSE_MISSING"
 
 
 class ResumeError(Exception):
@@ -1312,7 +1323,9 @@ RANGE_LADDER_CONTROLLER_NAME = "range_inventory_ladder"
 
 # CopyItem.kind values that name a real file to physically copy (Phase 5 acts
 # only on these). ``absolute_skipped`` is an audit marker, never copied.
-_COPYABLE_KINDS = frozenset({"ledger", "owner", "sqlite", "sqlite_journal", "extra"})
+# ``purse`` (hbpurseapi P1, F14) is the controller-owned money journal, carried
+# forward byte-exact alongside its ledger.
+_COPYABLE_KINDS = frozenset({"ledger", "owner", "sqlite", "sqlite_journal", "extra", "purse"})
 
 # Never copied, regardless of source (§6): session-stamped diagnostics, atomic-
 # write remnants, logs. Matched by ``fnmatch`` against the file *name*. The
@@ -1343,7 +1356,8 @@ class CopyItem:
         controller_id: The owning controller id, or ``None`` for instance-level
             files (sqlite, extra paths).
         kind: One of ``ledger`` / ``owner`` / ``sqlite`` / ``sqlite_journal`` /
-            ``extra`` (copyable), or ``absolute_skipped`` (audit marker).
+            ``extra`` / ``purse`` (copyable), or ``absolute_skipped`` (audit
+            marker).
     """
 
     src: Path
@@ -1369,12 +1383,25 @@ class CopyPlan:
             entries an API caller can branch on instead of grepping prose. A log
             line is invisible to whoever posted the deploy; C1's opt-out is only
             honest if the resulting skip comes back in the response.
+        purse_decisions: hbpurseapi P1 (F14) — one entry per range-ladder
+            controller whose purse journal was considered: ``{"controller_id",
+            "kind": "purse", "decision": "copied" | "bootstrap_pending",
+            "purse_name", "sha256"?}``. A ``copied`` purse also rides ``items`` as
+            a copyable file; ``bootstrap_pending`` records that no journal was
+            carried (with a structured warning). An INVALID purse or a
+            marker-declared-but-absent purse never reaches here — it aborts.
+        orphan_notes: hbpurseapi P1 (F14) — one entry per source ``*.json`` /
+            ``*.purse.json`` that matched no copy kind and was left behind:
+            ``{"name", "category", "note"}``. Purely observational (logged +
+            surfaced), never a copy or an abort.
     """
 
     items: List[CopyItem] = field(default_factory=list)
     decisions: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     structured_warnings: List[dict] = field(default_factory=list)
+    purse_decisions: List[dict] = field(default_factory=list)
+    orphan_notes: List[dict] = field(default_factory=list)
 
     @property
     def files_to_copy(self) -> List[CopyItem]:
@@ -1612,7 +1639,25 @@ def _expected_ledger_name(
     return f"range_inventory_ladder_{canonical_controller_id}.json"
 
 
-def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: str) -> None:
+def _expected_purse_name(ledger_name: str) -> str:
+    """Return the purse-journal filename for a controller (PINNED contract v1).
+
+    The journal lives NEXT TO the ladder state file, named ``<state stem>.purse.json``:
+    ``range_inventory_ladder_xmr_usdt.json`` -> ``range_inventory_ladder_xmr_usdt.purse.json``.
+    Mirrors the engine's ``purse_path_for_state`` (controllers/_shared/purse_ledger.py)
+    exactly: ``Path.with_name(f"{stem}.purse.json")`` — so a custom ``state_file_name``
+    in a subdirectory keeps its directory (``sub/x.json`` -> ``sub/x.purse.json``) and a
+    multi-dot name keeps every dot but the last (``a.b.json`` -> ``a.b.purse.json``).
+
+    Args:
+        ledger_name: The expected ledger filename from :func:`_expected_ledger_name`
+            (a data/-relative name; may carry a subdirectory).
+    """
+    p = Path(ledger_name)
+    return str(p.with_name(f"{p.stem}.purse.json"))
+
+
+def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: str) -> dict:
     """Fail-closed unless an expected ledger is a VALID ENGINE ENVELOPE (CDX-M02).
 
     Never seed garbage — the engine would quarantine and re-seed from the wallet
@@ -1638,6 +1683,12 @@ def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: st
         canonical_controller_id: The C2-CANONICAL (stripped) staged id. Passed in
             rather than re-read from ``config`` so no unvalidated id reaches an
             identity comparison — the same reasoning as :func:`_plan_controller`'s.
+
+    Returns:
+        The parsed ledger payload (a ``dict`` — the envelope validated it as an
+        object). Returned so the caller can read the v10 bridge marker
+        ``purse_initialized`` (hbpurseapi P1) off the already-parsed state file
+        instead of reading and parsing it a second time.
 
     Raises:
         ResumeError: ``LEDGER_INVALID`` on any read error, zero-length file, JSON
@@ -1688,6 +1739,7 @@ def _validate_ledger(src_ledger: Path, config: dict, canonical_controller_id: st
             f"Copying it forward would deploy a bot that quarantines this state on load and "
             f"re-seeds from the wallet. Refusing to deploy (CDX-M02, fail-closed).",
         )
+    return payload
 
 
 def _read_owner_controller_id(owner_path: Path) -> str:
@@ -1767,6 +1819,239 @@ def _assert_contained(candidate: Path, root: Path, label: str, controller_id) ->
             f"configured name is lexically clean). Failing closed.",
         )
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# Purse journal (hbpurseapi P1, F14) — copy kind + fail-closed plan semantics
+# ---------------------------------------------------------------------------
+#
+# The purse journal is the controller-owned, append-only money ledger (PINNED
+# "Purse journal contract v1"). The API NEVER writes or edits it (safety rule 3):
+# it validates the envelope, copies the file byte-exact alongside the state file,
+# and records the decision. Every branch fails CLOSED — a doubtful journal blocks
+# the resume rather than letting a bot trade on suspect accounting.
+
+# The purse's OWN schema version (PINNED contract v1), independent of the ledger's
+# SUPPORTED_LEDGER_SCHEMA_VERSIONS ({6..10}) — no coupling, no state-schema bump
+# this batch (safety invariant 5). Mirrors the engine's PURSE_SCHEMA_VERSION = 1
+# (controllers/_shared/purse_ledger.py). P2's formal contract owns this constant.
+PURSE_SCHEMA_VERSION_P1 = 1
+
+
+def _purse_envelope_reason_minimal(payload, canonical_controller_id: str) -> Optional[str]:
+    """P1 MINIMAL purse-envelope check — returns a reason string when INVALID,
+    ``None`` when it passes. **Swapped for the formal contract in P2**
+    (``services.purse_envelope_contract``); this is the deliberately-narrow subset
+    the phase spec pins: top-level shape + keys, ``purse_schema_version == 1``,
+    ``controller_id`` identity, a non-empty ``records`` list, and strictly-
+    increasing (monotonic) integer ``seq``.
+
+    It does NOT yet enforce the per-kind required fields, epoch rules, the
+    ``sequence``-matches-highest-seq rule, or the opening_epoch-first rule — those
+    are P2's. It is NECESSARY, not SUFFICIENT: enough to reject a journal the
+    engine is guaranteed to refuse, so the API can refuse the deploy while
+    refusing is still free (the same posture as the ledger envelope).
+
+    ``controller_id`` is compared EXACTLY against the C2-canonical staged id — the
+    journal's own copy is never stripped, mirroring the engine's exact comparison
+    (controllers/_shared/purse_ledger.py ``_validate_document``: ``raw.get(
+    "controller_id") != self._controller_id``). Stripping here would bless a
+    journal the engine quarantines.
+    """
+    if not isinstance(payload, dict):
+        return f"purse payload must be a JSON object (got {type(payload).__name__})"
+    for key in ("purse_schema_version", "controller_id", "records"):
+        if key not in payload:
+            return f"purse journal is missing required top-level key '{key}'"
+    version = payload.get("purse_schema_version")
+    if version != PURSE_SCHEMA_VERSION_P1:
+        return (
+            f"unsupported purse_schema_version {version!r}; this batch supports only "
+            f"{PURSE_SCHEMA_VERSION_P1} (the purse has its own version, independent of the "
+            f"ledger schema)"
+        )
+    journal_id = payload.get("controller_id")
+    if journal_id != canonical_controller_id:
+        return (
+            f"purse journal controller_id {journal_id!r} does not match the staged controller's "
+            f"canonical id {canonical_controller_id!r} — this is a different controller's "
+            f"journal (the engine compares these exactly and refuses to adopt a foreign journal)"
+        )
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        return "purse journal 'records' must be a non-empty list"
+    prev_seq = 0
+    for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            return f"purse record #{index} must be a JSON object"
+        seq = record.get("seq")
+        # ``bool`` excluded: ``isinstance(True, int)`` is True in Python, so
+        # ``seq: true`` would otherwise sneak in as 1.
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= prev_seq:
+            return (
+                f"purse record seq {seq!r} violates the strictly-increasing order "
+                f"(record #{index}, previous seq {prev_seq})"
+            )
+        prev_seq = seq
+    return None
+
+
+def _validate_purse(src_purse: Path, canonical_controller_id: str) -> str:
+    """Fail-closed unless a source purse journal passes the MINIMAL envelope check.
+
+    Owns the file (read errors, zero-length, JSON syntax) and delegates the
+    envelope to :func:`_purse_envelope_reason_minimal`, the same split the ledger
+    path uses (``_validate_ledger`` owns the file, the contract module owns the
+    envelope) and that P2 keeps when it swaps in the formal validator.
+
+    Returns:
+        The source file's sha256 hex digest — recorded on the ``copied`` purse
+        manifest entry, computed here from the bytes already read so no second
+        read is needed.
+
+    Raises:
+        ResumeError: ``PURSE_INVALID`` on any read error, zero-length file, JSON
+            syntax error, or envelope violation. Every uncertainty is a refusal:
+            never copy a doubtful money journal forward.
+    """
+    try:
+        raw = src_purse.read_bytes()
+    except OSError as exc:
+        raise ResumeError(
+            ResumeAbortReason.PURSE_INVALID,
+            f"Purse journal '{src_purse}' could not be read: {exc} — refusing to resume "
+            f"on a money journal we cannot verify.",
+        )
+    if len(raw) == 0:
+        raise ResumeError(
+            ResumeAbortReason.PURSE_INVALID,
+            f"Purse journal '{src_purse}' is zero-length — refusing to seed a broken money journal.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ResumeError(
+            ResumeAbortReason.PURSE_INVALID,
+            f"Purse journal '{src_purse}' is not valid JSON ({exc}) — refusing to seed garbage.",
+        )
+    except RecursionError as exc:
+        # json.loads recurses per nesting level; a journal nested past the
+        # interpreter limit raises RecursionError (a RuntimeError, not ValueError),
+        # so it must be caught explicitly or it surfaces as an opaque 500 (the same
+        # fix CDX-R03 applied to the ledger path).
+        raise ResumeError(
+            ResumeAbortReason.PURSE_INVALID,
+            f"Purse journal '{src_purse}' is nested too deeply to parse ({exc}) — "
+            f"refusing to seed garbage.",
+        )
+    reason = _purse_envelope_reason_minimal(payload, canonical_controller_id)
+    if reason is not None:
+        raise ResumeError(
+            ResumeAbortReason.PURSE_INVALID,
+            f"Purse journal '{src_purse}' is not a valid engine purse: {reason}. Copying it "
+            f"forward would resume a bot on suspect accounting (or one the engine refuses to "
+            f"adopt). Refusing to deploy (hbpurseapi P1, fail-closed).",
+        )
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _state_declares_purse(state_payload) -> bool:
+    """True iff a parsed state (ledger) payload carries the v10 bridge marker
+    ``"purse_initialized": true`` (PINNED contract: "once the purse exists, the
+    STATE file gains the OPTIONAL v10 key"). Exactly ``True`` — a truthy 1/"yes"
+    is not the marker, matching the engine's own strict writes. Anything that is
+    not a mapping (no state file, or a non-dict payload) declares no purse."""
+    return isinstance(state_payload, dict) and state_payload.get("purse_initialized") is True
+
+
+def _plan_purse(
+    controller_id: str,
+    ledger_name: str,
+    src_ledger: Path,
+    ledger_present: bool,
+    state_payload,
+    source: "ResolvedSource",
+    new_data_dir: Path,
+    plan: CopyPlan,
+) -> None:
+    """Plan the purse journal for one range-ladder controller; mutate ``plan``.
+
+    All four cases fail CLOSED (PINNED contract v1 / required change #3):
+
+    * purse PRESENT + envelope-valid -> copy it byte-exact (kind ``purse``),
+      record a ``copied`` manifest entry with sha256.
+    * purse PRESENT + INVALID -> ABORT (``PURSE_INVALID``): never copy a doubtful
+      money journal, the same posture as an invalid ledger.
+    * purse ABSENT + the state file declares ``purse_initialized: true`` -> ABORT
+      (``PURSE_MISSING``): a post-bootstrap source that lost its journal is a
+      data-loss event, not a first run.
+    * purse ABSENT + no marker -> allowed (pre-purse source / first migration):
+      record ``bootstrap_pending`` and a STRUCTURED warning (F12 — the operator
+      must see that no inception accounting is carried).
+
+    ``state_payload`` is the ALREADY-parsed ledger (from :func:`_validate_ledger`)
+    when the ledger is present, else ``None`` — the marker is read off it, never a
+    second file read.
+    """
+    purse_name = _expected_purse_name(ledger_name)
+    src_purse = source.data_dir / purse_name
+    dst_purse = new_data_dir / purse_name
+
+    # Same containment discipline as the ledger and its owner sidecar: the purse
+    # name is derived from the same (operator-influenced) state_file_name, so its
+    # concrete source and destination must resolve strictly inside their data/
+    # roots (a symlinked subdir escapes even a lexically clean name).
+    _assert_contained(src_purse, source.data_dir, "source purse path", controller_id)
+    _assert_contained(dst_purse, new_data_dir, "purse destination", controller_id)
+
+    if src_purse.exists():
+        sha256 = _validate_purse(src_purse, controller_id)  # PURSE_INVALID on failure
+        plan.items.append(
+            CopyItem(src=src_purse, dst=dst_purse, controller_id=controller_id, kind="purse")
+        )
+        plan.purse_decisions.append(
+            {
+                "controller_id": controller_id,
+                "kind": "purse",
+                "decision": "copied",
+                "purse_name": purse_name,
+                "sha256": sha256,
+            }
+        )
+        return
+
+    # Purse ABSENT.
+    if ledger_present and _state_declares_purse(state_payload):
+        raise ResumeError(
+            ResumeAbortReason.PURSE_MISSING,
+            f"Controller '{controller_id}': its state file '{src_ledger.name}' declares "
+            f"'purse_initialized: true', but the purse journal '{purse_name}' is absent from "
+            f"source '{source.data_dir}'. A post-bootstrap source that lost its money journal "
+            f"is a DATA-LOSS event, not a fresh first run — resuming would silently drop this "
+            f"controller's inception accounting. Refusing to deploy (hbpurseapi P1, fail-closed). "
+            f"Restore the purse journal, or resume from an instance that still has it.",
+        )
+
+    # Absent + no marker -> legitimate bootstrap (pre-purse source or first
+    # migration). Record it, and surface it structurally (not just in a log line):
+    # the operator is entitled to know no inception accounting was carried.
+    plan.purse_decisions.append(
+        {
+            "controller_id": controller_id,
+            "kind": "purse",
+            "decision": "bootstrap_pending",
+            "purse_name": purse_name,
+        }
+    )
+    plan._warn_structured(
+        "PURSE_BOOTSTRAP_PENDING",
+        f"Controller '{controller_id}': no purse journal '{purse_name}' in source "
+        f"'{source.data_dir}' and its state file does not declare one — the engine will "
+        f"bootstrap a fresh purse on first run (legitimate for a pre-purse source or a first "
+        f"migration). No inception accounting is carried forward for this controller.",
+        controller_id=controller_id,
+        purse_name=purse_name,
+    )
 
 
 def _plan_controller(
@@ -1875,17 +2160,29 @@ def _plan_controller(
     # No ledger in source -> warn + fresh seed for THIS controller only (§6 table).
     if not src_ledger.exists():
         plan.decisions[controller_id] = "fresh_seed"
-        plan._warn(
+        # F12: a fresh seed is a silent accounting epoch. It now lands in
+        # structured_warnings (was prose-only ``_warn``), so the operator sees it
+        # on the deploy AND the preview response, not only in a log line.
+        plan._warn_structured(
+            "RESUME_FRESH_SEED",
             f"Controller '{controller_id}': no ledger '{ledger_name}' in source '{source.data_dir}' — "
-            f"fresh-seeding this controller (legitimate for a newly added controller)."
+            f"fresh-seeding this controller (legitimate for a newly added controller).",
+            controller_id=controller_id,
+            ledger_name=ledger_name,
+        )
+        # Purse (F14): with no state file there is no marker, so an absent purse is
+        # a legitimate bootstrap and a present-but-stray purse still validates/copies.
+        _plan_purse(
+            controller_id, ledger_name, src_ledger, False, None, source, new_data_dir, plan
         )
         return ledger_name
 
     # Ledger present -> must be a valid engine envelope, else abort (never seed
     # garbage). Runs BEFORE the .owner check on purpose: the envelope carries the
     # controller's own identity claim, so a ledger that is not an engine ledger at
-    # all is rejected as such rather than as an owner mismatch.
-    _validate_ledger(src_ledger, config, controller_id)
+    # all is rejected as such rather than as an owner mismatch. The parsed payload
+    # is returned so the purse marker check reads the already-parsed state file.
+    state_payload = _validate_ledger(src_ledger, config, controller_id)
 
     # Identity via .owner controller_id, never the filename (§6).
     if src_owner.exists():
@@ -1934,6 +2231,13 @@ def _plan_controller(
         CopyItem(src=src_ledger, dst=new_data_dir / ledger_name, controller_id=controller_id, kind="ledger")
     )
     plan.decisions[controller_id] = "copied"
+
+    # Purse (F14): carry the money journal forward alongside the state file, all
+    # branches fail-closed (copy valid / abort invalid / abort marker-but-missing /
+    # bootstrap_pending when legitimately absent).
+    _plan_purse(
+        controller_id, ledger_name, src_ledger, True, state_payload, source, new_data_dir, plan
+    )
     return ledger_name
 
 
@@ -1960,25 +2264,60 @@ def _source_ledger_controller_id(json_path: Path) -> Optional[str]:
     return None
 
 
-def _scan_orphan_source_ledgers(source: "ResolvedSource", deployed_ids: set, handled_names: set, plan: CopyPlan) -> None:
-    """Log source ledgers whose controller is not in the new deploy (§6 table: skip).
+def _record_orphan(plan: CopyPlan, name: str, category: str, message: str) -> None:
+    """F14 orphan visibility: log ONE line and record a manifest note for a source
+    file that matched no copy kind. Observational only — never a copy or an abort."""
+    logger.info(message)
+    plan.orphan_notes.append({"name": name, "category": category, "note": message})
 
-    Read-only classification: marks ``skipped`` decisions, never aborts.
+
+def _scan_orphan_source_ledgers(source: "ResolvedSource", deployed_ids: set, handled_names: set, plan: CopyPlan) -> None:
+    """Classify source ``*.json`` / ``*.purse.json`` files not carried by the copy
+    plan (§6 table: skip; F14: make the skip visible).
+
+    Read-only: an identifiable ledger for a controller NOT in this deploy still
+    gets a ``skipped`` decision (unchanged); every OTHER unmatched file — an orphan
+    purse journal or an unidentified ``*.json`` — that the old scan ``continue``d
+    past SILENTLY now gets a logged manifest note (F14). Never aborts, never copies.
     """
     if not source.data_dir.is_dir():
         return
     for json_path in sorted(source.data_dir.glob("*.json")):
-        if json_path.name in handled_names or _is_excluded(json_path.name):
+        name = json_path.name
+        # Handled ledgers/owner/purse, the never-copy list, and the manifest itself
+        # are accounted for — skip them silently. ``*.purse.json`` matches the
+        # *.json glob, so a COPIED controller's purse is caught here by handled_names.
+        if name in handled_names or _is_excluded(name) or name == "resume.manifest.json":
             continue
-        if json_path.name == "resume.manifest.json":
+        if name.endswith(".purse.json"):
+            # A purse journal carried by no copied controller (its controller is not
+            # in this deploy, or is deployed under a different state_file_name). It
+            # is NEVER mined for a ladder id — the default-name regex would read a
+            # bogus "<id>.purse" out of the stem. F14: log + note, never abort.
+            _record_orphan(
+                plan, name, "orphan_purse",
+                f"Purse journal '{name}' in source '{source.data_dir}' is carried by no "
+                f"controller in this deploy — left behind (not copied forward).",
+            )
             continue
         orphan_id = _source_ledger_controller_id(json_path)
-        if orphan_id is None or orphan_id in deployed_ids:
+        if orphan_id is None:
+            # F14: an unidentified *.json matching no copy kind — not a ladder ledger
+            # and no readable '.owner' sidecar. The old scan dropped it silently.
+            _record_orphan(
+                plan, name, "unidentified_json",
+                f"Unidentified file '{name}' in source '{source.data_dir}' matches no copy "
+                f"kind (not a ladder ledger, no readable '.owner' sidecar) — left behind.",
+            )
+            continue
+        if orphan_id in deployed_ids:
+            # The controller IS deployed, just under a different (custom) name or as
+            # a stale default-named twin: its real ledger was already handled.
             continue
         plan.decisions.setdefault(orphan_id, "skipped")
         logger.info(
             "Source ledger '%s' belongs to controller '%s' which is not in this deploy — skipping.",
-            json_path.name,
+            name,
             orphan_id,
         )
 
@@ -2103,6 +2442,10 @@ def compute_copy_plan(
         if handled:
             handled_names.add(handled)
             handled_names.add(f"{handled}.owner")
+            # The purse journal (F14) shares the state file's directory and is
+            # planned inside _plan_controller — register its name too so the orphan
+            # scan does not re-flag a copied controller's purse as unidentified.
+            handled_names.add(_expected_purse_name(handled))
 
     # Source ledgers for controllers NOT in this deploy -> skipped (logged).
     _scan_orphan_source_ledgers(source, deployed_ids, handled_names, plan)
@@ -3051,9 +3394,14 @@ async def _seed_from_source(
         "mode": deployment.resume_mode,
         "files": files,
         "decisions": dict(plan.decisions),
-        # The structured half of plan.warnings — C1's opt-out skip has to reach
-        # whoever posted the deploy, not just the log (see _warn_structured).
-        # ``create_hummingbot_instance`` lifts these onto the response.
+        # hbpurseapi P1 (F14) — ADDITIVE keys, every existing field byte-compatible.
+        # ``purse``: per-controller money-journal decisions (copied / bootstrap_
+        # pending). ``orphans``: source files that matched no copy kind, left behind.
+        "purse": list(plan.purse_decisions),
+        "orphans": list(plan.orphan_notes),
+        # The structured half of plan.warnings — C1's opt-out skip, F12's fresh-seed,
+        # and the purse bootstrap_pending all reach whoever posted the deploy, not
+        # just the log. ``create_hummingbot_instance`` lifts these onto the response.
         "warnings": list(plan.structured_warnings),
         "drift": drift,
         "guard_report": guard_report.to_dict(),
@@ -3469,6 +3817,8 @@ async def preview_resume(
                 "target": target_block,
                 "files": [],
                 "decisions": {},
+                "purse": [],
+                "orphans": [],
                 "warnings": [],
                 "drift": [],
                 "guard_report": GuardReport().to_dict(),
@@ -3508,6 +3858,8 @@ async def preview_resume(
                 "target": target_block,
                 "files": [],
                 "decisions": {},
+                "purse": [],
+                "orphans": [],
                 "warnings": warnings,
                 "drift": [],
                 "guard_report": report.to_dict(),
@@ -3551,11 +3903,17 @@ async def preview_resume(
             "target": target_block,
             "files": files,
             "decisions": dict(plan.decisions),
+            # hbpurseapi P1 (F14): purse decisions + orphan notes at preview parity
+            # with the deploy manifest, so the operator sees a bootstrap_pending
+            # purse or a left-behind file BEFORE deploying.
+            "purse": list(plan.purse_decisions),
+            "orphans": list(plan.orphan_notes),
             # Structured, machine-readable warnings (C1 opt-out skips land here,
-            # CLA-M01's sizing-critical drift entries alongside them, and a
-            # flag-driven resume's skipped_not_flagged entries). The preview is a
-            # pre-deploy check: a skip — or a silent resize — the deploy would
-            # perform is exactly what an operator needs to see BEFORE deploying.
+            # CLA-M01's sizing-critical drift entries alongside them, a flag-driven
+            # resume's skipped_not_flagged entries, F12's fresh-seed and the purse
+            # bootstrap_pending). The preview is a pre-deploy check: a skip — or a
+            # silent resize — the deploy would perform is exactly what an operator
+            # needs to see BEFORE deploying.
             "warnings": list(plan.structured_warnings),
             # The full field-level diff (CLA-M01), classified. The warnings above
             # are the sizing-critical subset; this is everything, for an operator
