@@ -530,13 +530,13 @@ class TestHarvest:
 # ===========================================================================
 
 async def insert_snapshot(db, *, controller_id="ctrl_a", sha, sequence, contributed="1",
-                          source_instance_name="inst1"):
+                          earned_total="0", source_instance_name="inst1"):
     async with db.get_session_context() as session:
         return await PurseSnapshotRepository(session).insert_snapshot_if_absent(
             controller_id=controller_id, source_instance_name=source_instance_name,
             source_bot_run_id=None, purse_sha256=sha, sequence=sequence, records_json="{}",
             derived_contributed=contributed, derived_withdrawn="0", derived_earned_realized="0",
-            derived_earned_total="0", derived_unrealized="0", derived_drift="0",
+            derived_earned_total=earned_total, derived_unrealized="0", derived_drift="0",
             reference_price_used="150", opening_basis_quality="reconstructed",
         )
 
@@ -555,6 +555,22 @@ class TestEndpoints:
         assert resp.provenance.harvested_at is not None
         assert resp.derived.contributed == "200"
         assert resp.authority_note == AUTHORITY_NOTE     # labeled non-authoritative
+
+    @pytest.mark.asyncio
+    async def test_earned_total_pct_computed_from_stored_strings(self, db):
+        """earned_total_pct = earned_total / contributed * 100, computed at RESPONSE time
+        from the stored decimal strings — so snapshots harvested before the field existed
+        gain it without a migration. 400 contributed / 50 earned -> 12.5%."""
+        await insert_snapshot(db, sha="sha-pct", sequence=1, contributed="400", earned_total="50")
+        resp = await get_purse("ctrl_a", db_manager=db)
+        assert Decimal(resp.derived.earned_total_pct) == Decimal("12.5")
+
+    @pytest.mark.asyncio
+    async def test_earned_total_pct_zero_when_contributed_zero(self, db):
+        # Zero contributed must never divide — the display figure degrades to "0".
+        await insert_snapshot(db, sha="sha-z", sequence=1, contributed="0", earned_total="50")
+        resp = await get_purse("ctrl_a", db_manager=db)
+        assert resp.derived.earned_total_pct == "0"
 
     @pytest.mark.asyncio
     async def test_get_purse_404_for_unknown_controller(self, db):

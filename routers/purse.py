@@ -8,6 +8,7 @@ masquerade as the live journal (required change #9). The raw ``records_json`` is
 persisted for audit/recovery but is NOT exposed here — the surface is derived-only.
 """
 import logging
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -27,12 +28,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Purse (derived read-model)"], prefix="/purse")
 
 
+def _earned_total_pct(contributed: str, earned_total: str) -> str:
+    """Inception return in percent (earned_total / contributed * 100).
+
+    Presentation-only — NOT part of the pinned contract-v1 derived set (it mirrors the
+    engine's ``_purse_status_block``). Computed from the STORED strings at response
+    time so snapshots harvested before this field existed gain it without a migration.
+    '0' when nothing was contributed (or on a malformed stored value — this is a
+    derived display figure, never worth a 500).
+    """
+    try:
+        c = Decimal(contributed)
+        e = Decimal(earned_total)
+    except (InvalidOperation, TypeError, ValueError):
+        return "0"
+    if not c.is_finite() or not e.is_finite() or c <= 0:
+        return "0"
+    return str(e / c * Decimal("100"))
+
+
 def _derived(row: PurseSnapshot) -> PurseDerivedMetrics:
     return PurseDerivedMetrics(
         contributed=row.derived_contributed,
         withdrawn=row.derived_withdrawn,
         earned_realized=row.derived_earned_realized,
         earned_total=row.derived_earned_total,
+        earned_total_pct=_earned_total_pct(row.derived_contributed, row.derived_earned_total),
         unrealized=row.derived_unrealized,
         drift=row.derived_drift,
         reference_price_used=row.reference_price_used,

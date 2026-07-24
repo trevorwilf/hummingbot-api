@@ -34,6 +34,14 @@ class PurseDerivedMetrics(BaseModel):
         description="earned_opening_quote + sum over epochs of (quote_delta_cum + base_delta_cum * ref)"
     )
     earned_total: str = Field(description="equity - contributed + withdrawn")
+    earned_total_pct: str = Field(
+        default="0",
+        description=(
+            "earned_total / contributed * 100 — inception return in percent. "
+            "Presentation-only (NOT part of the pinned contract-v1 derived set; "
+            "mirrors the engine's _purse_status_block); '0' when contributed is 0."
+        ),
+    )
     unrealized: str = Field(description="earned_total - earned_realized")
     drift: str = Field(description="residual the records cannot explain — always surfaced")
     reference_price_used: str = Field(
