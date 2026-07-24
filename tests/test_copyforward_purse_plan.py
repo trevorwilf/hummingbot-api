@@ -331,6 +331,33 @@ class TestInvalidPurseAborts:
             compute_copy_plan(new, src, make_dep())
         assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
 
+    def test_seq_regression_after_valid_first_aborts(self, tmp_path):
+        # Wire-through for the strictly-increasing guard (:433 ``seq <= prev_seq``),
+        # distinct from test_first_seq_not_one_aborts (that trips the 1-based guard).
+        # A VALID first record (seq 1) then a 3->2 regression, top-level sequence
+        # still the highest (4): the ONLY invalidity is the mid-journal drop, so a
+        # ``<=``->``==`` mutation lets this journal through — this test catches it,
+        # which the [2, 1] first-seq fixtures could not (seq-regression audit).
+        recs = [
+            opening_epoch_record(seq=s, epoch_id=f"epoch-{i}")
+            for i, s in enumerate([1, 3, 2, 4])
+        ]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_overflow_ts_aborts(self, tmp_path):
+        # Wire-through for the never-raises contract: an overflow-sized integer ts
+        # (a 400-digit int) is parseable JSON but unrepresentable as a float. The
+        # formal contract must convert the OverflowError to a STRUCTURED PURSE_INVALID
+        # abort end-to-end, never let it escape as an opaque 500 (overflow-ts audit).
+        recs = [opening_epoch_record(seq=1, ts=10 ** 400)]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
     # -- P2 wire-through: the plan path now rejects via the FORMAL contract --
     # Each case below passes P1's minimal structural check (6 top-level keys,
     # version 1, matching controller_id, non-empty records, 1-based monotonic seq)

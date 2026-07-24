@@ -211,7 +211,18 @@ def _require_ts(value, field_name: str) -> float:
         raise _PurseEnvelopeInvalid(
             f"purse field '{field_name}' must be a number, got {value!r}"
         )
-    ts = float(value)
+    # A JSON integer literal is arbitrary-precision in Python, so an overflow-sized
+    # int off untrusted disk (e.g. a 400-digit `ts`) raises OverflowError from
+    # float() — parseable JSON, yet unrepresentable as an epoch. Convert it to a
+    # structured verdict rather than let it escape classify_purse_envelope as an
+    # opaque exception: the never-raises contract must hold for EVERY parseable
+    # input, not only the ones float() happens to accept. (Overflow-ts audit finding.)
+    try:
+        ts = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise _PurseEnvelopeInvalid(
+            f"purse field '{field_name}' is not a representable finite number, got {value!r}"
+        ) from exc
     if ts != ts or ts in (float("inf"), float("-inf")) or ts < 0.0:
         raise _PurseEnvelopeInvalid(
             f"purse field '{field_name}' must be a finite non-negative number"

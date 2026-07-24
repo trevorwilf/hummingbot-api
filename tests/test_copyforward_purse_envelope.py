@@ -372,11 +372,26 @@ class TestRecordSeqTsKind:
 
     @pytest.mark.parametrize(
         "seqs",
-        [pytest.param([1, 1], id="equal"), pytest.param([2, 1], id="decreasing")],
+        [
+            pytest.param([1, 1], id="equal"),
+            pytest.param([2, 1], id="first_not_one"),
+            # A TRUE regression that isolates the strictly-increasing guard
+            # (:433 ``seq <= prev_seq``): a VALID first record (seq 1) followed by a
+            # 3->2 drop, with the top-level ``sequence`` still the highest (4). The
+            # ``equal``/``first_not_one`` fixtures trip the equality and 1-based
+            # guards respectively, so under a ``<=``->``==`` mutation they still pass;
+            # ONLY this case exercises the strict-`<` guard, so it alone fails the
+            # mutation — the reason it was added (seq-regression audit finding).
+            pytest.param([1, 3, 2, 4], id="regression_after_valid_first"),
+        ],
     )
     def test_non_increasing_seq_rejected(self, seqs):
-        recs = [opening_epoch_record(seq=seqs[0], epoch_id="epoch-1"),
-                opening_epoch_record(seq=seqs[1], epoch_id="epoch-2")]
+        # Distinct epoch_ids per record so multi-record fixtures never trip the
+        # "epoch opened twice" guard — the seq order is the only thing under test.
+        recs = [
+            opening_epoch_record(seq=s, epoch_id=f"epoch-{i}")
+            for i, s in enumerate(seqs)
+        ]
         assert not classify(valid_purse_payload(CANON_ID, records=recs)).is_valid
 
     @pytest.mark.parametrize("seq", [True, 1.0, "1", None, [1]])
@@ -390,7 +405,17 @@ class TestRecordSeqTsKind:
         payload["records"] = ["not a record"]
         assert not classify(payload).is_valid
 
-    @pytest.mark.parametrize("ts", [None, "1700000000", float("nan"), float("inf"), -1, True])
+    @pytest.mark.parametrize(
+        "ts",
+        [
+            None, "1700000000", float("nan"), float("inf"), -1, True,
+            # An overflow-sized integer ts: parseable JSON (arbitrary-precision int),
+            # but float() raises OverflowError. The classifier must convert it to a
+            # verdict, never raise — without the _require_ts try/except this case
+            # would ERROR here rather than assert-fail (overflow-ts audit finding).
+            pytest.param(10 ** 400, id="overflow_int"),
+        ],
+    )
     def test_bad_ts_rejected(self, ts):
         rec = opening_epoch_record(seq=1, epoch_id="epoch-1", ts=ts)
         assert not classify(valid_purse_payload(CANON_ID, records=[rec])).is_valid
