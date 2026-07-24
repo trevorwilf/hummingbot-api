@@ -1842,15 +1842,21 @@ def _purse_envelope_reason_minimal(payload, canonical_controller_id: str) -> Opt
     """P1 MINIMAL purse-envelope check — returns a reason string when INVALID,
     ``None`` when it passes. **Swapped for the formal contract in P2**
     (``services.purse_envelope_contract``); this is the deliberately-narrow subset
-    the phase spec pins: top-level shape + keys, ``purse_schema_version == 1``,
-    ``controller_id`` identity, a non-empty ``records`` list, and strictly-
-    increasing (monotonic) integer ``seq``.
+    the phase spec pins: top-level shape, PRESENCE of every pinned top-level key
+    (``purse_schema_version``, ``controller_id``, ``controller_name``,
+    ``trading_pair``, ``sequence``, ``records``), ``purse_schema_version == 1``,
+    ``controller_id`` identity, a non-empty ``records`` list, and 1-based
+    strictly-increasing integer ``seq`` (first record's seq must be 1).
 
     It does NOT yet enforce the per-kind required fields, epoch rules, the
-    ``sequence``-matches-highest-seq rule, or the opening_epoch-first rule — those
-    are P2's. It is NECESSARY, not SUFFICIENT: enough to reject a journal the
-    engine is guaranteed to refuse, so the API can refuse the deploy while
-    refusing is still free (the same posture as the ledger envelope).
+    ``sequence``-matches-highest-record-seq VALUE relationship, the
+    ``controller_name``/``trading_pair`` value-equality against config, or the
+    opening_epoch-first rule — those are P2's formal contract (CDX-R01
+    adjudication: PRESENCE of the keys and first-seq==1 are cheap structural
+    checks the engine also enforces, so P1 must reject them; the value
+    relationships are P2's). It is NECESSARY, not SUFFICIENT: enough to reject a
+    journal the engine is guaranteed to refuse, so the API can refuse the deploy
+    while refusing is still free (the same posture as the ledger envelope).
 
     ``controller_id`` is compared EXACTLY against the C2-canonical staged id — the
     journal's own copy is never stripped, mirroring the engine's exact comparison
@@ -1860,7 +1866,14 @@ def _purse_envelope_reason_minimal(payload, canonical_controller_id: str) -> Opt
     """
     if not isinstance(payload, dict):
         return f"purse payload must be a JSON object (got {type(payload).__name__})"
-    for key in ("purse_schema_version", "controller_id", "records"):
+    for key in (
+        "purse_schema_version",
+        "controller_id",
+        "controller_name",
+        "trading_pair",
+        "sequence",
+        "records",
+    ):
         if key not in payload:
             return f"purse journal is missing required top-level key '{key}'"
     version = payload.get("purse_schema_version")
@@ -1886,10 +1899,18 @@ def _purse_envelope_reason_minimal(payload, canonical_controller_id: str) -> Opt
             return f"purse record #{index} must be a JSON object"
         seq = record.get("seq")
         # ``bool`` excluded: ``isinstance(True, int)`` is True in Python, so
-        # ``seq: true`` would otherwise sneak in as 1.
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= prev_seq:
+        # ``seq: true`` would otherwise sneak in as 1. The first record's seq must
+        # be exactly 1 (1-based per the PINNED contract; the engine rejects a first
+        # seq != 1 at purse_ledger.py:584-585). Later gaps are contract-valid — the
+        # contract demands strict increase, NOT contiguity (engine note :573-576).
+        if (
+            isinstance(seq, bool)
+            or not isinstance(seq, int)
+            or (index == 1 and seq != 1)
+            or seq <= prev_seq
+        ):
             return (
-                f"purse record seq {seq!r} violates the strictly-increasing order "
+                f"purse record seq {seq!r} violates the 1-based strictly-increasing order "
                 f"(record #{index}, previous seq {prev_seq})"
             )
         prev_seq = seq

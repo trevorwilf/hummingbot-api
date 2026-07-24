@@ -174,11 +174,39 @@ class TestPurseEnvelopeMinimal:
         assert _purse_envelope_reason_minimal([1, 2], "ctrl_a") is not None
         assert _purse_envelope_reason_minimal(None, "ctrl_a") is not None
 
-    @pytest.mark.parametrize("key", ["purse_schema_version", "controller_id", "records"])
+    @pytest.mark.parametrize(
+        "key",
+        # ALL SIX pinned top-level keys (CDX-R01): the engine rejects a journal
+        # missing controller_name (purse_ledger.py:558), trading_pair (:563), or
+        # the top-level sequence (:608) just as it does the version/id/records, so
+        # blessing one here would be fail-open mirror drift.
+        [
+            "purse_schema_version",
+            "controller_id",
+            "controller_name",
+            "trading_pair",
+            "sequence",
+            "records",
+        ],
+    )
     def test_missing_top_level_key(self, key):
         payload = valid_purse_payload("ctrl_a")
         payload.pop(key)
         assert _purse_envelope_reason_minimal(payload, "ctrl_a") is not None
+
+    def test_first_seq_must_be_one(self):
+        # CDX-R01: the PINNED contract's seq is 1-BASED — a single-record journal
+        # whose only record is seq: 2 is monotone-from-zero but starts wrong; the
+        # engine rejects it (purse_ledger.py:584-585) so the API must too.
+        recs = [opening_epoch_record(seq=2)]
+        assert _purse_envelope_reason_minimal(
+            valid_purse_payload("ctrl_a", records=recs), "ctrl_a"
+        ) is not None
+        # A gap AFTER a correct first seq stays valid (strict increase, no contiguity).
+        recs_ok = [opening_epoch_record(seq=1), opening_epoch_record(seq=5, epoch_id="epoch-2")]
+        assert _purse_envelope_reason_minimal(
+            valid_purse_payload("ctrl_a", records=recs_ok), "ctrl_a"
+        ) is None
 
     def test_wrong_schema_version(self):
         assert _purse_envelope_reason_minimal(
@@ -318,6 +346,26 @@ class TestInvalidPurseAborts:
 
     def test_non_monotonic_seq_aborts(self, tmp_path):
         recs = [opening_epoch_record(seq=2), opening_epoch_record(seq=1, epoch_id="epoch-2")]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    @pytest.mark.parametrize("key", ["controller_name", "trading_pair", "sequence"])
+    def test_missing_top_level_key_aborts(self, tmp_path, key):
+        # CDX-R01 wire-through: a journal missing a pinned top-level key the engine
+        # requires must ABORT the plan (PURSE_INVALID), not be copied forward.
+        payload = valid_purse_payload("ctrl_a")
+        payload.pop(key)
+        new, src = self._plan(tmp_path, payload)
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_first_seq_not_one_aborts(self, tmp_path):
+        # CDX-R01 wire-through: a single-record journal whose first seq is 2 is
+        # 1-based-invalid; the engine refuses it, so the plan aborts fail-closed.
+        recs = [opening_epoch_record(seq=2)]
         new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
         with pytest.raises(ResumeError) as exc:
             compute_copy_plan(new, src, make_dep())

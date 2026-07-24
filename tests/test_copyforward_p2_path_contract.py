@@ -31,6 +31,7 @@ Real tmp_path filesystems throughout; the Docker client is the only mock (the
 source-container guard's single read-only call).
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -384,13 +385,19 @@ class TestPreviewC1:
         assert custom in planned
         # The purse rode along as a first-class copy item and was recorded copied.
         assert "custom_ladder.purse.json" in planned
+        # CDX-R04: the recorded sha256 is the digest of the SOURCE bytes, computed
+        # INDEPENDENTLY here (not read back from the result) so a wrong/empty hash
+        # fails this test — the manifest's provenance claim is what's under test.
+        expected_purse_sha = hashlib.sha256(
+            (src_data / "custom_ladder.purse.json").read_bytes()
+        ).hexdigest()
         assert result["purse"] == [
             {
                 "controller_id": CONTROLLER_ID,
                 "kind": "purse",
                 "decision": "copied",
                 "purse_name": "custom_ladder.purse.json",
-                "sha256": result["purse"][0]["sha256"],
+                "sha256": expected_purse_sha,
             }
         ]
 
