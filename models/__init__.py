@@ -166,6 +166,16 @@ from .portfolio import (
     TokenDistribution,
 )
 
+# Purse read-model models (hbpurseapi P3)
+from .purse import (
+    AUTHORITY_NOTE,
+    PurseDerivedMetrics,
+    PurseHistoryEntry,
+    PurseHistoryResponse,
+    PurseProvenance,
+    PurseSnapshotResponse,
+)
+
 # Script models
 from .scripts import Script, ScriptConfig, ScriptConfigResponse, ScriptResponse
 
@@ -191,6 +201,13 @@ from .trading import (
 )
 
 __all__ = [
+    # Purse read-model models (hbpurseapi P3)
+    "AUTHORITY_NOTE",
+    "PurseDerivedMetrics",
+    "PurseHistoryEntry",
+    "PurseHistoryResponse",
+    "PurseProvenance",
+    "PurseSnapshotResponse",
     # Bot orchestration models
     "BotAction",
     "StartBotAction",

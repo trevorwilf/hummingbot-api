@@ -6,6 +6,7 @@ from .funding_repository import FundingRepository
 from .gateway_clmm_repository import GatewayCLMMRepository
 from .gateway_swap_repository import GatewaySwapRepository
 from .order_repository import OrderRepository
+from .purse_snapshot_repository import PurseSnapshotRepository
 from .trade_repository import TradeRepository
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "TradeRepository",
     "GatewaySwapRepository",
     "GatewayCLMMRepository",
+    "PurseSnapshotRepository",
 ]

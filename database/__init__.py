@@ -10,6 +10,7 @@ from .models import (
     GatewaySwap,
     Order,
     PositionSnapshot,
+    PurseSnapshot,
     TokenState,
     Trade,
 )
@@ -22,16 +23,17 @@ from .repositories import (
     GatewayCLMMRepository,
     GatewaySwapRepository,
     OrderRepository,
+    PurseSnapshotRepository,
     TradeRepository,
 )
 
 __all__ = [
     "AccountState", "TokenState", "Order", "Trade", "PositionSnapshot", "FundingPayment", "BotRun",
     "GatewaySwap", "GatewayCLMMPosition", "GatewayCLMMEvent",
-    "ControllerPerformanceSnapshot",
+    "ControllerPerformanceSnapshot", "PurseSnapshot",
     "Base", "AsyncDatabaseManager",
     "AccountRepository", "BotRunRepository", "ControllerPerformanceRepository",
     "ExecutorRepository",
     "OrderRepository", "TradeRepository", "FundingRepository",
-    "GatewaySwapRepository", "GatewayCLMMRepository"
+    "GatewaySwapRepository", "GatewayCLMMRepository", "PurseSnapshotRepository"
 ]
