@@ -13,6 +13,7 @@ import docker
 
 from database import AsyncDatabaseManager, BotRunRepository, ControllerPerformanceRepository, OrderRepository
 from services.docker_service import DockerService
+from services.purse_harvest import harvest_instance_purses
 from utils.bot_archiver import BotArchiver
 from utils.mqtt_manager import MQTTManager
 
@@ -700,6 +701,25 @@ class BotsOrchestrator:
         except Exception as e:
             logger.error(f"Failed to persist retirement evidence for {bot_name}: {e}")
 
+    async def _harvest_purses(
+        self, instance_dir: str, source_instance_name: str, bot_name: str
+    ) -> List[dict]:
+        """Harvest the instance's purse journal(s) into the derived read-model
+        (hbpurseapi P3, required change #9). OBSERVATION-ONLY: this is wrapped so a
+        harvest failure can NEVER block or fail the retirement — the delegate is
+        already exception-safe, and this is a second belt around it. Returns the
+        per-controller outcomes for the evidence trail (empty on any failure)."""
+        try:
+            return await harvest_instance_purses(
+                instance_dir,
+                db_manager=self.db_manager,
+                source_instance_name=source_instance_name,
+                bot_name=bot_name,
+            )
+        except Exception as e:
+            logger.error(f"Purse harvest failed for {bot_name} (retirement unaffected): {e}")
+            return []
+
     async def _finalize_retirement(
         self,
         bot_name: str,
@@ -1024,8 +1044,25 @@ class BotsOrchestrator:
                 )
             await self._persist_retirement_evidence(bot_name, evidence)
 
-            # Step 6: Archive the bot data
+            # Step 5.5 (hbpurseapi P3, required change #9): harvest the purse
+            # journal(s) into the DERIVED read-model. This MUST run BEFORE Step 6 —
+            # archive_locally moves (or archive_and_upload rmtrees) the instance dir,
+            # so a harvest after it would find nothing. The container has already
+            # exited here (process_exited_at set above), so the on-disk purse is
+            # final. Harvesting is OBSERVATION-ONLY: it never blocks or fails the
+            # retirement, and it runs whether the retirement will verify or not (the
+            # archive runs regardless, so the inception history must be captured
+            # regardless). instance_dir is computed here and REUSED by Step 6 so the
+            # harvest and the archive see the exact same directory.
             instance_dir = os.path.join('bots', 'instances', container_name)
+            purse_outcomes = await self._harvest_purses(
+                instance_dir, source_instance_name=container_name, bot_name=bot_name
+            )
+            if purse_outcomes:
+                evidence["purse_snapshots"] = purse_outcomes
+                await self._persist_retirement_evidence(bot_name, evidence)
+
+            # Step 6: Archive the bot data
             logger.info(f"Archiving bot data from {instance_dir}")
 
             try:

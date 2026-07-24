@@ -490,6 +490,69 @@ class PositionHoldRecord(Base):
     cleared_at = Column(TIMESTAMP(timezone=True), nullable=True)
 
 
+class PurseSnapshot(Base):
+    """DERIVED, NON-AUTHORITATIVE mirror of a controller's purse journal (hbpurseapi P3).
+
+    Safety rule 3 (ADDENDUM A5): the API purse surface is derived and never a source
+    of truth. The engine-owned journal file is the only authority; this table records
+    a snapshot harvested from that journal at VERIFIED retirement — the single moment
+    the copy-forward hook is between runs and the instance ``data/`` dir is about to be
+    archived/deleted (required change #9: archive ``rmtree`` must not lose inception
+    history). The API never writes, edits, or synthesizes a journal record: it reads
+    the on-disk journal, validates the P2 envelope, and stores the raw content plus the
+    contract-v1 derived metrics for reporting.
+
+    Every ``derived_*`` money value and ``reference_price_used`` is stored as a decimal
+    STRING (the canonical ``str(Decimal)``), NOT ``Numeric``: sqlite's ``Numeric`` round-
+    trips through a float and silently loses precision (verified), which is unacceptable
+    for a money read-model, and it mirrors how the engine and the ladder state ledger
+    already persist money (``str(parsed)``). Strings also survive JSON transport without
+    the float coercion a numeric column would invite. ``sequence`` is the journal's own
+    top-level ``sequence`` (highest record seq) and ``purse_sha256`` is the sha256 of the
+    exact journal bytes — together they let a stale mirror be DETECTED as required
+    change #9 demands, never masquerading as current.
+
+    Idempotency: a UNIQUE (controller_id, purse_sha256) makes re-harvesting an unchanged
+    journal a no-op, while a journal that GREW (new sha, higher sequence) inserts a fresh
+    row — the history is append-only per (controller, content).
+    """
+    __tablename__ = "purse_snapshots"
+    __table_args__ = (
+        UniqueConstraint("controller_id", "purse_sha256", name="uq_purse_snapshot_controller_sha"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # Provenance — who this snapshot came from and when it was harvested.
+    controller_id = Column(String, nullable=False, index=True)
+    harvested_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False, index=True)
+    source_instance_name = Column(String, nullable=False, index=True)
+    # Best-effort lineage link to the retiring run (nullable: the run row may be gone
+    # or unresolved — harvest is observation-only and must never depend on it).
+    # ON DELETE SET NULL (CDX-R04): deleting a bot_run (DELETE /bot-runs/{id} or the
+    # archived-bot cleanup) must NOT be blocked by, nor cascade-destroy, a derived purse
+    # snapshot — the snapshot survives with a null lineage link, honoring "may be gone".
+    source_bot_run_id = Column(
+        Integer, ForeignKey("bot_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+    # Journal identity/content — the stale-mirror detectors (required change #9).
+    purse_sha256 = Column(String, nullable=False, index=True)
+    sequence = Column(Integer, nullable=False)
+    records_json = Column(Text, nullable=False)  # the full journal content, byte-faithful
+
+    # Contract-v1 derived metrics (decimal strings; see class docstring). Reporting
+    # only — NEVER authority.
+    derived_contributed = Column(String, nullable=False)
+    derived_withdrawn = Column(String, nullable=False)
+    derived_earned_realized = Column(String, nullable=False)
+    derived_earned_total = Column(String, nullable=False)
+    derived_unrealized = Column(String, nullable=False)
+    derived_drift = Column(String, nullable=False)
+    reference_price_used = Column(String, nullable=False)
+    opening_basis_quality = Column(String, nullable=True)
+
+
 class ExecutorOrder(Base):
     """Database model for orders created by executors."""
     __tablename__ = "executor_orders"
