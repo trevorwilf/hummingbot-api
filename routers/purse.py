@@ -67,8 +67,9 @@ async def get_purse(
             status_code=404,
             detail=(
                 f"No purse snapshot harvested for controller '{controller_id}'. Snapshots are "
-                f"harvested at a bot's verified retirement; a controller that has never retired "
-                f"(or carries no purse journal) has none."
+                f"harvested when a bot retires (its container has exited, before its data is "
+                f"archived); a controller that has never retired (or carries no purse journal) "
+                f"has none."
             ),
         )
     return PurseSnapshotResponse(

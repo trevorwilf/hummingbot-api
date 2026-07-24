@@ -529,7 +529,12 @@ class PurseSnapshot(Base):
     source_instance_name = Column(String, nullable=False, index=True)
     # Best-effort lineage link to the retiring run (nullable: the run row may be gone
     # or unresolved — harvest is observation-only and must never depend on it).
-    source_bot_run_id = Column(Integer, ForeignKey("bot_runs.id"), nullable=True, index=True)
+    # ON DELETE SET NULL (CDX-R04): deleting a bot_run (DELETE /bot-runs/{id} or the
+    # archived-bot cleanup) must NOT be blocked by, nor cascade-destroy, a derived purse
+    # snapshot — the snapshot survives with a null lineage link, honoring "may be gone".
+    source_bot_run_id = Column(
+        Integer, ForeignKey("bot_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     # Journal identity/content — the stale-mirror detectors (required change #9).
     purse_sha256 = Column(String, nullable=False, index=True)

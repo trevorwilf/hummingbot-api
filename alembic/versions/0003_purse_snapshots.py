@@ -54,7 +54,11 @@ def upgrade() -> None:
         sa.Column("derived_drift", sa.String(), nullable=False),
         sa.Column("reference_price_used", sa.String(), nullable=False),
         sa.Column("opening_basis_quality", sa.String(), nullable=True),
-        sa.ForeignKeyConstraint(["source_bot_run_id"], ["bot_runs.id"], ),
+        # ON DELETE SET NULL (CDX-R04): a bot_run delete must not be blocked by a
+        # derived snapshot, nor cascade-destroy it — the lineage link nulls out.
+        sa.ForeignKeyConstraint(
+            ["source_bot_run_id"], ["bot_runs.id"], ondelete="SET NULL"
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "controller_id", "purse_sha256", name="uq_purse_snapshot_controller_sha"

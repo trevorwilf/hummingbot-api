@@ -1,9 +1,15 @@
 """hbpurseapi P3 — retirement-time purse harvest into the derived read-model.
 
-Required change #9: at VERIFIED retirement, BEFORE the archive step can move or
-``rmtree`` the instance ``data/`` dir, read each controller's purse journal, validate
-it with the P2 envelope, compute the contract-v1 derived metrics, and insert a
-snapshot row so the inception history survives the archive. ADDENDUM A5 pins the
+Required change #9: in the verified-retirement finalization path — BEFORE the archive
+step can move or ``rmtree`` the instance ``data/`` dir — read each controller's purse
+journal, validate it with the P2 envelope, compute the contract-v1 derived metrics, and
+insert a snapshot row so the inception history survives the archive. Harvesting is
+verification-AGNOSTIC by design (CDX-R01): the archive runs regardless of whether the
+retirement will be marked VERIFIED or UNVERIFIED, and it destroys the ``data/`` dir
+either way, so the mirror must be captured either way — an UNVERIFIED (dirty) retirement
+is precisely when preserving the journal matters most. The container has already exited
+at the harvest point, so the on-disk journal is final; its validity is enforced
+independently by the P2 envelope, not by the retirement verdict. ADDENDUM A5 pins the
 feed: the read-model is harvested from the JOURNAL FILE itself, never from API trade
 rows (the two stores are fully disjoint; there is no fill stream here).
 
@@ -173,6 +179,24 @@ async def _harvest_one_controller(
         return {"controller_id": canonical_id, "decision": "invalid", "reason": verdict.reason[:200]}
 
     metrics = compute_derived_metrics(payload)
+    if metrics.owned_ambiguous:
+        # CDX-R03: the journal ends on a ``drift``-classified reanchor, whose new_owned_*
+        # is indistinguishable between a pure observation (owned unchanged) and a real
+        # sub-dust cut (owned resized). Current owned cannot be authoritatively derived,
+        # so mirroring it would risk a grossly wrong equity/earned/drift. Skip (structured
+        # event), consistent with the observation-only, fail-safe-on-doubt posture — the
+        # raw journal still survives in the archive; only the derived mirror row is withheld.
+        logger.warning(
+            "purse harvest: current owned for controller %s at %s is ambiguous (journal ends "
+            "on a drift-classified reanchor with no superseding checkpoint) — skipping the "
+            "derived snapshot to avoid a misleading mirror",
+            canonical_id, purse_path,
+        )
+        return {
+            "controller_id": canonical_id,
+            "decision": "skipped_ambiguous_owned",
+            "reason": "terminal drift-classified reanchor; current owned not authoritatively established",
+        }
     sha256 = hashlib.sha256(raw).hexdigest()
     sequence = payload["sequence"]  # validated: int == highest record seq
     records_json = raw.decode("utf-8")

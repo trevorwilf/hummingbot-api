@@ -89,6 +89,7 @@ class CurrentState:
     owned_quote: Decimal
     owned_base: Decimal
     opening_basis_quality: Optional[str]
+    owned_ambiguous: bool = False
 
 
 def resolve_current_state(records: List[dict]) -> CurrentState:
@@ -100,10 +101,25 @@ def resolve_current_state(records: List[dict]) -> CurrentState:
         reseed_epoch, checkpoint). ``reanchor`` carries no reference_price, so it never
         moves it; the final value is "the journal's newest checkpoint/epoch reference
         price", precisely the batch's step-2 input.
-      * ``owned_*`` — updated by every record that establishes owned (opening_epoch,
-        reseed_epoch's ``new_owned_*``, reanchor's ``new_owned_*``, checkpoint). The
-        final value is the most-current on-disk owned — the API's proxy for the live
+      * ``owned_*`` — updated by every record whose owned_* is AUTHORITATIVE: opening_epoch,
+        reseed_epoch's ``new_owned_*``, checkpoint, and an ``undeclared_outflow`` reanchor
+        (the engine's v12 site resizes owned to ``new_owned_*`` and commits it, so its
+        ``new_owned_*`` IS the true owned — engine range_inventory_ladder.py:6810-6860).
+        The final value is the most-current on-disk owned — the API's proxy for the live
         controller's authoritative owned the engine would otherwise pass in.
+      * ``owned_ambiguous`` (CDX-R03) — a ``drift``-classified reanchor's ``new_owned_*`` is
+        NOT authoritative: the engine emits ``drift`` reanchors in two indistinguishable
+        shapes — a pure OBSERVATION (carried-prune / uncommitted-fill: owned unchanged,
+        ``new_owned_*=0`` merely encodes the surfaced magnitude —
+        range_inventory_ladder.py:4708-4800) AND a real sub-dust cut (owned resized to
+        ``new_owned_*`` — the v12 site when the cut ≤ dust, :6852-6860). From the journal
+        fields alone the two cannot be told apart, so a ``drift`` reanchor leaves owned_*
+        UNCHANGED (the safe default for the dangerous observation case, which would
+        otherwise zero owned) and FLAGS the state ambiguous. A later AUTHORITATIVE
+        owned record (opening/reseed/checkpoint/undeclared_outflow reanchor) supersedes
+        it and clears the flag. If the flag survives to the end (a terminal ``drift``
+        reanchor), the current owned cannot be established from the journal and the
+        harvest SKIPS this snapshot rather than mirror a misleading balance.
       * ``opening_basis_quality`` — captured from the FIRST opening_epoch only (the
         inception basis; a later post-quarantine opening declares no new basis).
     """
@@ -112,6 +128,7 @@ def resolve_current_state(records: List[dict]) -> CurrentState:
     owned_quote = Decimal("0")
     owned_base = Decimal("0")
     opening_basis_quality: Optional[str] = None
+    owned_ambiguous = False
     for record in records:
         kind = record.get("kind")
         seq = record.get("seq")
@@ -122,26 +139,38 @@ def resolve_current_state(records: List[dict]) -> CurrentState:
             owned_base = _dec(record["owned_base"], "owned_base")
             ref = _dec(record["reference_price"], "reference_price")
             ref_source = f"opening_epoch@seq{seq}"
+            owned_ambiguous = False
         elif kind == "reseed_epoch":
             owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
             owned_base = _dec(record["new_owned_base"], "new_owned_base")
             ref = _dec(record["reference_price"], "reference_price")
             ref_source = f"reseed_epoch@seq{seq}"
+            owned_ambiguous = False
         elif kind == "reanchor":
-            # A reanchor moves owned_* but declares NO reference_price — ref unchanged.
-            owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
-            owned_base = _dec(record["new_owned_base"], "new_owned_base")
+            # A reanchor declares NO reference_price — ref unchanged either way.
+            if record.get("classification") == "undeclared_outflow":
+                # A real, committed owned cut (engine v12 site resizes owned to
+                # new_owned_* — :6810-6860): new_owned_* IS the authoritative owned.
+                owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
+                owned_base = _dec(record["new_owned_base"], "new_owned_base")
+                owned_ambiguous = False
+            else:
+                # "drift": indistinguishable observation-vs-dust-cut (see docstring).
+                # Leave owned unchanged; mark the state ambiguous until superseded.
+                owned_ambiguous = True
         elif kind == "checkpoint":
             owned_quote = _dec(record["owned_quote"], "owned_quote")
             owned_base = _dec(record["owned_base"], "owned_base")
             ref = _dec(record["reference_price"], "reference_price")
             ref_source = f"checkpoint@seq{seq}"
+            owned_ambiguous = False
     return CurrentState(
         reference_price=ref,
         reference_source=ref_source,
         owned_quote=owned_quote,
         owned_base=owned_base,
         opening_basis_quality=opening_basis_quality,
+        owned_ambiguous=owned_ambiguous,
     )
 
 
@@ -166,6 +195,10 @@ class DerivedPurseMetrics:
     owned_quote: Decimal
     owned_base: Decimal
     opening_basis_quality: Optional[str]
+    # CDX-R03: True when the current owned_* could not be authoritatively established
+    # from the journal (a terminal ``drift``-classified reanchor). The harvest treats
+    # this as a skip — a metrics object with this set must NOT be mirrored.
+    owned_ambiguous: bool = False
 
 
 def compute_derived_metrics(payload: dict) -> DerivedPurseMetrics:
@@ -272,4 +305,5 @@ def compute_derived_metrics(payload: dict) -> DerivedPurseMetrics:
         owned_quote=owned_quote,
         owned_base=owned_base,
         opening_basis_quality=state.opening_basis_quality,
+        owned_ambiguous=state.owned_ambiguous,
     )
