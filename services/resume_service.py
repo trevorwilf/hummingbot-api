@@ -41,6 +41,7 @@ from database.repositories.bot_run_repository import (
 )
 from services.controller_id_contract import classify_controller_id
 from services.ledger_envelope_contract import classify_ledger_envelope
+from services.purse_envelope_contract import classify_purse_envelope
 from services.state_file_contract import (
     ALLOW_ABSOLUTE_FIELD,
     StateFileStatus,
@@ -1831,99 +1832,33 @@ def _assert_contained(candidate: Path, root: Path, label: str, controller_id) ->
 # and records the decision. Every branch fails CLOSED — a doubtful journal blocks
 # the resume rather than letting a bot trade on suspect accounting.
 
-# The purse's OWN schema version (PINNED contract v1), independent of the ledger's
-# SUPPORTED_LEDGER_SCHEMA_VERSIONS ({6..10}) — no coupling, no state-schema bump
-# this batch (safety invariant 5). Mirrors the engine's PURSE_SCHEMA_VERSION = 1
-# (controllers/_shared/purse_ledger.py). P2's formal contract owns this constant.
-PURSE_SCHEMA_VERSION_P1 = 1
-
-
-def _purse_envelope_reason_minimal(payload, canonical_controller_id: str) -> Optional[str]:
-    """P1 MINIMAL purse-envelope check — returns a reason string when INVALID,
-    ``None`` when it passes. **Swapped for the formal contract in P2**
-    (``services.purse_envelope_contract``); this is the deliberately-narrow subset
-    the phase spec pins: top-level shape, PRESENCE of every pinned top-level key
-    (``purse_schema_version``, ``controller_id``, ``controller_name``,
-    ``trading_pair``, ``sequence``, ``records``), ``purse_schema_version == 1``,
-    ``controller_id`` identity, a non-empty ``records`` list, and 1-based
-    strictly-increasing integer ``seq`` (first record's seq must be 1).
-
-    It does NOT yet enforce the per-kind required fields, epoch rules, the
-    ``sequence``-matches-highest-record-seq VALUE relationship, the
-    ``controller_name``/``trading_pair`` value-equality against config, or the
-    opening_epoch-first rule — those are P2's formal contract (CDX-R01
-    adjudication: PRESENCE of the keys and first-seq==1 are cheap structural
-    checks the engine also enforces, so P1 must reject them; the value
-    relationships are P2's). It is NECESSARY, not SUFFICIENT: enough to reject a
-    journal the engine is guaranteed to refuse, so the API can refuse the deploy
-    while refusing is still free (the same posture as the ledger envelope).
-
-    ``controller_id`` is compared EXACTLY against the C2-canonical staged id — the
-    journal's own copy is never stripped, mirroring the engine's exact comparison
-    (controllers/_shared/purse_ledger.py ``_validate_document``: ``raw.get(
-    "controller_id") != self._controller_id``). Stripping here would bless a
-    journal the engine quarantines.
-    """
-    if not isinstance(payload, dict):
-        return f"purse payload must be a JSON object (got {type(payload).__name__})"
-    for key in (
-        "purse_schema_version",
-        "controller_id",
-        "controller_name",
-        "trading_pair",
-        "sequence",
-        "records",
-    ):
-        if key not in payload:
-            return f"purse journal is missing required top-level key '{key}'"
-    version = payload.get("purse_schema_version")
-    if version != PURSE_SCHEMA_VERSION_P1:
-        return (
-            f"unsupported purse_schema_version {version!r}; this batch supports only "
-            f"{PURSE_SCHEMA_VERSION_P1} (the purse has its own version, independent of the "
-            f"ledger schema)"
-        )
-    journal_id = payload.get("controller_id")
-    if journal_id != canonical_controller_id:
-        return (
-            f"purse journal controller_id {journal_id!r} does not match the staged controller's "
-            f"canonical id {canonical_controller_id!r} — this is a different controller's "
-            f"journal (the engine compares these exactly and refuses to adopt a foreign journal)"
-        )
-    records = payload.get("records")
-    if not isinstance(records, list) or not records:
-        return "purse journal 'records' must be a non-empty list"
-    prev_seq = 0
-    for index, record in enumerate(records, start=1):
-        if not isinstance(record, dict):
-            return f"purse record #{index} must be a JSON object"
-        seq = record.get("seq")
-        # ``bool`` excluded: ``isinstance(True, int)`` is True in Python, so
-        # ``seq: true`` would otherwise sneak in as 1. The first record's seq must
-        # be exactly 1 (1-based per the PINNED contract; the engine rejects a first
-        # seq != 1 at purse_ledger.py:584-585). Later gaps are contract-valid — the
-        # contract demands strict increase, NOT contiguity (engine note :573-576).
-        if (
-            isinstance(seq, bool)
-            or not isinstance(seq, int)
-            or (index == 1 and seq != 1)
-            or seq <= prev_seq
-        ):
-            return (
-                f"purse record seq {seq!r} violates the 1-based strictly-increasing order "
-                f"(record #{index}, previous seq {prev_seq})"
-            )
-        prev_seq = seq
-    return None
-
-
-def _validate_purse(src_purse: Path, canonical_controller_id: str) -> str:
-    """Fail-closed unless a source purse journal passes the MINIMAL envelope check.
+def _validate_purse(src_purse: Path, canonical_controller_id: str, staged_config: dict) -> str:
+    """Fail-closed unless a source purse journal passes the formal envelope contract.
 
     Owns the file (read errors, zero-length, JSON syntax) and delegates the
-    envelope to :func:`_purse_envelope_reason_minimal`, the same split the ledger
-    path uses (``_validate_ledger`` owns the file, the contract module owns the
-    envelope) and that P2 keeps when it swaps in the formal validator.
+    envelope to :func:`services.purse_envelope_contract.classify_purse_envelope`,
+    the same split the ledger path uses (``_validate_ledger`` owns the file, the
+    contract module owns the envelope) and the same split the engine uses between
+    ``PurseLedger.load`` and ``_validate_document``.
+
+    P1 shipped a deliberately-narrow inline structural check here; P2 swaps it for
+    the full "Purse journal contract v1" — so this call site now ALSO rejects a
+    wrong ``controller_name``/``trading_pair``, a ``sequence`` that disagrees with
+    the highest record seq, an out-of-contract per-kind field, an unknown kind, a
+    second ``fills_rollup`` for one epoch, a record referencing an unopened epoch,
+    and a journal that does not begin with an ``opening_epoch``. Every one is a
+    journal the engine refuses to adopt (it degrades ``accounting_degraded``), so
+    the API refuses the deploy while refusing is still free.
+
+    Args:
+        src_purse: The source purse path (already containment-checked).
+        canonical_controller_id: The C2-CANONICAL (stripped) staged id, compared
+            exactly against the journal's ``controller_id``.
+        staged_config: The staged controller config, passed whole to the contract,
+            which resolves the ``controller_name``/``trading_pair`` the engine's
+            ``PurseLedger`` compares the journal against — falling back to the
+            engine's model defaults for fields the YAML omits, never skipping a
+            comparison.
 
     Returns:
         The source file's sha256 hex digest — recorded on the ``copied`` purse
@@ -1965,13 +1900,18 @@ def _validate_purse(src_purse: Path, canonical_controller_id: str) -> str:
             f"Purse journal '{src_purse}' is nested too deeply to parse ({exc}) — "
             f"refusing to seed garbage.",
         )
-    reason = _purse_envelope_reason_minimal(payload, canonical_controller_id)
-    if reason is not None:
+    verdict = classify_purse_envelope(
+        payload,
+        canonical_controller_id=canonical_controller_id,
+        staged_config=staged_config,
+    )
+    if not verdict.is_valid:
         raise ResumeError(
             ResumeAbortReason.PURSE_INVALID,
-            f"Purse journal '{src_purse}' is not a valid engine purse: {reason}. Copying it "
-            f"forward would resume a bot on suspect accounting (or one the engine refuses to "
-            f"adopt). Refusing to deploy (hbpurseapi P1, fail-closed).",
+            f"Purse journal '{src_purse}' is not a valid engine purse: {verdict.reason}. Copying "
+            f"it forward would resume a bot on suspect accounting (one the engine refuses to "
+            f"adopt — it degrades accounting_degraded and halts new orders). Refusing to deploy "
+            f"(hbpurseapi P2 purse envelope contract, fail-closed).",
         )
     return hashlib.sha256(raw).hexdigest()
 
@@ -1994,6 +1934,7 @@ def _plan_purse(
     source: "ResolvedSource",
     new_data_dir: Path,
     plan: CopyPlan,
+    config: dict,
 ) -> None:
     """Plan the purse journal for one range-ladder controller; mutate ``plan``.
 
@@ -2026,7 +1967,7 @@ def _plan_purse(
     _assert_contained(dst_purse, new_data_dir, "purse destination", controller_id)
 
     if src_purse.exists():
-        sha256 = _validate_purse(src_purse, controller_id)  # PURSE_INVALID on failure
+        sha256 = _validate_purse(src_purse, controller_id, config)  # PURSE_INVALID on failure
         plan.items.append(
             CopyItem(src=src_purse, dst=dst_purse, controller_id=controller_id, kind="purse")
         )
@@ -2194,7 +2135,7 @@ def _plan_controller(
         # Purse (F14): with no state file there is no marker, so an absent purse is
         # a legitimate bootstrap and a present-but-stray purse still validates/copies.
         _plan_purse(
-            controller_id, ledger_name, src_ledger, False, None, source, new_data_dir, plan
+            controller_id, ledger_name, src_ledger, False, None, source, new_data_dir, plan, config
         )
         return ledger_name
 
@@ -2257,7 +2198,7 @@ def _plan_controller(
     # branches fail-closed (copy valid / abort invalid / abort marker-but-missing /
     # bootstrap_pending when legitimately absent).
     _plan_purse(
-        controller_id, ledger_name, src_ledger, True, state_payload, source, new_data_dir, plan
+        controller_id, ledger_name, src_ledger, True, state_payload, source, new_data_dir, plan, config
     )
     return ledger_name
 

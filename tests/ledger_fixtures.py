@@ -183,3 +183,121 @@ def valid_purse_payload(
     }
     payload.update(overrides)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Per-kind purse record fixtures (hbpurseapi P2)
+# ---------------------------------------------------------------------------
+#
+# One builder per non-opening record kind, each carrying EXACTLY the fields the
+# PINNED "Purse journal contract v1" requires for that kind (cross-checked against
+# purse_ledger.py ``_MONEY_FIELDS`` :100-131 + ``_validate_record`` :621-690 —
+# read-only). Money values are decimal STRINGS. ``fills_rollup``/``reanchor``/
+# ``checkpoint`` reference an epoch that an ``opening_epoch``/``reseed_epoch`` must
+# have opened earlier in the same journal, so their default ``epoch_id`` is
+# ``"epoch-1"`` (the opening fixture's default). Every value is transcribed from the
+# contract, never captured by running the validator.
+
+
+def flow_record(seq=2, ts=1700000100.0, *, flow_kind="deposit", **overrides):
+    """A ``flow`` record (deposit/withdrawal). Carries no epoch reference — the
+    contract's flow kind is epoch-independent (purse_ledger.py:648-654)."""
+    record = {
+        "seq": seq,
+        "ts": ts,
+        "kind": "flow",
+        "token": "flow-token-1",
+        "flow_kind": flow_kind,
+        "asset": "USDT",
+        "native_amount": "50",
+        "quote_valuation": "50",
+        "valuation_price": "1",
+        "valuation_ts": ts,
+        "confirmation": "wallet_delta_matched",
+    }
+    record.update(overrides)
+    return record
+
+
+def fills_rollup_record(seq=2, ts=1700000100.0, *, epoch_id="epoch-1", **overrides):
+    """A ``fills_rollup`` record. ``base_delta_cum``/``quote_delta_cum`` are SIGNED
+    (bought-sold / received-spent), so they may be negative; ``fees_quote_cum`` is
+    non-negative (purse_ledger.py:112-115)."""
+    record = {
+        "seq": seq,
+        "ts": ts,
+        "kind": "fills_rollup",
+        "epoch_id": epoch_id,
+        "base_delta_cum": "1",
+        "quote_delta_cum": "-150",
+        "fees_quote_cum": "0",
+        "fills_seen": 3,
+        "last_update_ts": ts,
+    }
+    record.update(overrides)
+    return record
+
+
+def reseed_epoch_record(seq=2, ts=1700000100.0, *, epoch_id="epoch-2",
+                        prev_epoch_id="epoch-1", **overrides):
+    """A ``reseed_epoch`` record — itself an epoch-OPENING kind (purse_ledger.py:37),
+    so its ``epoch_id`` opens a new epoch that later records may reference."""
+    record = {
+        "seq": seq,
+        "ts": ts,
+        "kind": "reseed_epoch",
+        "epoch_id": epoch_id,
+        "prev_epoch_id": prev_epoch_id,
+        "token": "reseed-token-1",
+        "old_owned_quote": "100",
+        "old_owned_base": "0",
+        "old_seed_value_quote": "100",
+        "new_owned_quote": "120",
+        "new_owned_base": "0",
+        "new_seed_value_quote": "120",
+        "reference_price": "150",
+    }
+    record.update(overrides)
+    return record
+
+
+def reanchor_record(seq=2, ts=1700000100.0, *, epoch_id="epoch-1", **overrides):
+    """A ``reanchor`` record. ``classification`` is one of the closed set
+    (undeclared_outflow / drift, purse_ledger.py:34)."""
+    record = {
+        "seq": seq,
+        "ts": ts,
+        "kind": "reanchor",
+        "epoch_id": epoch_id,
+        "old_owned_quote": "100",
+        "old_owned_base": "0",
+        "new_owned_quote": "90",
+        "new_owned_base": "0",
+        "overclaim_quote": "10",
+        "classification": "undeclared_outflow",
+        "wallet_quote_total": "90",
+        "wallet_base_total": "0",
+    }
+    record.update(overrides)
+    return record
+
+
+def checkpoint_record(seq=2, ts=1700000100.0, *, epoch_id="epoch-1", **overrides):
+    """A ``checkpoint`` record — a wallet-observation snapshot referencing an open
+    epoch (purse_ledger.py:126-130)."""
+    record = {
+        "seq": seq,
+        "ts": ts,
+        "kind": "checkpoint",
+        "epoch_id": epoch_id,
+        "owned_quote": "100",
+        "owned_base": "0",
+        "reference_price": "150",
+        "equity_quote": "100",
+        "wallet_quote_total": "100",
+        "wallet_base_total": "0",
+        "external_holds_quote": "0",
+        "external_holds_base": "0",
+    }
+    record.update(overrides)
+    return record

@@ -92,10 +92,19 @@ What this module deliberately does NOT check (honest limits)
 -------------------------------------------------------------
 The API cannot fully replicate the engine's gate, and pretending otherwise would
 be worse than the gap. This validator is NECESSARY, not SUFFICIENT: it proves a
-ledger is known-bad, never that it will load. It does not run the v9->v10
-migration (:2059-2076), the post-migration ``owned_quote``/``owned_base``/
-``seed_value_quote`` re-validation (:2083-2092), or anything requiring live
-exchange/wallet state.
+ledger is known-bad, never that it will load. It does not RUN the v9->v10
+migration (:2531-2545) — it cannot derive a missing ``owned_quote`` — nor touch
+anything requiring live exchange/wallet state. It DOES now validate those v10
+monetary fields when PRESENT (F7, :data:`OPTIONAL_MONETARY_LEDGER_FIELDS`) and the
+``booked_fill_progress`` map (CLA-M03), because both are cases the engine
+quarantines on and the old six-field mirror silently blessed. The other optional
+v10 keys the engine batch added (``purse_initialized``, ``reanchor_events``,
+``reanchor_offset_*``, ``init_unavailable_*``, ``last_flow_token`` …) are
+accept-and-ignored here: unknown-key tolerance is unchanged, so a widened engine
+that quarantines one of THEM is a known residual, not a claim this mirror covers
+it. The controller-owned PURSE journal is a wholly separate contract with its own
+version — see :mod:`services.purse_envelope_contract`; it does NOT ride this
+envelope and is not coupled to :data:`SUPPORTED_LEDGER_SCHEMA_VERSIONS` (F22).
 
 The clock is the caller's (:2049-2054)
 ---------------------------------------
@@ -109,10 +118,17 @@ two containers on one host, while the ledger it DOES catch (a timestamp far in t
 future) is one the engine is guaranteed to quarantine. An unsupplied or
 unparseable clock is uncertainty, and uncertainty is ``LEDGER_INVALID``.
 
-Keeping :data:`SUPPORTED_LEDGER_SCHEMA_VERSIONS` in sync with the engine is a
-recorded, permanent obligation of this mirror — it is listed in the batch's final
-report. A widened engine set that is not mirrored here costs a false abort; a
-NARROWED engine set that is not mirrored here costs a wallet re-seed.
+Keeping this mirror in sync with the engine is a recorded, permanent obligation —
+listed in the batch's final report. The obligation is not just the version set: it
+now spans :data:`SUPPORTED_LEDGER_SCHEMA_VERSIONS`, :data:`ENGINE_IDENTITY_DEFAULTS`,
+:data:`NUMERIC_LEDGER_FIELDS`, the F7-widened :data:`OPTIONAL_MONETARY_LEDGER_FIELDS`,
+and the ``booked_fill_progress`` rules (CLA-M03) — every rule this module transcribes
+from ``_validate_loaded_state``. The drift is asymmetric in both directions: a
+widened/relaxed engine that is not mirrored here costs a FALSE ABORT (a valid deploy
+refused — a lost deploy, recoverable); a NARROWED/stricter engine that is not mirrored
+here costs a WALLET RE-SEED (the API blesses a ledger the engine quarantines — the F7
+class of defect, unrecoverable accounting loss). The ``test_mirror_matches_engine_*``
+suite is what makes a broken sync loud instead of silent.
 """
 
 from dataclasses import dataclass
@@ -160,8 +176,10 @@ _STRING_LEDGER_FIELDS = (
     "quote_asset",
 )
 
-# Mirrors the numeric loop at range_inventory_ladder.py:2033-2047: each is parsed
-# with ``_safe_decimal`` (:165) and must be finite and non-negative (:2045).
+# Mirrors the numeric loop at range_inventory_ladder.py:2507-2521: each is parsed
+# with ``_safe_decimal`` (:167) and must be finite and non-negative (:2519). All
+# six are in :data:`REQUIRED_LEDGER_KEYS`, so by the time the numeric loop runs
+# they are guaranteed present — their absence is already a missing-key rejection.
 NUMERIC_LEDGER_FIELDS = (
     "reserve_quote_balance",
     "reserve_base_balance",
@@ -169,6 +187,25 @@ NUMERIC_LEDGER_FIELDS = (
     "initial_claimed_base_amount",
     "initial_reference_price",
     "initialized_timestamp",
+)
+
+# F7 (CDX-008/CLA-003) — the v10 monetary ledger fields the engine ALSO validates
+# and quarantines on, at a SEPARATE site from the six above
+# (range_inventory_ladder.py:2551-2558). They are NOT required keys: the engine's
+# v9->v10 migration DERIVES them when absent (:2531-2545), so a state file that
+# omits them is still valid. But a PRESENT value that is non-finite or negative is
+# ``LEDGER_INVALID`` (:2553-2557) — exactly the case the old six-field mirror
+# missed, which let the API bless a ledger the engine then quarantines and
+# wallet-reseeds (the F7 defect this widening closes). Kept a distinct tuple, not
+# folded into :data:`NUMERIC_LEDGER_FIELDS`, precisely because their ABSENCE
+# semantics differ: the six required fields must be present, these three may be
+# absent. Folding them in would make an absent (migration-derived) field a false
+# abort — mirror drift in the reject-too-much direction. MUST be kept in sync with
+# the engine, the same standing obligation as the version set and the defaults.
+OPTIONAL_MONETARY_LEDGER_FIELDS = (
+    "owned_quote",
+    "owned_base",
+    "seed_value_quote",
 )
 
 # The engine's RESOLVED config defaults for the identity fields, mirrored from
@@ -227,19 +264,30 @@ def _invalid(reason: str) -> LedgerVerdict:
     return LedgerVerdict(False, reason)
 
 
-def _mirror_safe_decimal(value, field_name: str) -> Decimal:
-    """Mirror of the engine's ``_safe_decimal`` (range_inventory_ladder.py:165).
+def _mirror_safe_decimal(value, field_name: str, default: Optional[str] = None) -> Decimal:
+    """Mirror of the engine's ``_safe_decimal`` (range_inventory_ladder.py:167).
 
     Transcribed rather than imported: the API cannot import engine code. Kept
-    decision-for-decision, including the blank rejection (no ``default`` is passed
-    at the engine's call site :2042, so ``None``/``""`` raise) and the
-    ``is_finite`` check — JSON parses ``NaN`` and ``Infinity`` by default, and a
-    non-finite reserve balance would poison every figure the controller derives.
+    decision-for-decision, including the ``is_finite`` check — JSON parses ``NaN``
+    and ``Infinity`` by default, and a non-finite reserve balance would poison
+    every figure the controller derives.
+
+    The ``default`` argument mirrors the engine's own (:167-171): a MISSING value
+    (``None``/``""``) resolves to ``Decimal(default)`` when a default is supplied,
+    else it raises. The default covers ONLY ``None``/``""`` — a PRESENT but
+    non-parseable/non-finite value still raises even when a default is given
+    (CLA-M03: the engine's booking read is ``_safe_decimal(entry.get(k), ...,
+    default="0")`` at :2593, so a missing ``base``/``quote``/``fees`` sub-key is a
+    valid 0 while a garbage one quarantines). The six REQUIRED numeric fields pass
+    no default (their absence is already a missing-required-key rejection), so they
+    keep the strict blank-raises behaviour.
 
     Raises:
         ValueError: exactly where the engine's raises.
     """
     if value is None or value == "":
+        if default is not None:
+            return Decimal(default)
         raise ValueError(f"{field_name} cannot be blank")
     try:
         parsed = Decimal(str(value))
@@ -498,5 +546,85 @@ def classify_ledger_envelope(
             f"{now}); the engine rejects it at range_inventory_ladder.py:2049-2054 "
             f"(STATE_MAX_FUTURE_SKEW_SECONDS, :1387) and quarantines the state."
         )
+
+    # 8. F7 — the v10 monetary fields (owned_quote/owned_base/seed_value_quote).
+    #    ABSENT is valid: the engine's v9->v10 migration derives them
+    #    (range_inventory_ladder.py:2531-2545) BEFORE re-validating them, so a state
+    #    file that omits them still loads. PRESENT-but-invalid (non-finite / negative)
+    #    is the case the engine quarantines at :2551-2558 — and the case the old
+    #    six-field mirror silently blessed, letting the API say "yes" to a ledger the
+    #    engine then quarantines and wallet-reseeds. Same parse discipline as the six.
+    for field_name in OPTIONAL_MONETARY_LEDGER_FIELDS:
+        if field_name not in payload:
+            continue  # engine derives it via v9->v10 migration; absent is valid.
+        try:
+            parsed = _mirror_safe_decimal(payload.get(field_name), f"state field '{field_name}'")
+        except ValueError as exc:
+            return _invalid(
+                f"ledger's {field_name} is not a valid decimal ({exc}); the engine validates "
+                f"this v10 monetary field at range_inventory_ladder.py:2553 and quarantines "
+                f"the state on a non-finite value (F7). A missing field is fine — the engine's "
+                f"v9->v10 migration derives it (:2531-2545) — but a present garbage one is not."
+            )
+        if parsed < Decimal("0"):
+            return _invalid(
+                f"ledger's {field_name} must be non-negative (got {parsed}); the engine rejects "
+                f"it at range_inventory_ladder.py:2556-2557 and quarantines the state (F7)."
+            )
+
+    # 9. CLA-M03 — booked_fill_progress. An OPTIONAL v10 key: absent/None is a valid
+    #    absence (the engine's booking read treats it as {}). But a value that loads
+    #    clean yet is unbookable — a non-dict payload, a non-string key, an entry that
+    #    is not a dict, or a base/quote/fees that is non-finite / negative — would
+    #    raise EVERY booking cycle engine-side, silently killing booking while trading
+    #    continues, AND ride copy-forward to the next deploy. The engine now quarantines
+    #    it at load (range_inventory_ladder.py:2571-2602); mirror that so the API refuses
+    #    the deploy while refusing is still free. A MISSING base/quote/fees sub-key is
+    #    fine (the engine defaults it to 0 via ``_safe_decimal(..., default="0")`` at
+    #    :2593) — rejecting it would be a false abort on a ledger the engine loads.
+    progress = payload.get("booked_fill_progress")
+    if progress is None:
+        pass  # absent/None -> valid (engine: :2572-2577).
+    elif not isinstance(progress, dict):
+        return _invalid(
+            f"ledger's booked_fill_progress must be a JSON object (got "
+            f"{type(progress).__name__}); the engine rejects it at "
+            f"range_inventory_ladder.py:2578-2579 and quarantines the state (CLA-M03)."
+        )
+    else:
+        for entry_key, entry_val in progress.items():
+            if not isinstance(entry_key, str):
+                return _invalid(
+                    f"ledger's booked_fill_progress key {entry_key!r} must be a string; the "
+                    f"engine rejects it at range_inventory_ladder.py:2582-2585 (CLA-M03)."
+                )
+            if not isinstance(entry_val, dict):
+                return _invalid(
+                    f"ledger's booked_fill_progress[{entry_key!r}] entry must be a JSON object "
+                    f"(got {type(entry_val).__name__}); the engine rejects it at "
+                    f"range_inventory_ladder.py:2586-2589 and quarantines the state (CLA-M03)."
+                )
+            for money_key in ("base", "quote", "fees"):
+                # default="0" mirrors the engine's booking read (:2593): a MISSING sub-key
+                # is a valid 0, a PRESENT non-numeric/non-finite one raises.
+                try:
+                    parsed = _mirror_safe_decimal(
+                        entry_val.get(money_key),
+                        f"booked_fill_progress[{entry_key}].{money_key}",
+                        default="0",
+                    )
+                except ValueError as exc:
+                    return _invalid(
+                        f"ledger's booked_fill_progress[{entry_key!r}].{money_key} is not a "
+                        f"valid decimal ({exc}); the engine parses it with _safe_decimal at "
+                        f"range_inventory_ladder.py:2593 and quarantines the state on a "
+                        f"non-finite value (CLA-M03)."
+                    )
+                if parsed < Decimal("0"):
+                    return _invalid(
+                        f"ledger's booked_fill_progress[{entry_key!r}].{money_key} must be "
+                        f"non-negative (got {parsed}); the engine rejects it at "
+                        f"range_inventory_ladder.py:2598-2601 (CLA-M03)."
+                    )
 
     return LedgerVerdict(True)

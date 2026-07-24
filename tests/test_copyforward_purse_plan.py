@@ -5,8 +5,10 @@ Covers the purse journal half of ``services.resume_service``:
 
   * ``_expected_purse_name`` — the PINNED contract v1 naming
     (``<state stem>.purse.json``), incl. subdir / multi-dot cases.
-  * ``_purse_envelope_reason_minimal`` / ``_validate_purse`` — the P1 minimal
-    structural check (swapped for the formal contract in P2).
+  * ``_validate_purse`` — the source-file guard (read errors, zero-length, JSON
+    syntax, sha256) that delegates the envelope to P2's formal purse contract
+    (``services.purse_envelope_contract``); the envelope rules themselves are
+    spec-tested in ``test_copyforward_purse_envelope.py``.
   * ``compute_copy_plan`` purse planning — the four fail-closed cases:
       valid -> copied (byte-exact + manifest entry),
       invalid -> PURSE_INVALID abort,
@@ -41,7 +43,9 @@ from docker.errors import NotFound
 
 from database.repositories.bot_run_repository import REQUIRED_RETIREMENT_EVIDENCE
 from ledger_fixtures import (
+    checkpoint_record,
     opening_epoch_record,
+    reseed_epoch_record,
     valid_ledger_payload,
     valid_purse_payload,
 )
@@ -52,12 +56,20 @@ from services.resume_service import (
     ResumeAbortReason,
     ResumeError,
     _expected_purse_name,
-    _purse_envelope_reason_minimal,
     _validate_purse,
     compute_copy_plan,
     preview_resume,
     _execute_copy_plan,
 )
+
+# The staged config a purse fixture's identity agrees with — controller_name /
+# trading_pair resolve to these engine-compared values (see the P2 purse envelope
+# contract). ``valid_purse_payload`` defaults to exactly this name + pair.
+PURSE_STAGED_CONFIG = {
+    "id": "ctrl_a",
+    "controller_name": "range_inventory_ladder",
+    "trading_pair": "XMR-USDT",
+}
 
 
 # ===========================================================================
@@ -163,87 +175,35 @@ class TestExpectedPurseName:
 
 
 # ===========================================================================
-# 2.  The minimal envelope validator, as a spec table
+# 2.  _validate_purse — the source-file guard around P2's formal contract
 # ===========================================================================
+#
+# The envelope RULES are spec-tested against ``classify_purse_envelope`` directly
+# in ``test_copyforward_purse_envelope.py``. Here we only pin ``_validate_purse``'s
+# own responsibilities: it returns the SOURCE sha256 on a valid journal and it
+# delegates the envelope (a formal-contract rejection must abort PURSE_INVALID).
 
-class TestPurseEnvelopeMinimal:
-    def test_valid_purse_passes(self):
-        assert _purse_envelope_reason_minimal(valid_purse_payload("ctrl_a"), "ctrl_a") is None
-
-    def test_not_a_mapping(self):
-        assert _purse_envelope_reason_minimal([1, 2], "ctrl_a") is not None
-        assert _purse_envelope_reason_minimal(None, "ctrl_a") is not None
-
-    @pytest.mark.parametrize(
-        "key",
-        # ALL SIX pinned top-level keys (CDX-R01): the engine rejects a journal
-        # missing controller_name (purse_ledger.py:558), trading_pair (:563), or
-        # the top-level sequence (:608) just as it does the version/id/records, so
-        # blessing one here would be fail-open mirror drift.
-        [
-            "purse_schema_version",
-            "controller_id",
-            "controller_name",
-            "trading_pair",
-            "sequence",
-            "records",
-        ],
-    )
-    def test_missing_top_level_key(self, key):
-        payload = valid_purse_payload("ctrl_a")
-        payload.pop(key)
-        assert _purse_envelope_reason_minimal(payload, "ctrl_a") is not None
-
-    def test_first_seq_must_be_one(self):
-        # CDX-R01: the PINNED contract's seq is 1-BASED — a single-record journal
-        # whose only record is seq: 2 is monotone-from-zero but starts wrong; the
-        # engine rejects it (purse_ledger.py:584-585) so the API must too.
-        recs = [opening_epoch_record(seq=2)]
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=recs), "ctrl_a"
-        ) is not None
-        # A gap AFTER a correct first seq stays valid (strict increase, no contiguity).
-        recs_ok = [opening_epoch_record(seq=1), opening_epoch_record(seq=5, epoch_id="epoch-2")]
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=recs_ok), "ctrl_a"
-        ) is None
-
-    def test_wrong_schema_version(self):
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", purse_schema_version=2), "ctrl_a"
-        ) is not None
-
-    def test_foreign_controller_id_compared_exactly(self):
-        # A padded id is a genuine mismatch — the journal's copy is never stripped,
-        # mirroring the engine's exact comparison.
-        assert _purse_envelope_reason_minimal(valid_purse_payload("SOMEONE_ELSE"), "ctrl_a") is not None
-        assert _purse_envelope_reason_minimal(valid_purse_payload(" ctrl_a "), "ctrl_a") is not None
-
-    def test_empty_records_rejected(self):
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=[], sequence=0), "ctrl_a"
-        ) is not None
-
-    def test_non_monotonic_seq_rejected(self):
-        recs = [opening_epoch_record(seq=1), opening_epoch_record(seq=1, epoch_id="epoch-2")]
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=recs), "ctrl_a"
-        ) is not None
-        recs2 = [opening_epoch_record(seq=2), opening_epoch_record(seq=1, epoch_id="epoch-2")]
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=recs2), "ctrl_a"
-        ) is not None
-
-    def test_seq_bool_rejected(self):
-        recs = [opening_epoch_record(seq=True)]
-        assert _purse_envelope_reason_minimal(
-            valid_purse_payload("ctrl_a", records=recs), "ctrl_a"
-        ) is not None
-
+class TestValidatePurseHelper:
     def test_validate_purse_returns_source_sha(self, tmp_path):
+        # A valid journal whose identity agrees with the staged config -> the source
+        # file's sha256 (computed from the bytes on disk, not re-read).
         src = make_source(tmp_path)
         data = write_purse(src, "p.purse.json", valid_purse_payload("ctrl_a"))
-        assert _validate_purse(src.data_dir / "p.purse.json", "ctrl_a") == hashlib.sha256(data).hexdigest()
+        assert _validate_purse(
+            src.data_dir / "p.purse.json", "ctrl_a", PURSE_STAGED_CONFIG
+        ) == hashlib.sha256(data).hexdigest()
+
+    def test_validate_purse_delegates_to_formal_contract(self, tmp_path):
+        # A formal-contract-only rejection (wrong controller_name — the P1 minimal
+        # check never compared it) must raise PURSE_INVALID through _validate_purse,
+        # proving the source-file guard delegates to the formal envelope.
+        src = make_source(tmp_path)
+        write_purse(
+            src, "p.purse.json", valid_purse_payload("ctrl_a", controller_name="not_the_ladder")
+        )
+        with pytest.raises(ResumeError) as exc:
+            _validate_purse(src.data_dir / "p.purse.json", "ctrl_a", PURSE_STAGED_CONFIG)
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
 
 
 # ===========================================================================
@@ -366,6 +326,68 @@ class TestInvalidPurseAborts:
         # CDX-R01 wire-through: a single-record journal whose first seq is 2 is
         # 1-based-invalid; the engine refuses it, so the plan aborts fail-closed.
         recs = [opening_epoch_record(seq=2)]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    # -- P2 wire-through: the plan path now rejects via the FORMAL contract --
+    # Each case below passes P1's minimal structural check (6 top-level keys,
+    # version 1, matching controller_id, non-empty records, 1-based monotonic seq)
+    # yet is a journal the ENGINE refuses to adopt. They therefore ABORT only
+    # because ``_validate_purse`` delegates to ``classify_purse_envelope`` — the
+    # P1 minimal check would have blessed and copied every one of them.
+
+    def test_wrong_controller_name_aborts(self, tmp_path):
+        # P1 minimal never compared controller_name; the formal contract does (:558).
+        new, src = self._plan(
+            tmp_path, valid_purse_payload("ctrl_a", controller_name="not_the_ladder")
+        )
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_wrong_trading_pair_aborts(self, tmp_path):
+        new, src = self._plan(
+            tmp_path, valid_purse_payload("ctrl_a", trading_pair="BTC-USDT")
+        )
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_sequence_value_mismatch_aborts(self, tmp_path):
+        # The top-level `sequence` disagrees with the highest record seq — a VALUE
+        # relationship P1 never checked, enforced by the formal contract (:608).
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", sequence=42))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_not_beginning_with_opening_epoch_aborts(self, tmp_path):
+        # A reseed_epoch-first journal is structurally P1-valid but the engine
+        # requires the journal to begin with an opening_epoch (:614).
+        recs = [reseed_epoch_record(seq=1, epoch_id="epoch-1", prev_epoch_id=None)]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_checkpoint_referencing_unopened_epoch_aborts(self, tmp_path):
+        # A checkpoint whose epoch was never opened — the formal contract's epoch
+        # reference gate (:682) catches it; P1's minimal check never looked at kinds.
+        recs = [
+            opening_epoch_record(seq=1, epoch_id="epoch-1"),
+            checkpoint_record(seq=2, epoch_id="epoch-404"),
+        ]
+        new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
+        with pytest.raises(ResumeError) as exc:
+            compute_copy_plan(new, src, make_dep())
+        assert exc.value.reason is ResumeAbortReason.PURSE_INVALID
+
+    def test_nan_money_field_aborts(self, tmp_path):
+        # A NaN owned_quote in the opening epoch — the per-kind money-field parse
+        # (:624-627) rejects it; P1's minimal check never parsed record fields.
+        recs = [opening_epoch_record(seq=1, owned_quote=float("nan"))]
         new, src = self._plan(tmp_path, valid_purse_payload("ctrl_a", records=recs))
         with pytest.raises(ResumeError) as exc:
             compute_copy_plan(new, src, make_dep())
