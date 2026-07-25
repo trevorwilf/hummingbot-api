@@ -47,7 +47,13 @@ from ledger_fixtures import (
     valid_purse_payload,
 )
 from routers.bot_orchestration import get_latest_controller_performance
-from routers.purse import get_purse, get_purse_history
+from routers.purse import (
+    get_purse,
+    get_purse_activity,
+    get_purse_history,
+    get_purse_timeseries,
+)
+from database.repositories.purse_snapshot_repository import PurseSnapshotRepository
 from services.purse_harvest import _extract_source_degraded, harvest_instance_purses
 from services.purse_read_model import PurseHarvestMarkers, compute_harvest_markers
 
@@ -434,19 +440,64 @@ class TestHistoryLineageOrdering:
     async def test_all_null_run_ids_fall_back_to_harvested_at(self, db):
         """Backward-compat: a fleet of all-NULL source_bot_run_id rows degrades to exactly
         the previous newest-by-harvest order (nullslast keeps them together, then
-        harvested_at DESC decides)."""
+        harvested_at DESC decides — NOT the journal sequence, which is invalid across
+        incarnations). The fixture deliberately ANTI-CORRELATES sequence with harvest time:
+        the newest-harvested row carries the LOWER sequence and the stale older row the
+        HIGHER sequence. So only harvested_at ordering yields [seq 1, seq 99]; the forbidden
+        desc(sequence) ordering would yield [99, 1] and fail. MUTATION GUARD (CDX-R03):
+        replacing desc(harvested_at) with desc(sequence) in get_history_for_controller puts
+        the stale higher-sequence row first and fails both asserts below."""
         await _insert_row(
-            db, controller_id="ctrl_a", run_id=None, sha="sha-old", sequence=1,
+            db, controller_id="ctrl_a", run_id=None, sha="sha-stale", sequence=99,
             records_json=_journal_json(epoch_id="epoch-1"),
-            harvested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            harvested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),  # OLDER harvest, HIGHER seq
         )
         await _insert_row(
-            db, controller_id="ctrl_a", run_id=None, sha="sha-new", sequence=2,
+            db, controller_id="ctrl_a", run_id=None, sha="sha-recent", sequence=1,
             records_json=_journal_json(epoch_id="epoch-1"),
-            harvested_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            harvested_at=datetime(2026, 6, 1, tzinfo=timezone.utc),  # NEWER harvest, LOWER seq
         )
         resp = await get_purse_history("ctrl_a", limit=100, offset=0, db_manager=db)
-        assert [e.provenance.sequence for e in resp.snapshots] == [2, 1]  # newest harvest first
+        # Newest HARVEST leads, regardless of the (anti-correlated) sequence:
+        assert [e.provenance.sequence for e in resp.snapshots] == [1, 99]
+        assert [e.provenance.purse_sha256 for e in resp.snapshots] == ["sha-recent", "sha-stale"]
+
+    @pytest.mark.asyncio
+    async def test_latest_surfaces_select_lineage_newest_not_late_stale(self, db):
+        """CDX-R01: the CURRENT-STATE surfaces (GET /purse/{id}, /activity, /timeseries) all
+        resolve the newest snapshot via the SAME lineage-correct ordering as history — so a
+        late-archived STALE incarnation (higher harvested_at, LOWER run id) cannot win on the
+        primary card while history shows the genuinely-newer one first. All four surfaces
+        must agree on run id 2. MUTATION GUARD: ordering get_latest_for_controller by
+        harvested_at alone (the pre-fix behavior) selects the stale run-1 row and every
+        `== 2` assert flips to 1.
+
+        Both rows carry the same (valid, computable) journal bytes so /activity and
+        /timeseries actually derive over a real journal rather than 500-ing."""
+        # B — the GENUINELY newer incarnation: run id 2, harvested EARLY (2026-01).
+        await _insert_row(
+            db, controller_id="ctrl_a", run_id=2, sha="sha-B", sequence=1,
+            records_json=json.dumps(two_reanchor_journal()),
+            harvested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        # A — the STALE, late-archived older incarnation: run id 1, harvested LATE (2026-06).
+        await _insert_row(
+            db, controller_id="ctrl_a", run_id=1, sha="sha-A", sequence=99,
+            records_json=json.dumps(two_reanchor_journal()),
+            harvested_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+
+        purse = await get_purse("ctrl_a", db_manager=db)
+        activity = await get_purse_activity("ctrl_a", db_manager=db)
+        timeseries = await get_purse_timeseries("ctrl_a", db_manager=db)
+        hist = await get_purse_history("ctrl_a", limit=100, offset=0, db_manager=db)
+
+        # Every current-state surface selects the lineage-newest incarnation (run 2)...
+        assert purse.provenance.source_bot_run_id == 2
+        assert activity.provenance.source_bot_run_id == 2
+        assert timeseries.provenance.source_bot_run_id == 2
+        # ...and history agrees — the surfaces can never disagree about "newest" now.
+        assert hist.snapshots[0].provenance.source_bot_run_id == 2
 
     @pytest.mark.asyncio
     async def test_history_incarnation_id_through_asgi_no_records_leak(self, db, asgi_main):
@@ -475,6 +526,83 @@ class TestHistoryLineageOrdering:
         assert body["snapshots"][0]["incarnation_id"] == _spec_incarnation_id("ctrl_a", "epoch-beta")
         assert body["snapshots"][1]["incarnation_id"] == _spec_incarnation_id("ctrl_a", "epoch-alpha")
         assert "records_json" not in json.dumps(body)
+
+
+# ===========================================================================
+# 5b. Content-dedup provenance refresh (CDX-R02) — a byte-identical re-harvest by a
+#     lineage-newer retirement must not lose its source_degraded observation, and a
+#     stale retirement must never clobber a newer one.
+# ===========================================================================
+
+
+async def _dedup_insert(db, *, run_id, degraded, sha="sha-same", inst="inst"):
+    """Insert-if-absent one snapshot for fixed content ``sha`` with an explicit run id and
+    source_degraded — the knobs the CDX-R02 refresh keys on. records_json is irrelevant to
+    the dedup (keyed on controller_id + sha), so a stub is fine."""
+    async with db.get_session_context() as session:
+        return await PurseSnapshotRepository(session).insert_snapshot_if_absent(
+            controller_id="ctrl_a", source_instance_name=inst, source_bot_run_id=run_id,
+            purse_sha256=sha, sequence=1, records_json="{}",
+            derived_contributed="0", derived_withdrawn="0", derived_earned_realized="0",
+            derived_earned_total="0", derived_unrealized="0", derived_drift="0",
+            reference_price_used="150", opening_basis_quality=None, source_degraded=degraded,
+        )
+
+
+class TestContentDedupProvenanceRefresh:
+    @pytest.mark.asyncio
+    async def test_newer_retirement_refreshes_degraded_on_identical_content(self, db):
+        """The reviewer's exact CDX-R02 scenario: content harvested clean (False) under run 1,
+        then re-harvested BYTE-IDENTICAL but DEGRADED (True) under a lineage-newer run 2. The
+        later degraded observation must survive — refreshed onto the single content row — and
+        NO second row is created (dedup preserved). MUTATION GUARD: dropping the
+        `_is_lineage_newer` refresh block leaves source_degraded stuck at the first False."""
+        first = await _dedup_insert(db, run_id=1, degraded=False, inst="inst1")
+        assert first is not None                        # inserted the content row
+        dup = await _dedup_insert(db, run_id=2, degraded=True, inst="inst2")
+        assert dup is None                              # still a content-dedup: no 2nd row
+        rows = await history(db)
+        assert len(rows) == 1                           # exactly one content row
+        assert rows[0].source_degraded is True          # REFRESHED from the newer retirement
+        assert rows[0].source_bot_run_id == 2           # lineage advanced to the newer run
+        assert rows[0].source_instance_name == "inst2"
+
+    @pytest.mark.asyncio
+    async def test_stale_retirement_does_not_clobber_newer_observation(self, db):
+        """CLA-309 safety: a LATE stale retirement (LOWER run id) re-harvesting identical
+        content must NOT overwrite the newer observation — the refresh is lineage-GUARDED.
+        MUTATION GUARD: an unguarded update (refresh on any duplicate) would let run 1 clobber
+        run 2's True back to False and fail the `is True` below."""
+        await _dedup_insert(db, run_id=2, degraded=True, inst="inst2")   # newer first
+        await _dedup_insert(db, run_id=1, degraded=False, inst="inst1")  # stale, lower run id
+        rows = await history(db)
+        assert len(rows) == 1
+        assert rows[0].source_degraded is True          # newer observation preserved
+        assert rows[0].source_bot_run_id == 2
+        assert rows[0].source_instance_name == "inst2"
+
+    @pytest.mark.asyncio
+    async def test_same_run_reharvest_is_a_plain_noop(self, db):
+        """Equal run id is NOT lineage-newer: an identical-content, identical-lineage
+        re-harvest is a pure dedup no-op (never an over-eager refresh). MUTATION GUARD:
+        loosening `_is_lineage_newer` to `>=` would let this refresh False->True and fail."""
+        await _dedup_insert(db, run_id=5, degraded=False)
+        await _dedup_insert(db, run_id=5, degraded=True)   # same run id -> no refresh
+        rows = await history(db)
+        assert len(rows) == 1
+        assert rows[0].source_degraded is False            # unchanged
+
+    @pytest.mark.asyncio
+    async def test_null_lineage_never_refreshes(self, db):
+        """Ambiguous lineage (either run id NULL) never touches the stored observation —
+        conservative: we neither clobber on doubt nor fabricate an ordering. A first
+        resolved (run 3, True) is preserved when a later NULL-run re-harvest arrives."""
+        await _dedup_insert(db, run_id=3, degraded=True, inst="inst3")
+        await _dedup_insert(db, run_id=None, degraded=False, inst="instX")  # NULL -> not newer
+        rows = await history(db)
+        assert len(rows) == 1
+        assert rows[0].source_degraded is True
+        assert rows[0].source_bot_run_id == 3
 
 
 # ===========================================================================
@@ -517,3 +645,38 @@ class TestSourceDegradedThroughRetirement:
         assert rows[0].reanchor_count == 2          # epoch markers persisted too
         assert rows[0].latest_epoch_id == "epoch-2"
         assert rows[0].source_bot_run_id is not None  # lineage link resolved through the FSM
+
+    @pytest.mark.asyncio
+    async def test_harvest_exception_does_not_block_retirement(self, tmp_path, db, monkeypatch):
+        """Invariant 5 at the ORCHESTRATION BOUNDARY (CDX-R04). The prior test proves a
+        SUCCESSFUL harvest does not block retirement; this proves the load-bearing part: if
+        the harvest delegate itself RAISES an unexpected error, the broad barrier in
+        BotsOrchestrator._harvest_purses must swallow it so the retirement still finishes —
+        the archiver runs and the run finalizes, an observation-only concern never becoming
+        load-bearing on the retirement path.
+
+        The harvest is driven through the REAL retirement FSM with a delegate monkeypatched
+        to raise; only the outer barrier stands between that raise and an aborted archive.
+        MUTATION GUARD: narrowing that barrier from `except Exception` to `except KeyError`
+        (services/bots_orchestrator.py) lets the injected RuntimeError escape _harvest_purses,
+        propagate to the retirement's outer handler, and SKIP Step 6 (archive) — so
+        `archiver.archived` stays empty and the `== ['bot1']` assert fails."""
+        monkeypatch.chdir(tmp_path)
+        build_instance(tmp_path, name="bot1", controller_id="ctrl_a",
+                       purse_payload=two_reanchor_journal())
+        await seed_bot_run(db, bot_name="bot1", account_name="acct")
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("injected harvest failure")
+
+        # Patch the name _harvest_purses actually calls (imported into the orchestrator module).
+        monkeypatch.setattr("services.bots_orchestrator.harvest_instance_purses", _boom)
+
+        orch = make_orchestrator(db, ReportingMQTT())
+        archiver = RmtreeArchiver()
+        await run_fsm(orch, StubDockerManager(exit_code=0), archiver)
+
+        # The harvest raised, but the retirement still ran to completion (archive happened).
+        assert archiver.archived == ["bot1"]
+        # No snapshot landed (harvest aborted before any insert) — yet retirement was unaffected.
+        assert await history(db) == []
