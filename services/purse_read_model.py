@@ -460,3 +460,256 @@ def compute_activity(payload: dict, *, source_bot_run_id: Optional[int] = None) 
         booked_fills_per_week=booked_fills_per_week,
         incarnation_id=derive_incarnation_id(controller_id, records, source_bot_run_id),
     )
+
+
+# ---------------------------------------------------------------------------
+# Timeseries read-model (hbdash_api P2) — the authoritative journal-time
+# checkpoint/epoch series (equity/contributed/earned), incarnation-segmented.
+# DERIVED and NON-AUTHORITATIVE, single-sourced with the SAME seq-ordered record
+# walk and accumulator logic as compute_derived_metrics (CLA-2A-05, CLA-M02).
+# ---------------------------------------------------------------------------
+
+# The boundary kinds a point can carry (HBDASH_FINDINGS §3 — the recommended design's
+# "segment by incarnation_id / boundary"). A checkpoint is an in-epoch series sample
+# and carries no boundary (None); the three RE-BASELINE events each carry one so a
+# chart can mark the reset instead of drawing one continuous line across it:
+#   * "opening"  — an opening_epoch (inception, or a later post-quarantine opening)
+#   * "reseed"   — a reseed_epoch (owned re-anchored to new_owned_*)
+#   * "reanchor" — a reanchor (an owned cut / drift surfacing)
+BOUNDARY_OPENING = "opening"
+BOUNDARY_RESEED = "reseed"
+BOUNDARY_REANCHOR = "reanchor"
+
+
+@dataclass(frozen=True)
+class TimeseriesPoint:
+    """One DERIVED journal-time point in a purse's equity/flows series (P2).
+
+    Emitted while walking the journal in ``seq`` order at every ``checkpoint`` (an
+    in-epoch sample) and every ``opening_epoch``/``reseed_epoch``/``reanchor`` (a
+    re-baseline, flagged via :attr:`boundary`). ``flow`` and ``fills_rollup`` records
+    update the running accumulators but do NOT themselves emit a point — EXCEPT when
+    one is the journal's LAST record, in which case a single terminal reconciliation
+    point is emitted for it (CDX-R03) so the final point reflects the whole journal.
+
+    The point-in-time money metrics ``equity_quote``/``contributed``/``withdrawn``/
+    ``earned_total`` are computed with the SAME formulas as
+    :func:`compute_derived_metrics` over the journal PREFIX up to and including this
+    record, valued at the reference price CURRENT at this point (the newest
+    checkpoint/epoch ``reference_price`` seen so far — a ``reanchor`` carries none, so
+    it inherits the prior one). These are exact at every point because each is derived
+    from append-only records (opening/checkpoint owned+ref, flows) whose values are
+    point-in-time truth.
+
+    ``earned_realized`` is the ONE metric the light path cannot always place in time
+    (CDX-R01): the engine keeps ONE cumulative ``fills_rollup`` per epoch, updated
+    IN PLACE (``purse_ledger.py:update_fills_rollup`` — its ``seq``/``ts`` stay frozen
+    at the first fill while ``quote_delta_cum``/``base_delta_cum``/``last_update_ts``
+    advance), so a checkpoint whose ``ts`` precedes a counted rollup's
+    ``last_update_ts`` would otherwise report realized P&L booked AFTER it. Rather than
+    fabricate that (the exact historical series would need the rejected heavy journal),
+    ``earned_realized`` is ``None`` at any point where a rollup counted so far settled
+    LATER than this point's journal time; it is a real value only once its booked fills
+    have all settled (the last point of a healthy journal, hence the reconciliation
+    cross-check still holds there).
+
+    Attributes:
+        ts: the RECORD's ``ts`` = journal/accounting time (epoch seconds), NOT the
+            DB ``harvested_at`` — this is the CLA-M02 fix. For a terminal ``fills_rollup``
+            point it is the rollup's ``last_update_ts`` (the accounting time of its
+            settled realized content, not its frozen first-fill ``ts``). ``None`` only
+            for the envelope-impossible non-numeric ts.
+        seq: the record's ``seq`` (the series is emitted in strictly-increasing seq
+            order); ``None`` for the envelope-impossible non-int seq.
+        epoch_id: the record's ``epoch_id`` (``None`` when the record carries none).
+        incarnation_id: the journal's inception-lineage id (:func:`derive_incarnation_id`),
+            IDENTICAL on every point of one journal — a reseed re-baselines but does
+            NOT open a new incarnation; only a separate no-resume fresh seed does.
+        boundary: one of :data:`BOUNDARY_OPENING`/:data:`BOUNDARY_RESEED`/
+            :data:`BOUNDARY_REANCHOR`, or ``None`` for a checkpoint / terminal sample.
+        owned_quote / owned_base: the current on-disk owned at this point (a ``drift``
+            reanchor leaves owned unchanged, mirroring :func:`resolve_current_state`).
+        reference_price: the reference price current at this point.
+        equity_quote / contributed / withdrawn / earned_total: point-in-time-exact
+            contract-v1 running metrics (exact ``Decimal``; the caller stringifies).
+        earned_realized: the running realized metric, or ``None`` when it is not yet
+            temporally knowable at this point (see above).
+    """
+
+    ts: Optional[float]
+    seq: Optional[int]
+    epoch_id: Optional[str]
+    incarnation_id: str
+    boundary: Optional[str]
+    owned_quote: Decimal
+    owned_base: Decimal
+    reference_price: Decimal
+    equity_quote: Decimal
+    contributed: Decimal
+    withdrawn: Decimal
+    earned_total: Decimal
+    earned_realized: Optional[Decimal]
+
+
+def compute_timeseries(
+    payload: dict, *, source_bot_run_id: Optional[int] = None
+) -> List[TimeseriesPoint]:
+    """Build the journal-time checkpoint/epoch series for a VALIDATED payload (P2).
+
+    Single-sourced with :func:`compute_derived_metrics`: the SAME per-record walk in
+    ``seq`` order, the SAME ``_dec`` money parser, the SAME accumulator semantics
+    (``contributed`` = opening ``contributed_opening_quote`` + deposit valuations;
+    ``withdrawn`` = withdrawal valuations; ``earned_opening`` from opening records;
+    the signed ``quote_delta_cum``/``base_delta_cum`` summed across ALL epochs — a
+    reseed does NOT reset them, matching ``compute_derived_metrics``; owned/ref moved
+    exactly as :func:`resolve_current_state` moves them). It emits a point at each
+    ``checkpoint``/``opening_epoch``/``reseed_epoch``/``reanchor`` so the series
+    starts, re-baselines and owned cuts are all visible.
+
+    Two honesty rules make the series faithful to the light-path journal:
+
+    * **Terminal reconciliation (CDX-R03).** ``flow`` and ``fills_rollup`` records do
+      not emit a point of their own, so a journal that ENDS with one (a deposit/
+      withdrawal or a final fills update after the last checkpoint) would leave the
+      last emitted point stale. When the journal's last record is such a non-emitting
+      record, ONE terminal point is appended carrying the whole-journal accumulators,
+      so the final point reconciles with :func:`compute_derived_metrics` for EVERY
+      valid ordering, not only checkpoint-terminated ones.
+
+    * **Temporal realized honesty (CDX-R01).** The engine keeps ONE cumulative
+      ``fills_rollup`` per epoch, updated IN PLACE with its ``seq``/``ts`` frozen at the
+      first fill while its cumulative deltas and ``last_update_ts`` advance. So the
+      value walked at that rollup's list position is the epoch-FINAL cumulative, and
+      applying it to an EARLIER checkpoint would leak future realized P&L into the
+      past. ``earned_realized`` is therefore emitted only when every rollup counted so
+      far has ``last_update_ts`` at or before this point's journal time (the
+      ``realized_frontier``); otherwise it is ``None`` — genuinely unknowable on the
+      light path. ``earned_total``/``equity``/``contributed``/``withdrawn`` are
+      unaffected (all point-in-time exact from append-only records).
+
+    ``payload`` MUST have passed
+    :func:`services.purse_envelope_contract.classify_purse_envelope` (the route
+    re-validates before calling); like ``compute_derived_metrics`` this trusts that
+    guarantee and reads pinned fields directly, so an UN-validated payload raises
+    (a corrupt stored row becomes a clean 500, never silently-wrong points).
+
+    ``source_bot_run_id`` is threaded to :func:`derive_incarnation_id` only as the
+    documented last-resort lineage hint; a valid journal's inception ``opening_epoch``
+    supplies the id and the run id is ignored (see that function).
+    """
+    records = payload["records"]
+    incarnation_id = derive_incarnation_id(
+        payload.get("controller_id"), records, source_bot_run_id
+    )
+
+    zero = Decimal("0")
+    contributed = zero
+    withdrawn = zero
+    earned_opening = zero
+    quote_delta_sum = zero
+    base_delta_sum = zero
+    owned_quote = zero
+    owned_base = zero
+    ref = zero
+    # The newest ``last_update_ts`` among fills_rollup records counted so far. A point
+    # whose journal time is BEFORE this cannot honestly know its realized P&L (a counted
+    # rollup booked fills after it), so earned_realized is None there (CDX-R01).
+    realized_frontier: Optional[float] = None
+
+    def _num(value) -> Optional[float]:
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    points: List[TimeseriesPoint] = []
+
+    def _emit(record: dict, boundary: Optional[str], ts_value: Optional[float]) -> None:
+        equity = owned_quote + owned_base * ref
+        # earned_realized is knowable only once every counted rollup has settled at or
+        # before this point's journal time (no rollup yet -> exact = earned_opening).
+        known = realized_frontier is None or (ts_value is not None and realized_frontier <= ts_value)
+        earned_realized = (earned_opening + quote_delta_sum + base_delta_sum * ref) if known else None
+        seq = record.get("seq")
+        epoch_id = record.get("epoch_id")
+        points.append(
+            TimeseriesPoint(
+                ts=ts_value,
+                seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
+                epoch_id=epoch_id if isinstance(epoch_id, str) and epoch_id else None,
+                incarnation_id=incarnation_id,
+                boundary=boundary,
+                owned_quote=owned_quote,
+                owned_base=owned_base,
+                reference_price=ref,
+                equity_quote=equity,
+                contributed=contributed,
+                withdrawn=withdrawn,
+                earned_total=equity - contributed + withdrawn,
+                earned_realized=earned_realized,
+            )
+        )
+
+    for record in records:
+        kind = record.get("kind")
+        boundary: Optional[str] = None
+        emit = False
+        if kind == "opening_epoch":
+            contributed += _dec(record["contributed_opening_quote"], "contributed_opening_quote")
+            earned_opening += _dec(record["earned_opening_quote"], "earned_opening_quote")
+            owned_quote = _dec(record["owned_quote"], "owned_quote")
+            owned_base = _dec(record["owned_base"], "owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            boundary = BOUNDARY_OPENING
+            emit = True
+        elif kind == "flow":
+            valuation = _dec(record["quote_valuation"], "quote_valuation")
+            if record.get("flow_kind") == "deposit":
+                contributed += valuation
+            else:
+                withdrawn += valuation
+        elif kind == "fills_rollup":
+            quote_delta_sum += _dec(record["quote_delta_cum"], "quote_delta_cum")
+            base_delta_sum += _dec(record["base_delta_cum"], "base_delta_cum")
+            # Advance the realized frontier: the cumulative just counted was booked
+            # through this rollup's last_update_ts (its logical, not its frozen, time).
+            lut = _num(record.get("last_update_ts"))
+            if lut is not None:
+                realized_frontier = lut if realized_frontier is None else max(realized_frontier, lut)
+        elif kind == "reseed_epoch":
+            owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
+            owned_base = _dec(record["new_owned_base"], "new_owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            boundary = BOUNDARY_RESEED
+            emit = True
+        elif kind == "reanchor":
+            # A reanchor carries no reference_price — ref unchanged. An
+            # ``undeclared_outflow`` is a committed owned cut (new_owned_* IS the true
+            # owned); a ``drift`` reanchor is the indistinguishable observation case,
+            # so owned is left UNCHANGED — the SAME safe default resolve_current_state
+            # applies. Either way it is a re-baseline worth a marker.
+            if record.get("classification") == "undeclared_outflow":
+                owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
+                owned_base = _dec(record["new_owned_base"], "new_owned_base")
+            boundary = BOUNDARY_REANCHOR
+            emit = True
+        elif kind == "checkpoint":
+            owned_quote = _dec(record["owned_quote"], "owned_quote")
+            owned_base = _dec(record["owned_base"], "owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            emit = True
+        if emit:
+            _emit(record, boundary, _num(record.get("ts")))
+
+    # Terminal reconciliation (CDX-R03): if the journal ends with a non-emitting record,
+    # its accumulator changes are not yet on any point. Emit one terminal point so the
+    # final point reflects the whole journal and reconciles with compute_derived_metrics.
+    if records:
+        last = records[-1]
+        last_kind = last.get("kind")
+        if last_kind == "flow":
+            _emit(last, None, _num(last.get("ts")))
+        elif last_kind == "fills_rollup":
+            # Stamp its settled accounting time (last_update_ts), not its frozen ts, so
+            # the point's realized content and its x-position agree (and stays knowable).
+            lut = _num(last.get("last_update_ts"))
+            _emit(last, None, lut if lut is not None else _num(last.get("ts")))
+
+    return points

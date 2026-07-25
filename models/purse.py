@@ -124,6 +124,76 @@ class PurseActivityResponse(BaseModel):
     metric_note: str = Field(default=ACTIVITY_METRIC_NOTE)
 
 
+# The freshness/segmentation disclaimer stamped on every timeseries response
+# (hbdash_api P2, CLA-2A-05 / CLA-M02). The x-axis is JOURNAL time (each point's
+# record ts), not the DB harvest time, and the series is a harvested snapshot — not a
+# live tail — so a panel cannot render it as fresh; ``incarnation_id`` + ``boundary``
+# tell a chart where to segment incarnations and mark re-baselines.
+TIMESERIES_NOTE = (
+    "journal checkpoints, as of last harvest — not a live tail; x-axis is journal "
+    "time (each point's ts is the journal record's own accounting time, NOT "
+    "harvested_at); segment by incarnation_id / boundary (opening | reseed | reanchor). "
+    "earned_realized is null at a point before its epoch's booked fills have all "
+    "settled: the light-path journal keeps ONE in-place cumulative fills_rollup per "
+    "epoch, so a checkpoint earlier than that rollup's last_update_ts cannot know its "
+    "point-in-time realized (equity / contributed / withdrawn / earned_total remain "
+    "point-in-time exact)."
+)
+
+
+class PurseTimeseriesPoint(BaseModel):
+    """One DERIVED, non-authoritative journal-time point (hbdash_api P2) — computed from
+    engine-authoritative journal bytes. Money values are decimal STRINGS (JSON float
+    coercion must never corrupt a reported balance)."""
+    ts: Optional[float] = Field(
+        default=None,
+        description="the journal RECORD's ts (accounting/journal epoch seconds), NOT "
+        "the DB harvested_at — the CLA-M02 fix",
+    )
+    seq: Optional[int] = Field(
+        default=None, description="the record's seq (points are in strictly-increasing seq order)"
+    )
+    epoch_id: Optional[str] = Field(default=None, description="the record's epoch_id, or null")
+    incarnation_id: str = Field(
+        description="the journal's inception-lineage id — identical on every point of "
+        "one journal; a separate no-resume fresh seed yields a different id"
+    )
+    boundary: Optional[str] = Field(
+        default=None,
+        description="'opening' | 'reseed' | 'reanchor' for a re-baseline record, else "
+        "null for a checkpoint sample — segment/mark on this so a reset is not drawn "
+        "as a continuous line",
+    )
+    owned_quote: str = Field(description="current owned quote at this point")
+    owned_base: str = Field(description="current owned base at this point")
+    reference_price: str = Field(description="the reference price current at this point")
+    equity_quote: str = Field(description="owned_quote + owned_base * reference_price")
+    contributed: str = Field(description="running contributed at this point")
+    withdrawn: str = Field(description="running withdrawn at this point")
+    earned_total: str = Field(description="equity - contributed + withdrawn at this point")
+    earned_realized: Optional[str] = Field(
+        default=None,
+        description="earned_opening + sum(quote_delta_cum + base_delta_cum * reference_price); "
+        "null when not yet temporally knowable at this point (a counted in-place rollup "
+        "settled after this point's journal time — see the response note)",
+    )
+
+
+class PurseTimeseriesResponse(BaseModel):
+    """The DERIVED journal checkpoint/epoch series for a controller (hbdash_api P2).
+
+    NON-AUTHORITATIVE: computed from the engine-authoritative journal bytes, never the
+    source of truth. Reuses :class:`PurseProvenance` + :data:`AUTHORITY_NOTE`; carries a
+    required :data:`TIMESERIES_NOTE`. The response must not imply live freshness — it is
+    the harvested snapshot's journal series, as of ``provenance.harvested_at``.
+    """
+    controller_id: str
+    points: List[PurseTimeseriesPoint] = Field(default_factory=list)
+    provenance: PurseProvenance
+    authority_note: str = Field(default=AUTHORITY_NOTE)
+    note: str = Field(default=TIMESERIES_NOTE)
+
+
 class PurseHistoryEntry(BaseModel):
     """One historical snapshot — derived metrics + provenance, NO raw records_json."""
     derived: PurseDerivedMetrics
