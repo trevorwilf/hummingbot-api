@@ -713,3 +713,60 @@ def compute_timeseries(
             _emit(last, None, lut if lut is not None else _num(last.get("ts")))
 
     return points
+
+
+# ---------------------------------------------------------------------------
+# Harvest-honesty markers (hbdash_api P3) — additive epoch/reanchor markers derived
+# from the journal at harvest so a retired run's epoch boundaries are answerable
+# (CLA-2A-07 / CLA-008). DERIVED and NON-AUTHORITATIVE, single-sourced with the SAME
+# record walk. OBSERVATION-ONLY: never raises — a degenerate shape yields (None, 0)
+# so the harvest attaches nulls and proceeds without ever blocking a retirement
+# (safety invariant 5).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PurseHarvestMarkers:
+    """Additive epoch markers for the harvest (P3).
+
+    Attributes:
+        latest_epoch_id: the ``epoch_id`` opened by the NEWEST ``opening_epoch``/
+            ``reseed_epoch`` record — the currently-active accounting epoch (records
+            walk in seq order, so the last epoch-opening record's id wins). ``None``
+            when no record carries a usable epoch id (e.g. a recordless/degenerate
+            payload).
+        reanchor_count: the number of ``reanchor`` records in the journal.
+    """
+
+    latest_epoch_id: Optional[str]
+    reanchor_count: int
+
+
+def compute_harvest_markers(payload: dict) -> PurseHarvestMarkers:
+    """Derive (latest_epoch_id, reanchor_count) from a purse journal payload (P3).
+
+    Single-sourced with :func:`compute_derived_metrics`'s record walk: ``latest_epoch_id``
+    tracks the epoch opened by the newest ``opening_epoch``/``reseed_epoch`` (exactly the
+    epoch :func:`resolve_current_state` treats as current), and ``reanchor_count`` counts
+    ``reanchor`` records. Observation-only and TOTALLY DEFENSIVE: it reads every field
+    with ``.get`` on ``dict`` instances only and NEVER raises, so a malformed payload
+    yields ``(None, 0)`` rather than costing the harvest its snapshot (invariant 5). It
+    does NOT re-validate — the caller validates the envelope before harvesting; here a
+    non-dict payload/record is simply skipped.
+    """
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        return PurseHarvestMarkers(latest_epoch_id=None, reanchor_count=0)
+    latest_epoch_id: Optional[str] = None
+    reanchor_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        if kind == "opening_epoch" or kind == "reseed_epoch":
+            epoch_id = record.get("epoch_id")
+            if isinstance(epoch_id, str) and epoch_id:
+                latest_epoch_id = epoch_id
+        elif kind == "reanchor":
+            reanchor_count += 1
+    return PurseHarvestMarkers(latest_epoch_id=latest_epoch_id, reanchor_count=reanchor_count)

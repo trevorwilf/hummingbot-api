@@ -8,7 +8,7 @@ and no arbitrary write — the API never edits a purse record.
 """
 from typing import List, Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, nullslast, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import PurseSnapshot
@@ -49,6 +49,12 @@ class PurseSnapshotRepository:
         derived_drift: str,
         reference_price_used: str,
         opening_basis_quality: Optional[str],
+        # hbdash_api P3 harvest-honesty markers — ADDITIVE, nullable, observation-only.
+        # Defaulted so pre-P3 callers/tests that do not supply them insert NULLs, exactly
+        # like a snapshot harvested before these columns existed.
+        latest_epoch_id: Optional[str] = None,
+        reanchor_count: Optional[int] = None,
+        source_degraded: Optional[bool] = None,
     ) -> Optional[PurseSnapshot]:
         """Insert a snapshot, or return None if one already exists for this content.
 
@@ -74,6 +80,9 @@ class PurseSnapshotRepository:
             derived_drift=derived_drift,
             reference_price_used=reference_price_used,
             opening_basis_quality=opening_basis_quality,
+            latest_epoch_id=latest_epoch_id,
+            reanchor_count=reanchor_count,
+            source_degraded=source_degraded,
         )
         self.session.add(snapshot)
         await self.session.flush()
@@ -99,11 +108,35 @@ class PurseSnapshotRepository:
     async def get_history_for_controller(
         self, controller_id: str, limit: int = 100, offset: int = 0
     ) -> List[PurseSnapshot]:
-        """All snapshots for a controller, newest first (paginated)."""
+        """All snapshots for a controller, in LINEAGE-CORRECT chronology (CDX-005/CLA-309).
+
+        Ordered by ``source_bot_run_id`` DESC first (the deploy chronology — a bot_run's
+        auto-increment id rises with each new deploy/resume), then ``harvested_at`` DESC,
+        then ``id`` DESC. This is what stops a LATE-ARCHIVED STALE instance from
+        masquerading as the newest incarnation: an older run archived after a newer one
+        has a LOWER run id, so it sorts BELOW the newer run even though its ``harvested_at``
+        is later. Ordering by ``harvested_at`` alone (the old behavior) got this wrong;
+        ordering by the journal ``sequence`` across incarnations is INVALID (seq resets on a
+        fresh journal — the discovery run proved it), so it is deliberately NOT used here.
+
+        Rows with a NULL ``source_bot_run_id`` (the lineage link could not be resolved)
+        fall to the bottom of the run-id ordering and are then ordered among themselves by
+        ``harvested_at``/``id`` — the same best-effort each row already carries; a fleet of
+        all-NULL rows degrades to exactly the previous newest-by-harvest order.
+        """
         stmt = (
             select(PurseSnapshot)
             .where(PurseSnapshot.controller_id == controller_id)
-            .order_by(desc(PurseSnapshot.harvested_at), desc(PurseSnapshot.id))
+            .order_by(
+                # nullslast() is EXPLICIT, not incidental: SQLite sorts NULLs last under
+                # DESC but PostgreSQL (production) sorts them FIRST — without this an
+                # unresolved-lineage (NULL run id) row would jump to the newest slot on
+                # Postgres, the exact masquerade this ordering exists to prevent. Pinned
+                # so both dialects agree: NULL run ids fall to the bottom.
+                nullslast(desc(PurseSnapshot.source_bot_run_id)),
+                desc(PurseSnapshot.harvested_at),
+                desc(PurseSnapshot.id),
+            )
             .limit(limit)
             .offset(offset)
         )

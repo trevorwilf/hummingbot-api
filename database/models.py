@@ -1,5 +1,6 @@
 from sqlalchemy import (
     TIMESTAMP,
+    Boolean,
     Column,
     ForeignKey,
     Index,
@@ -551,6 +552,26 @@ class PurseSnapshot(Base):
     derived_drift = Column(String, nullable=False)
     reference_price_used = Column(String, nullable=False)
     opening_basis_quality = Column(String, nullable=True)
+
+    # ------------------------------------------------------------------
+    # Harvest-honesty markers (hbdash_api P3) — ADDITIVE, nullable, observation-only.
+    # Populated best-effort at harvest from the (already validated) journal / retirement
+    # final_status; a parse/lookup failure leaves them NULL and NEVER blocks the harvest
+    # or the retirement (safety invariant 5). Migration 0004_purse_harvest_honesty.
+    # ------------------------------------------------------------------
+    # CLA-2A-07 / CLA-008: the retired run's epoch boundaries, dropped from the derived
+    # metrics until now. latest_epoch_id = the epoch_id opened by the newest
+    # opening_epoch/reseed_epoch (the currently-active accounting epoch); reanchor_count
+    # = the number of reanchor records. Both DERIVED from records_json, never authored.
+    latest_epoch_id = Column(String, nullable=True)
+    reanchor_count = Column(Integer, nullable=True)
+    # CLA-007: whether the retiring instance's purse was flagged degraded
+    # (purse_degraded / accounting_degraded) in its last observed status BEFORE the stop
+    # — captured best-effort from the retirement final_status. True/False when a boolean
+    # flag was observed; NULL when unavailable (NEVER fabricated healthy). It proves
+    # pre-existing degradation, not final shutdown health (final_status is captured before
+    # the stop command — HBDASH_FINDINGS §6 CLA-007).
+    source_degraded = Column(Boolean, nullable=True)
 
 
 class ExecutorOrder(Base):

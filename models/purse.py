@@ -53,12 +53,34 @@ class PurseDerivedMetrics(BaseModel):
 
 
 class PurseProvenance(BaseModel):
-    """Where a snapshot came from + the stale-mirror detectors (required change #9)."""
+    """Where a snapshot came from + the stale-mirror detectors (required change #9).
+
+    hbdash_api P3 adds three ADDITIVE, nullable harvest-honesty markers so a retired run's
+    epoch boundaries and pre-stop degradation are answerable from the derived mirror
+    (CLA-2A-07/CLA-008, CLA-007). All three are ``None`` for snapshots harvested before P3
+    (or when the source was unavailable) — never fabricated.
+    """
     harvested_at: datetime = Field(description="when the snapshot was harvested from the journal")
     source_instance_name: str = Field(description="the retiring instance the journal was read from")
     source_bot_run_id: Optional[int] = Field(default=None, description="best-effort lineage link to the bot run")
     purse_sha256: str = Field(description="sha256 of the exact journal bytes (staleness detector)")
     sequence: int = Field(description="the journal's top-level sequence / highest record seq (staleness detector)")
+    latest_epoch_id: Optional[str] = Field(
+        default=None,
+        description="CLA-2A-07: the epoch_id opened by the newest opening_epoch/reseed_epoch "
+        "(the currently-active accounting epoch); null for pre-P3 snapshots",
+    )
+    reanchor_count: Optional[int] = Field(
+        default=None,
+        description="CLA-2A-07: the number of reanchor records in the journal; null for pre-P3 snapshots",
+    )
+    source_degraded: Optional[bool] = Field(
+        default=None,
+        description="CLA-007: whether the retiring instance's purse was flagged degraded "
+        "(purse_degraded/accounting_degraded) in its last observed status BEFORE the stop — "
+        "proves pre-existing degradation, not final shutdown health; null when unavailable "
+        "(never fabricated healthy)",
+    )
 
 
 class PurseSnapshotResponse(BaseModel):
@@ -195,9 +217,19 @@ class PurseTimeseriesResponse(BaseModel):
 
 
 class PurseHistoryEntry(BaseModel):
-    """One historical snapshot — derived metrics + provenance, NO raw records_json."""
+    """One historical snapshot — derived metrics + provenance, NO raw records_json.
+
+    Carries the ``incarnation_id`` (CDX-005/CLA-309) so a chart can tell unrelated
+    no-resume incarnations apart instead of drawing one continuous line across an
+    accounting reset. Derived from THIS row's own journal via P1's derivation.
+    """
     derived: PurseDerivedMetrics
     provenance: PurseProvenance
+    incarnation_id: str = Field(
+        description="stable inception-lineage id for this snapshot's journal (P1's "
+        "derivation); identical across re-harvest/resume of one lineage, changed by a "
+        "no-resume fresh seed"
+    )
 
 
 class PurseHistoryResponse(BaseModel):
