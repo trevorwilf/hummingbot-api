@@ -42,6 +42,7 @@ exactly as the engine applies its single passed-in ``ref`` — so a reference th
 moved across epochs is NOT retro-applied per epoch (that would diverge from the
 engine).
 """
+import hashlib
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import List, Optional
@@ -306,4 +307,156 @@ def compute_derived_metrics(payload: dict) -> DerivedPurseMetrics:
         owned_base=owned_base,
         opening_basis_quality=state.opening_basis_quality,
         owned_ambiguous=state.owned_ambiguous,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activity read-model (hbdash_api P1) — booked-fill-event count + since-inception
+# rate + incarnation lineage id. DERIVED and NON-AUTHORITATIVE, single-sourced with
+# the record walk above (CLA-2A-01, CDX-007/CLA-2A-02).
+# ---------------------------------------------------------------------------
+
+# A calendar week in seconds (7 * 24 * 3600). The since-inception rate's denominator
+# is calendar weeks from the first opening_epoch to the last activity — WITH stopped
+# weeks included (an explicit operator choice, HBDASH_FINDINGS §3 open-decision #2).
+SECONDS_PER_WEEK = Decimal("604800")
+
+
+def derive_incarnation_id(
+    controller_id, records: List[dict], source_bot_run_id: Optional[int] = None
+) -> str:
+    """Stable inception-lineage id for a purse journal (CDX-005 / CLA-309).
+
+    The identity of a journal's ACCOUNTING LINEAGE is the epoch_id of its FIRST
+    ``opening_epoch`` — the inception epoch. The engine mints that epoch_id once, at
+    the fresh-seed that opened the journal, and carries it forward VERBATIM through
+    every copy-forward resume. So a hash of ``(controller_id, inception_epoch_id)``:
+
+      * is STABLE across a re-harvest of the same journal (same inception epoch),
+      * is STABLE across a copy-forward RESUME (the resume keeps the inception epoch —
+        this is exactly why HBDASH_FINDINGS rejects ``source_instance_name`` /
+        ``source_bot_run_id`` as lineage detectors: both CHANGE on a resume, which
+        would wrongly split one continuous lineage), and
+      * CHANGES the instant a NO-RESUME fresh seed opens a NEW ``opening_epoch`` (a new
+        epoch_id → a new id), so two unrelated incarnations never share an id.
+
+    ``source_bot_run_id`` is therefore deliberately NOT folded into the id when an
+    inception epoch is present; it is used only as a last-resort lineage hint for the
+    (envelope-impossible) degenerate case of a journal with no resolvable opening
+    epoch_id, honoring "combined with source_bot_run_id when available" without
+    breaking the stability the finding requires. The controller_id is included so two
+    controllers that happen to reuse an epoch_id string never collide.
+
+    Returns ``"inc_" + <16 hex>`` — a 64-bit prefix of the sha256 of the tagged basis
+    (tagged so an ``epoch``-basis id can never coincide with a ``run``/``anon`` one).
+    Never raises: every field is read defensively.
+    """
+    inception_epoch_id: Optional[str] = None
+    for record in records:
+        if isinstance(record, dict) and record.get("kind") == "opening_epoch":
+            candidate = record.get("epoch_id")
+            if isinstance(candidate, str) and candidate:
+                inception_epoch_id = candidate
+            break  # only the FIRST opening_epoch is the inception epoch
+    cid = controller_id if isinstance(controller_id, str) and controller_id else "?"
+    if inception_epoch_id is not None:
+        basis = f"epoch\x00{cid}\x00{inception_epoch_id}"
+    elif source_bot_run_id is not None:
+        basis = f"run\x00{cid}\x00{source_bot_run_id}"
+    else:
+        basis = f"anon\x00{cid}"
+    return "inc_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class PurseActivity:
+    """Derived per-controller ACTIVITY metrics (hbdash_api P1).
+
+    HONEST LABELING (safety invariant 6): ``booked_fill_events`` counts BOOKED FILL
+    EVENTS — one per executor per accounting cycle with any positive base/quote/fee
+    delta (fee-only INCLUDED) — NOT exchange trades. The rate's denominator is
+    calendar weeks since inception (stopped weeks included); the caller stringifies the
+    Decimals and stamps the ``metric_note``.
+
+    Attributes:
+        booked_fill_events: sum of ``fills_seen`` over every ``fills_rollup`` record.
+        first_journal_ts: the first ``opening_epoch``'s ``ts`` (journal/accounting
+            time), or None when absent.
+        last_journal_ts: max ``last_update_ts`` over ``fills_rollup`` records, falling
+            back to the newest record's ``ts``; None when absent.
+        weeks_since_inception: calendar weeks (first→last) as an exact Decimal; 0 when
+            the span is zero or undefined.
+        booked_fills_per_week: ``booked_fill_events / weeks_since_inception``, or None
+            when the span is zero/undefined (never a divide-by-zero, never a bare 0).
+        incarnation_id: the lineage id from :func:`derive_incarnation_id`.
+    """
+
+    booked_fill_events: int
+    first_journal_ts: Optional[float]
+    last_journal_ts: Optional[float]
+    weeks_since_inception: Decimal
+    booked_fills_per_week: Optional[Decimal]
+    incarnation_id: str
+
+
+def compute_activity(payload: dict, *, source_bot_run_id: Optional[int] = None) -> PurseActivity:
+    """Compute activity metrics for a VALIDATED purse journal payload (hbdash_api P1).
+
+    Single-sourced with :func:`compute_derived_metrics`: the SAME per-record walk,
+    reading only fields the P2 envelope contract already pinned. Defensive by design —
+    it NEVER raises (invariant 1/6): a malformed ``fills_seen`` (missing/non-int/
+    negative/bool) is SKIPPED, not summed and not fatal, so a single bad rollup can
+    never poison the count or crash a report.
+
+    ``source_bot_run_id`` is passed through to :func:`derive_incarnation_id` only as
+    the documented last-resort lineage hint; for a valid journal the inception
+    ``opening_epoch`` supplies the id and the run id is ignored (see that function).
+    """
+    records = payload.get("records") or []
+    controller_id = payload.get("controller_id")
+
+    booked_fill_events = 0
+    first_journal_ts: Optional[float] = None
+    rollup_last_ts: List[float] = []
+    newest_record_ts: Optional[float] = None
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        ts = record.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            newest_record_ts = float(ts)  # records walk in seq order — last valid wins
+        if kind == "opening_epoch":
+            if first_journal_ts is None and isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                first_journal_ts = float(ts)
+        elif kind == "fills_rollup":
+            fills_seen = record.get("fills_seen")
+            # Mirror the envelope's own fills_seen gate (purse_envelope_contract:342):
+            # a non-negative int, NEVER a bool. Anything else is skipped, not summed.
+            if isinstance(fills_seen, int) and not isinstance(fills_seen, bool) and fills_seen >= 0:
+                booked_fill_events += fills_seen
+            last_update_ts = record.get("last_update_ts")
+            if isinstance(last_update_ts, (int, float)) and not isinstance(last_update_ts, bool):
+                rollup_last_ts.append(float(last_update_ts))
+
+    last_journal_ts = max(rollup_last_ts) if rollup_last_ts else newest_record_ts
+
+    weeks_since_inception = Decimal("0")
+    booked_fills_per_week: Optional[Decimal] = None
+    if first_journal_ts is not None and last_journal_ts is not None:
+        span_seconds = Decimal(str(last_journal_ts)) - Decimal(str(first_journal_ts))
+        if span_seconds > 0:
+            weeks_since_inception = span_seconds / SECONDS_PER_WEEK
+            booked_fills_per_week = Decimal(booked_fill_events) / weeks_since_inception
+        # span <= 0 (zero/undefined) → weeks stays 0 and the rate stays None: a rate is
+        # null (not a bare 0) when the denominator is undefined, never a divide-by-zero.
+
+    return PurseActivity(
+        booked_fill_events=booked_fill_events,
+        first_journal_ts=first_journal_ts,
+        last_journal_ts=last_journal_ts,
+        weeks_since_inception=weeks_since_inception,
+        booked_fills_per_week=booked_fills_per_week,
+        incarnation_id=derive_incarnation_id(controller_id, records, source_bot_run_id),
     )

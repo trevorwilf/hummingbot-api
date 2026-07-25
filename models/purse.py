@@ -69,6 +69,61 @@ class PurseSnapshotResponse(BaseModel):
     authority_note: str = Field(default=AUTHORITY_NOTE)
 
 
+# The honest-labeling disclaimer stamped on every activity response (safety invariant
+# 6, CDX-007 / CLA-2A-02). ``booked_fill_events`` are BOOKING events, not exchange
+# trades; the rate carries its denominator definition so a panel cannot silently
+# re-present it as "trades per week".
+ACTIVITY_METRIC_NOTE = (
+    "booked_fill_events counts booked fill events, not exchange trades — one booking "
+    "per executor per accounting cycle with any positive base/quote/fee delta (fee-only "
+    "INCLUDED); it is NOT a count of exchange fills or trades. "
+    "booked_fills_per_week_since_inception = booked_fill_events / calendar weeks from the "
+    "first opening_epoch ts to the last activity ts (a week = 604800 s; weeks the bot was "
+    "stopped are INCLUDED in the denominator); it is null when that span is zero or "
+    "undefined (never a divide-by-zero)."
+)
+
+
+class PurseActivityResponse(BaseModel):
+    """Derived per-controller ACTIVITY over the harvested journal (hbdash_api P1).
+
+    Reuses :class:`PurseProvenance` + :data:`AUTHORITY_NOTE`; carries a required
+    :data:`ACTIVITY_METRIC_NOTE` and, per safety invariant 6, names NO field
+    ``trades`` / ``trade_count``. Rates are decimal strings; the per-week rate is
+    ``null`` (not 0) when the span is zero/undefined.
+    """
+    controller_id: str
+    booked_fill_events: int = Field(
+        description="count of BOOKED FILL EVENTS (not exchange trades), summed over "
+        "every fills_rollup record's fills_seen"
+    )
+    first_journal_ts: Optional[float] = Field(
+        default=None,
+        description="the first opening_epoch's ts (journal/accounting epoch seconds), or null",
+    )
+    last_journal_ts: Optional[float] = Field(
+        default=None,
+        description="max fills_rollup last_update_ts (else the newest record's ts), "
+        "epoch seconds, or null",
+    )
+    weeks_since_inception: str = Field(
+        description="calendar weeks first→last activity (decimal string; a week = 604800 s; "
+        "stopped weeks included). '0' when the span is zero/undefined"
+    )
+    booked_fills_per_week_since_inception: Optional[str] = Field(
+        default=None,
+        description="booked_fill_events / weeks_since_inception (decimal string); null "
+        "when the span is zero/undefined (never a divide-by-zero, never a bare 0)",
+    )
+    incarnation_id: str = Field(
+        description="stable inception-lineage id (derived from the first opening_epoch); "
+        "identical across re-harvest/resume of one lineage, changed by a no-resume fresh seed"
+    )
+    provenance: PurseProvenance
+    authority_note: str = Field(default=AUTHORITY_NOTE)
+    metric_note: str = Field(default=ACTIVITY_METRIC_NOTE)
+
+
 class PurseHistoryEntry(BaseModel):
     """One historical snapshot — derived metrics + provenance, NO raw records_json."""
     derived: PurseDerivedMetrics
