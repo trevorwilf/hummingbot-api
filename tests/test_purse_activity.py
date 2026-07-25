@@ -112,6 +112,43 @@ async def insert_journal(db, payload, *, source_instance_name="inst1", source_bo
         )
 
 
+async def insert_journal_under(db, db_controller_id, payload, *,
+                               source_instance_name="inst1", source_bot_run_id=None):
+    """Insert a snapshot INDEXED under ``db_controller_id`` whose stored ``records_json``
+    may carry a DIFFERENT internal ``controller_id`` — the one lever ``insert_journal``
+    cannot pull (it indexes by ``payload["controller_id"]``). Used to prove the route
+    re-validates the STORED envelope against the URL id and refuses a mismatch (CDX-R05)."""
+    body = json.dumps(payload)
+    sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    async with db.get_session_context() as session:
+        return await PurseSnapshotRepository(session).insert_snapshot_if_absent(
+            controller_id=db_controller_id,
+            source_instance_name=source_instance_name,
+            source_bot_run_id=source_bot_run_id,
+            purse_sha256=sha,
+            sequence=payload["sequence"],
+            records_json=body,
+            derived_contributed="0", derived_withdrawn="0", derived_earned_realized="0",
+            derived_earned_total="0", derived_unrealized="0", derived_drift="0",
+            reference_price_used="0", opening_basis_quality=None,
+        )
+
+
+async def insert_raw_journal(db, db_controller_id, records_json, *, sequence=1):
+    """Insert a snapshot with ARBITRARY ``records_json`` bytes (possibly unparseable JSON) —
+    to exercise the route's parse-error branch (routers/purse.py:108-114) for CDX-R05."""
+    sha = hashlib.sha256(records_json.encode("utf-8")).hexdigest()
+    async with db.get_session_context() as session:
+        return await PurseSnapshotRepository(session).insert_snapshot_if_absent(
+            controller_id=db_controller_id,
+            source_instance_name="inst1", source_bot_run_id=None,
+            purse_sha256=sha, sequence=sequence, records_json=records_json,
+            derived_contributed="0", derived_withdrawn="0", derived_earned_realized="0",
+            derived_earned_total="0", derived_unrealized="0", derived_drift="0",
+            reference_price_used="0", opening_basis_quality=None,
+        )
+
+
 # ===========================================================================
 # 1. compute_activity — booked count, since-inception rate (hand-computed)
 # ===========================================================================
@@ -125,23 +162,60 @@ class TestBookedFillEvents:
         assert activity.booked_fill_events != 3   # not just the first rollup
 
     def test_malformed_fills_seen_is_skipped_never_summed_never_raises(self):
-        """Safety invariant 6: a malformed ``fills_seen`` (negative / bool / missing) is
-        SKIPPED, not summed and not fatal. Only the one valid rollup (5) counts."""
-        bad_neg = fills_rollup_record(seq=3, ts=T0 + 200, epoch_id="epoch-alpha",
-                                      fills_seen=-1, last_update_ts=T0 + 200)
-        bad_bool = fills_rollup_record(seq=4, ts=T0 + 300, epoch_id="epoch-alpha",
-                                       fills_seen=True, last_update_ts=T0 + 300)
-        missing = fills_rollup_record(seq=5, ts=T0 + 400, epoch_id="epoch-alpha",
-                                      last_update_ts=T0 + 400)
+        """Safety invariant 6: EVERY malformed ``fills_seen`` kind is SKIPPED — not summed,
+        not fatal. Each bad value is exercised IN ISOLATION against a single valid rollup
+        (fills_seen=5), so no two errors can cancel to a passing total (CDX-R01): a summed
+        negative would drop the count to 4, a summed bool would raise it to 6, and a summed
+        non-int would raise or inflate — every case is pinned by the invariant total of 5,
+        the exact count only a correct type/range gate produces."""
+        BASELINE = 5
+        # value -> what a BROKEN gate would do to the count if it let this value through.
+        malformed = {
+            "negative_int": -1,      # summed → 4   (a negative int passes an int-only gate)
+            "boolean_true": True,    # summed → 6   (bool is an int subclass; True == 1)
+            "numeric_string": "5",   # summed → TypeError, or 10 if coerced
+            "float": 2.5,            # summed → 7.5 / TypeError (fills are integer events)
+        }
+        for label, bad in malformed.items():
+            records = [
+                opening_epoch_record(seq=1, ts=T0, epoch_id="epoch-alpha"),
+                fills_rollup_record(seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
+                                    fills_seen=BASELINE, last_update_ts=T0 + 100),
+                fills_rollup_record(seq=3, ts=T0 + 200, epoch_id="epoch-alpha",
+                                    fills_seen=bad, last_update_ts=T0 + 200),
+            ]
+            activity = compute_activity(valid_purse_payload(records=records))  # must not raise
+            assert activity.booked_fill_events == BASELINE, f"{label} was not skipped"
+        # a MISSING fills_seen (key absent entirely) is likewise skipped, never fatal.
+        missing = fills_rollup_record(seq=3, ts=T0 + 200, epoch_id="epoch-alpha",
+                                      last_update_ts=T0 + 200)
         missing.pop("fills_seen")
         records = [
             opening_epoch_record(seq=1, ts=T0, epoch_id="epoch-alpha"),
             fills_rollup_record(seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
-                                fills_seen=5, last_update_ts=T0 + 100),
-            bad_neg, bad_bool, missing,
+                                fills_seen=BASELINE, last_update_ts=T0 + 100),
+            missing,
         ]
         activity = compute_activity(valid_purse_payload(records=records))  # must not raise
-        assert activity.booked_fill_events == 5
+        assert activity.booked_fill_events == BASELINE
+
+    def test_ignores_fills_seen_on_non_rollup_records(self):
+        """Only ``fills_rollup`` records contribute. A non-rollup record (here a checkpoint)
+        carrying a stray or forward-compat ``fills_seen`` MUST NOT be counted — the counter
+        keys off record KIND, never the mere presence of the field (CDX-R02). The envelope
+        contract permits extra fields on a checkpoint (purse_envelope_contract:366-367), so
+        this is a reachable valid journal. MUTATION GUARD: a 'sum any record whose fills_seen
+        is an int' impl would add the checkpoint's 99 → 109 ≠ 10."""
+        records = [
+            opening_epoch_record(seq=1, ts=T0, epoch_id="epoch-alpha"),
+            fills_rollup_record(seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
+                                fills_seen=3, last_update_ts=T0 + 1 * WEEK),
+            checkpoint_record(seq=3, ts=T0 + 150, epoch_id="epoch-alpha", fills_seen=99),
+            fills_rollup_record(seq=4, ts=T0 + 300, epoch_id="epoch-alpha",
+                                fills_seen=7, last_update_ts=T0 + 2 * WEEK),
+        ]
+        activity = compute_activity(valid_purse_payload(records=records))
+        assert activity.booked_fill_events == 10   # 3 + 7 only; the checkpoint's 99 ignored
 
 
 class TestSinceInceptionRate:
@@ -157,14 +231,36 @@ class TestSinceInceptionRate:
         assert activity.weeks_since_inception == expected_weeks
         assert activity.booked_fills_per_week == Decimal("10") / Decimal("2") == Decimal("5")
 
+    def test_last_ts_falls_back_to_newest_record_not_opening_when_no_rollups(self):
+        """With no rollups, ``last_journal_ts`` is the NEWEST record's ts — NOT the opening
+        ts. A journal of opening(T0) + a later checkpoint(T0+1wk) and no rollups: last is
+        the checkpoint's ts, the span is one real week, and the zero-event rate is a DEFINED
+        0 (span>0), not null. This is the discriminating fixture CDX-R03 requires — the
+        opening-only journal below cannot tell 'newest record' from 'opening' because they
+        coincide. MUTATION GUARD: falling the fallback back to ``first_journal_ts`` yields
+        last=T0, weeks=0, and a null rate — every assertion below then fails."""
+        records = [
+            opening_epoch_record(seq=1, ts=T0, epoch_id="epoch-alpha"),
+            checkpoint_record(seq=2, ts=T0 + 1 * WEEK, epoch_id="epoch-alpha"),
+        ]
+        activity = compute_activity(valid_purse_payload(records=records))
+        assert activity.booked_fill_events == 0
+        assert activity.first_journal_ts == T0
+        assert activity.last_journal_ts == T0 + 1 * WEEK        # newest record, not the opening
+        assert activity.weeks_since_inception == Decimal("1")
+        assert activity.booked_fills_per_week == Decimal("0")   # a DEFINED 0 (span>0), not null
+
     def test_no_rollups_gives_zero_events_and_null_rate(self):
-        """A journal with no rollups: 0 events, and — because inception==last (zero span)
-        — a NULL rate (not a bare 0, and never a divide-by-zero)."""
+        """The zero-span/null-rate boundary: an inception-ONLY journal (no rollups, no later
+        record) has first==last, so the span is 0 and the rate is NULL — not a bare 0 and
+        never a divide-by-zero. (last==T0 here is the sole record; the newest-vs-opening
+        fallback is discriminated in the test above, where the two timestamps diverge —
+        they coincide when there is only one record, so this fixture cannot prove it.)"""
         activity = compute_activity(opening_only_journal())
         assert activity.booked_fill_events == 0
         assert activity.booked_fills_per_week is None
         assert activity.weeks_since_inception == Decimal("0")
-        assert activity.last_journal_ts == T0                  # newest-record fallback
+        assert activity.last_journal_ts == T0                  # the sole (degenerate) record
 
     def test_zero_span_with_events_still_yields_null_rate_not_divide_by_zero(self):
         """Events present but first==last (all activity at one instant): the rate is
@@ -268,6 +364,8 @@ class TestActivityEndpoint:
 
         assert resp.controller_id == "ctrl_a"
         assert resp.booked_fill_events == 10
+        assert resp.first_journal_ts == T0                     # mapped through, not swapped/dropped
+        assert resp.last_journal_ts == T0 + 2 * WEEK           # (CDX-R04 — the API boundary, not just compute)
         assert Decimal(resp.weeks_since_inception) == Decimal("2")
         assert Decimal(resp.booked_fills_per_week_since_inception) == Decimal("5")
         assert resp.incarnation_id == _spec_incarnation_id("ctrl_a", "epoch-alpha")
@@ -289,6 +387,31 @@ class TestActivityEndpoint:
             await get_purse_activity("nobody", db_manager=db)
         assert exc.value.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_contract_invalid_stored_journal_is_500_not_cross_attributed(self, db):
+        """A row indexed under ctrl_a whose stored journal's OWN controller_id is ctrl_b is a
+        corrupt/tampered mirror. The route re-validates the stored envelope against the URL
+        id and returns 500 — it never silently attributes ctrl_b's booked events (or its
+        incarnation id) to ctrl_a (CDX-R05). MUTATION GUARD: dropping the
+        ``if not verdict.is_valid`` gate (routers/purse.py:124) would 200 with ctrl_b's data
+        under the ctrl_a label, so this raises HTTPException only on a route that re-checks."""
+        mismatched = multi_epoch_journal(controller_id="ctrl_b")   # internal id ≠ the URL id
+        await insert_journal_under(db, "ctrl_a", mismatched)
+        with pytest.raises(HTTPException) as exc:
+            await get_purse_activity("ctrl_a", db_manager=db)
+        assert exc.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stored_journal_is_500(self, db):
+        """A stored journal that is not valid JSON is a corrupt mirror → a clean 500, never
+        silently-empty derived numbers (CDX-R05, the parse-error branch routers/purse.py:108).
+        MUTATION GUARD: swallowing the parse error would 200 or 500-elsewhere; here the route
+        must surface a 500 on the unparseable bytes."""
+        await insert_raw_journal(db, "ctrl_a", "{ this is not valid json ")
+        with pytest.raises(HTTPException) as exc:
+            await get_purse_activity("ctrl_a", db_manager=db)
+        assert exc.value.status_code == 500
+
 
 class TestActivityEndpointASGI:
     @pytest.mark.asyncio
@@ -307,6 +430,8 @@ class TestActivityEndpointASGI:
         body = resp.json()
         assert body["controller_id"] == "ctrl_a"
         assert body["booked_fill_events"] == 10
+        assert body["first_journal_ts"] == T0                  # both timestamps survive serialization
+        assert body["last_journal_ts"] == T0 + 2 * WEEK        # (CDX-R04, through the ASGI stack)
         assert Decimal(body["booked_fills_per_week_since_inception"]) == Decimal("5")
         assert body["incarnation_id"] == _spec_incarnation_id("ctrl_a", "epoch-alpha")
         assert body["metric_note"] == ACTIVITY_METRIC_NOTE
