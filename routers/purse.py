@@ -7,6 +7,7 @@ detectors (sha256 + sequence + harvested_at) so a stale snapshot can never
 masquerade as the live journal (required change #9). The raw ``records_json`` is
 persisted for audit/recovery but is NOT exposed here — the surface is derived-only.
 """
+import json
 import logging
 from decimal import Decimal, InvalidOperation
 
@@ -16,12 +17,15 @@ from database import AsyncDatabaseManager, PurseSnapshotRepository
 from database.models import PurseSnapshot
 from deps import get_database_manager
 from models.purse import (
+    PurseActivityResponse,
     PurseDerivedMetrics,
     PurseHistoryEntry,
     PurseHistoryResponse,
     PurseProvenance,
     PurseSnapshotResponse,
 )
+from services.purse_envelope_contract import classify_purse_envelope
+from services.purse_read_model import compute_activity
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,63 @@ def _provenance(row: PurseSnapshot) -> PurseProvenance:
     )
 
 
+def _snapshot_not_found(controller_id: str) -> HTTPException:
+    """The shared 404 for a controller with no harvested snapshot.
+
+    One source of the 404 so every purse route (``get_purse`` and the derived
+    activity/timeseries siblings) reports it BYTE-IDENTICALLY and can never drift.
+    A derived surface reports only what it holds, never a fabricated zero.
+    """
+    return HTTPException(
+        status_code=404,
+        detail=(
+            f"No purse snapshot harvested for controller '{controller_id}'. Snapshots are "
+            f"harvested when a bot retires (its container has exited, before its data is "
+            f"archived); a controller that has never retired (or carries no purse journal) "
+            f"has none."
+        ),
+    )
+
+
+def _load_validated_journal(row: PurseSnapshot, controller_id: str) -> dict:
+    """Parse + re-validate the stored journal bytes before computing over them.
+
+    The bytes passed the P2 envelope at harvest (the harvest never stores an invalid
+    journal); re-validating here — with the URL ``controller_id`` as the canonical id
+    and the journal's OWN resolved ``controller_name``/``trading_pair`` — re-confirms
+    ``compute_*``'s structural preconditions (records[0] an opening_epoch, seq order,
+    per-kind money fields) still hold. A corrupted/tampered stored row is then a clean
+    500, not silently-wrong derived numbers. A legitimately harvested row always
+    re-validates (identical bytes, identical contract), so this never 500s a healthy
+    snapshot. ``records_json`` is consumed here and NEVER placed on the response.
+    """
+    try:
+        payload = json.loads(row.records_json)
+    except (ValueError, TypeError) as exc:
+        logger.error(
+            "purse read-model: stored journal for %r is unparseable JSON: %s", controller_id, exc
+        )
+        raise HTTPException(status_code=500, detail="stored purse journal is corrupt (unparseable)")
+    staged_config = {}
+    if isinstance(payload, dict):
+        staged_config = {
+            "controller_name": payload.get("controller_name"),
+            "trading_pair": payload.get("trading_pair"),
+        }
+    verdict = classify_purse_envelope(
+        payload, canonical_controller_id=controller_id, staged_config=staged_config
+    )
+    if not verdict.is_valid:
+        logger.error(
+            "purse read-model: stored journal for %r failed contract re-validation: %s",
+            controller_id, verdict.reason,
+        )
+        raise HTTPException(
+            status_code=500, detail="stored purse journal failed contract re-validation"
+        )
+    return payload
+
+
 @router.get("/{controller_id}", response_model=PurseSnapshotResponse)
 async def get_purse(
     controller_id: str,
@@ -84,15 +145,7 @@ async def get_purse(
     async with db_manager.get_session_context() as session:
         row = await PurseSnapshotRepository(session).get_latest_for_controller(controller_id)
     if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No purse snapshot harvested for controller '{controller_id}'. Snapshots are "
-                f"harvested when a bot retires (its container has exited, before its data is "
-                f"archived); a controller that has never retired (or carries no purse journal) "
-                f"has none."
-            ),
-        )
+        raise _snapshot_not_found(controller_id)
     return PurseSnapshotResponse(
         controller_id=controller_id,
         derived=_derived(row),
@@ -122,4 +175,40 @@ async def get_purse_history(
         snapshots=[
             PurseHistoryEntry(derived=_derived(row), provenance=_provenance(row)) for row in rows
         ],
+    )
+
+
+@router.get("/{controller_id}/activity", response_model=PurseActivityResponse)
+async def get_purse_activity(
+    controller_id: str,
+    db_manager: AsyncDatabaseManager = Depends(get_database_manager),
+):
+    """Booked-fill-event activity for a controller, from its newest harvested snapshot.
+
+    Same newest-snapshot fetch + 404 as :func:`get_purse` (via the shared sources).
+    Parses the harvested journal, re-validates the P2 envelope, then returns the P1
+    activity read-model: ``booked_fill_events`` (BOOKED FILL EVENTS, not exchange
+    trades — see ``metric_note``, safety invariant 6), the since-inception per-week
+    rate (with its denominator defined), and the ``incarnation_id`` lineage key. The
+    raw ``records_json`` is consumed to compute and NEVER placed on the response.
+    """
+    async with db_manager.get_session_context() as session:
+        row = await PurseSnapshotRepository(session).get_latest_for_controller(controller_id)
+    if row is None:
+        raise _snapshot_not_found(controller_id)
+    payload = _load_validated_journal(row, controller_id)
+    activity = compute_activity(payload, source_bot_run_id=row.source_bot_run_id)
+    return PurseActivityResponse(
+        controller_id=controller_id,
+        booked_fill_events=activity.booked_fill_events,
+        first_journal_ts=activity.first_journal_ts,
+        last_journal_ts=activity.last_journal_ts,
+        weeks_since_inception=str(activity.weeks_since_inception),
+        booked_fills_per_week_since_inception=(
+            str(activity.booked_fills_per_week)
+            if activity.booked_fills_per_week is not None
+            else None
+        ),
+        incarnation_id=activity.incarnation_id,
+        provenance=_provenance(row),
     )
