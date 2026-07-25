@@ -460,3 +460,188 @@ def compute_activity(payload: dict, *, source_bot_run_id: Optional[int] = None) 
         booked_fills_per_week=booked_fills_per_week,
         incarnation_id=derive_incarnation_id(controller_id, records, source_bot_run_id),
     )
+
+
+# ---------------------------------------------------------------------------
+# Timeseries read-model (hbdash_api P2) — the authoritative journal-time
+# checkpoint/epoch series (equity/contributed/earned), incarnation-segmented.
+# DERIVED and NON-AUTHORITATIVE, single-sourced with the SAME seq-ordered record
+# walk and accumulator logic as compute_derived_metrics (CLA-2A-05, CLA-M02).
+# ---------------------------------------------------------------------------
+
+# The boundary kinds a point can carry (HBDASH_FINDINGS §3 — the recommended design's
+# "segment by incarnation_id / boundary"). A checkpoint is an in-epoch series sample
+# and carries no boundary (None); the three RE-BASELINE events each carry one so a
+# chart can mark the reset instead of drawing one continuous line across it:
+#   * "opening"  — an opening_epoch (inception, or a later post-quarantine opening)
+#   * "reseed"   — a reseed_epoch (owned re-anchored to new_owned_*)
+#   * "reanchor" — a reanchor (an owned cut / drift surfacing)
+BOUNDARY_OPENING = "opening"
+BOUNDARY_RESEED = "reseed"
+BOUNDARY_REANCHOR = "reanchor"
+
+
+@dataclass(frozen=True)
+class TimeseriesPoint:
+    """One authoritative journal-time point in a purse's equity/flows series (P2).
+
+    Emitted while walking the journal in ``seq`` order at every ``checkpoint`` (an
+    in-epoch sample) and every ``opening_epoch``/``reseed_epoch``/``reanchor`` (a
+    re-baseline, flagged via :attr:`boundary`). ``flow`` and ``fills_rollup`` records
+    update the running accumulators but do NOT themselves emit a point.
+
+    The running money metrics are computed with the SAME formulas as
+    :func:`compute_derived_metrics` over the journal PREFIX up to and including this
+    record, valued at the reference price CURRENT at this point (the newest
+    checkpoint/epoch ``reference_price`` seen so far — a ``reanchor`` carries none, so
+    it inherits the prior one). Because every ``reference_price``-bearing record emits
+    a point, the LAST point's ``reference_price``/owned equal
+    :func:`resolve_current_state`'s final values, so the final point RECONCILES with
+    :func:`compute_derived_metrics` for the same journal (the P2 cross-check).
+
+    Attributes:
+        ts: the RECORD's ``ts`` = journal/accounting time (epoch seconds), NOT the
+            DB ``harvested_at`` — this is the CLA-M02 fix. ``None`` only for the
+            envelope-impossible non-numeric ts.
+        seq: the record's ``seq`` (the series is emitted in strictly-increasing seq
+            order); ``None`` for the envelope-impossible non-int seq.
+        epoch_id: the record's ``epoch_id`` (``None`` when the record carries none).
+        incarnation_id: the journal's inception-lineage id (:func:`derive_incarnation_id`),
+            IDENTICAL on every point of one journal — a reseed re-baselines but does
+            NOT open a new incarnation; only a separate no-resume fresh seed does.
+        boundary: one of :data:`BOUNDARY_OPENING`/:data:`BOUNDARY_RESEED`/
+            :data:`BOUNDARY_REANCHOR`, or ``None`` for a checkpoint sample.
+        owned_quote / owned_base: the current on-disk owned at this point (a ``drift``
+            reanchor leaves owned unchanged, mirroring :func:`resolve_current_state`).
+        reference_price: the reference price current at this point.
+        equity_quote / contributed / withdrawn / earned_total / earned_realized: the
+            contract-v1 running metrics at this point (exact ``Decimal``; the caller
+            stringifies for transport).
+    """
+
+    ts: Optional[float]
+    seq: Optional[int]
+    epoch_id: Optional[str]
+    incarnation_id: str
+    boundary: Optional[str]
+    owned_quote: Decimal
+    owned_base: Decimal
+    reference_price: Decimal
+    equity_quote: Decimal
+    contributed: Decimal
+    withdrawn: Decimal
+    earned_total: Decimal
+    earned_realized: Decimal
+
+
+def compute_timeseries(
+    payload: dict, *, source_bot_run_id: Optional[int] = None
+) -> List[TimeseriesPoint]:
+    """Build the journal-time checkpoint/epoch series for a VALIDATED payload (P2).
+
+    Single-sourced with :func:`compute_derived_metrics`: the SAME per-record walk in
+    ``seq`` order, the SAME ``_dec`` money parser, the SAME accumulator semantics
+    (``contributed`` = opening ``contributed_opening_quote`` + deposit valuations;
+    ``withdrawn`` = withdrawal valuations; ``earned_opening`` from opening records;
+    the signed ``quote_delta_cum``/``base_delta_cum`` summed across ALL epochs — a
+    reseed does NOT reset them, matching ``compute_derived_metrics``; owned/ref moved
+    exactly as :func:`resolve_current_state` moves them). It emits a point at each
+    ``checkpoint``/``opening_epoch``/``reseed_epoch``/``reanchor`` so the series
+    starts, re-baselines and owned cuts are all visible; the two computations agree at
+    the final point by construction.
+
+    ``payload`` MUST have passed
+    :func:`services.purse_envelope_contract.classify_purse_envelope` (the route
+    re-validates before calling); like ``compute_derived_metrics`` this trusts that
+    guarantee and reads pinned fields directly, so an UN-validated payload raises
+    (a corrupt stored row becomes a clean 500, never silently-wrong points).
+
+    ``source_bot_run_id`` is threaded to :func:`derive_incarnation_id` only as the
+    documented last-resort lineage hint; a valid journal's inception ``opening_epoch``
+    supplies the id and the run id is ignored (see that function).
+    """
+    records = payload["records"]
+    incarnation_id = derive_incarnation_id(
+        payload.get("controller_id"), records, source_bot_run_id
+    )
+
+    zero = Decimal("0")
+    contributed = zero
+    withdrawn = zero
+    earned_opening = zero
+    quote_delta_sum = zero
+    base_delta_sum = zero
+    owned_quote = zero
+    owned_base = zero
+    ref = zero
+
+    points: List[TimeseriesPoint] = []
+    for record in records:
+        kind = record.get("kind")
+        boundary: Optional[str] = None
+        emit = False
+        if kind == "opening_epoch":
+            contributed += _dec(record["contributed_opening_quote"], "contributed_opening_quote")
+            earned_opening += _dec(record["earned_opening_quote"], "earned_opening_quote")
+            owned_quote = _dec(record["owned_quote"], "owned_quote")
+            owned_base = _dec(record["owned_base"], "owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            boundary = BOUNDARY_OPENING
+            emit = True
+        elif kind == "flow":
+            valuation = _dec(record["quote_valuation"], "quote_valuation")
+            if record.get("flow_kind") == "deposit":
+                contributed += valuation
+            else:
+                withdrawn += valuation
+        elif kind == "fills_rollup":
+            quote_delta_sum += _dec(record["quote_delta_cum"], "quote_delta_cum")
+            base_delta_sum += _dec(record["base_delta_cum"], "base_delta_cum")
+        elif kind == "reseed_epoch":
+            owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
+            owned_base = _dec(record["new_owned_base"], "new_owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            boundary = BOUNDARY_RESEED
+            emit = True
+        elif kind == "reanchor":
+            # A reanchor carries no reference_price — ref unchanged. An
+            # ``undeclared_outflow`` is a committed owned cut (new_owned_* IS the true
+            # owned); a ``drift`` reanchor is the indistinguishable observation case,
+            # so owned is left UNCHANGED — the SAME safe default resolve_current_state
+            # applies (CDX-R03). Either way it is a re-baseline worth a marker.
+            if record.get("classification") == "undeclared_outflow":
+                owned_quote = _dec(record["new_owned_quote"], "new_owned_quote")
+                owned_base = _dec(record["new_owned_base"], "new_owned_base")
+            boundary = BOUNDARY_REANCHOR
+            emit = True
+        elif kind == "checkpoint":
+            owned_quote = _dec(record["owned_quote"], "owned_quote")
+            owned_base = _dec(record["owned_base"], "owned_base")
+            ref = _dec(record["reference_price"], "reference_price")
+            emit = True
+        if not emit:
+            continue
+        equity = owned_quote + owned_base * ref
+        earned_realized = earned_opening + quote_delta_sum + base_delta_sum * ref
+        earned_total = equity - contributed + withdrawn
+        ts = record.get("ts")
+        seq = record.get("seq")
+        epoch_id = record.get("epoch_id")
+        points.append(
+            TimeseriesPoint(
+                ts=float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None,
+                seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else None,
+                epoch_id=epoch_id if isinstance(epoch_id, str) and epoch_id else None,
+                incarnation_id=incarnation_id,
+                boundary=boundary,
+                owned_quote=owned_quote,
+                owned_base=owned_base,
+                reference_price=ref,
+                equity_quote=equity,
+                contributed=contributed,
+                withdrawn=withdrawn,
+                earned_total=earned_total,
+                earned_realized=earned_realized,
+            )
+        )
+    return points

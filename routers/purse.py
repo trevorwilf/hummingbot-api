@@ -23,9 +23,11 @@ from models.purse import (
     PurseHistoryResponse,
     PurseProvenance,
     PurseSnapshotResponse,
+    PurseTimeseriesPoint,
+    PurseTimeseriesResponse,
 )
 from services.purse_envelope_contract import classify_purse_envelope
-from services.purse_read_model import compute_activity
+from services.purse_read_model import compute_activity, compute_timeseries
 
 logger = logging.getLogger(__name__)
 
@@ -210,5 +212,51 @@ async def get_purse_activity(
             else None
         ),
         incarnation_id=activity.incarnation_id,
+        provenance=_provenance(row),
+    )
+
+
+@router.get("/{controller_id}/timeseries", response_model=PurseTimeseriesResponse)
+async def get_purse_timeseries(
+    controller_id: str,
+    db_manager: AsyncDatabaseManager = Depends(get_database_manager),
+):
+    """Authoritative journal-time equity/flows series for a controller (hbdash_api P2).
+
+    Same newest-snapshot fetch + 404 as :func:`get_purse` (via the shared sources).
+    Parses the harvested journal, re-validates the P2 envelope, then returns the P2
+    timeseries read-model: one point at each checkpoint (an in-epoch sample) and each
+    opening_epoch/reseed_epoch/reanchor (a re-baseline, flagged via ``boundary``), in
+    journal-time (each point's ``ts`` is the record's own accounting time, NOT
+    ``harvested_at`` — the CLA-M02 fix), segmentable by ``incarnation_id``/``boundary``
+    (CLA-2A-05). Money is decimal strings; the ``note`` states it is a harvested
+    snapshot, not a live tail. The raw ``records_json`` is consumed and NEVER exposed.
+    """
+    async with db_manager.get_session_context() as session:
+        row = await PurseSnapshotRepository(session).get_latest_for_controller(controller_id)
+    if row is None:
+        raise _snapshot_not_found(controller_id)
+    payload = _load_validated_journal(row, controller_id)
+    points = compute_timeseries(payload, source_bot_run_id=row.source_bot_run_id)
+    return PurseTimeseriesResponse(
+        controller_id=controller_id,
+        points=[
+            PurseTimeseriesPoint(
+                ts=p.ts,
+                seq=p.seq,
+                epoch_id=p.epoch_id,
+                incarnation_id=p.incarnation_id,
+                boundary=p.boundary,
+                owned_quote=str(p.owned_quote),
+                owned_base=str(p.owned_base),
+                reference_price=str(p.reference_price),
+                equity_quote=str(p.equity_quote),
+                contributed=str(p.contributed),
+                withdrawn=str(p.withdrawn),
+                earned_total=str(p.earned_total),
+                earned_realized=str(p.earned_realized),
+            )
+            for p in points
+        ],
         provenance=_provenance(row),
     )
