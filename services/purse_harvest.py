@@ -39,7 +39,7 @@ from typing import List, Optional
 from database.repositories.bot_run_repository import BotRunRepository
 from database.repositories.purse_snapshot_repository import PurseSnapshotRepository
 from services.purse_envelope_contract import classify_purse_envelope
-from services.purse_read_model import compute_derived_metrics
+from services.purse_read_model import compute_derived_metrics, compute_harvest_markers
 from services.resume_service import (
     RANGE_LADDER_CONTROLLER_NAME,
     StateFileStatus,
@@ -65,6 +65,57 @@ async def _resolve_source_run_id(db_manager, bot_name: Optional[str]) -> Optiona
             return run.id if run else None
     except Exception as exc:  # observation-only
         logger.warning("purse harvest: could not resolve source bot_run id for %s: %s", bot_name, exc)
+        return None
+
+
+def _extract_source_degraded(
+    final_status, controller_id_raw, canonical_id: str
+) -> Optional[bool]:
+    """Best-effort per-controller purse-degraded flag from the retirement ``final_status``
+    (CLA-007). OBSERVATION-ONLY and TOTALLY DEFENSIVE — it NEVER raises (invariant 5).
+
+    ``final_status`` is the orchestrator's ``get_bot_status(...)`` captured BEFORE the stop
+    command, so its ``performance`` maps ``controller_id -> {custom_info: {purse:
+    {purse_degraded | accounting_degraded: bool}}}`` (bots_orchestrator.determine_controller_performance).
+    Because it is captured pre-stop it proves PRE-EXISTING degradation, not final shutdown
+    health (HBDASH_FINDINGS §6 CLA-007) — the caller stores it under the honestly-named
+    ``source_degraded`` column with that documented meaning.
+
+    Returns:
+        ``True``  when a degraded flag was observed True;
+        ``False`` when a degraded flag was present but False (a clean pre-stop status);
+        ``None``  when unavailable / not a boolean — NEVER fabricated healthy from absence.
+    """
+    try:
+        if not isinstance(final_status, dict):
+            return None
+        performance = final_status.get("performance")
+        if not isinstance(performance, dict):
+            return None
+        entry = None
+        for key in (canonical_id, controller_id_raw):
+            if key is not None and key in performance:
+                entry = performance.get(key)
+                break
+        if not isinstance(entry, dict):
+            return None
+        custom_info = entry.get("custom_info")
+        if not isinstance(custom_info, dict):
+            return None
+        purse = custom_info.get("purse")
+        if not isinstance(purse, dict):
+            return None
+        saw_bool = False
+        for flag in ("purse_degraded", "accounting_degraded"):
+            value = purse.get(flag)
+            if isinstance(value, bool):
+                saw_bool = True
+                if value:
+                    return True
+        # A degraded flag was present but not True -> a clean pre-stop status (False).
+        # No boolean flag at all -> unknowable, never fabricate healthy (None).
+        return False if saw_bool else None
+    except Exception:  # observation-only: a hostile final_status is a None, never a raise
         return None
 
 
@@ -96,7 +147,8 @@ def _expected_purse_path(instance_path: Path, config: dict) -> Optional[Path]:
 
 async def _insert_snapshot(
     db_manager, *, controller_id, source_instance_name, source_bot_run_id, sha256,
-    sequence, records_json, metrics,
+    sequence, records_json, metrics, latest_epoch_id=None, reanchor_count=None,
+    source_degraded=None,
 ) -> Optional[dict]:
     """Idempotent insert of one snapshot in its OWN session. Returns the outcome dict."""
     async with db_manager.get_session_context() as session:
@@ -116,6 +168,9 @@ async def _insert_snapshot(
             derived_drift=str(metrics.drift),
             reference_price_used=str(metrics.reference_price_used),
             opening_basis_quality=metrics.opening_basis_quality,
+            latest_epoch_id=latest_epoch_id,
+            reanchor_count=reanchor_count,
+            source_degraded=source_degraded,
         )
     if row is None:
         return {"controller_id": controller_id, "decision": "skipped_duplicate", "sha256": sha256}
@@ -130,7 +185,7 @@ async def _insert_snapshot(
 
 async def _harvest_one_controller(
     config: dict, instance_path: Path, db_manager, source_instance_name: str,
-    source_bot_run_id: Optional[int],
+    source_bot_run_id: Optional[int], final_status=None,
 ) -> Optional[dict]:
     """Harvest one range-ladder controller's purse. Returns an outcome dict or None.
 
@@ -200,6 +255,22 @@ async def _harvest_one_controller(
     sha256 = hashlib.sha256(raw).hexdigest()
     sequence = payload["sequence"]  # validated: int == highest record seq
     records_json = raw.decode("utf-8")
+    # Additive harvest-honesty markers (hbdash_api P3). OBSERVATION-ONLY: computed inside
+    # a local guard so a marker/degraded failure yields nulls and NEVER costs us the
+    # snapshot (the snapshot itself must still be mirrored — invariant 5). Both helpers
+    # are already non-raising; this is the belt-and-braces around them.
+    try:
+        markers = compute_harvest_markers(payload)
+        latest_epoch_id = markers.latest_epoch_id
+        reanchor_count = markers.reanchor_count
+    except Exception as exc:  # pragma: no cover — helpers do not raise; defense in depth
+        logger.warning(
+            "purse harvest: epoch markers unavailable for controller %s (nulled, "
+            "snapshot still harvested): %s", canonical_id, exc,
+        )
+        latest_epoch_id = None
+        reanchor_count = None
+    source_degraded = _extract_source_degraded(final_status, controller_id_raw, canonical_id)
     return await _insert_snapshot(
         db_manager,
         controller_id=canonical_id,
@@ -209,11 +280,15 @@ async def _harvest_one_controller(
         sequence=sequence,
         records_json=records_json,
         metrics=metrics,
+        latest_epoch_id=latest_epoch_id,
+        reanchor_count=reanchor_count,
+        source_degraded=source_degraded,
     )
 
 
 async def harvest_instance_purses(
     instance_dir, *, db_manager, source_instance_name: str, bot_name: Optional[str] = None,
+    final_status=None,
 ) -> List[dict]:
     """Harvest every range-ladder controller's purse in ``instance_dir`` (observation-only).
 
@@ -229,6 +304,10 @@ async def harvest_instance_purses(
         db_manager: Provides ``get_session_context()`` (the house DB accessor).
         source_instance_name: Recorded as the snapshot's provenance.
         bot_name: Used only to resolve the best-effort ``source_bot_run_id`` lineage link.
+        final_status: The retirement's pre-stop ``get_bot_status`` snapshot (hbdash_api P3,
+            CLA-007). Read best-effort per controller for the ``source_degraded`` marker;
+            ``None`` (or any hostile shape) simply yields a null flag — it never blocks the
+            harvest or the retirement (invariant 5).
     """
     outcomes: List[dict] = []
     try:
@@ -240,6 +319,7 @@ async def harvest_instance_purses(
             try:
                 outcome = await _harvest_one_controller(
                     config, instance_path, db_manager, source_instance_name, source_bot_run_id,
+                    final_status,
                 )
                 if outcome is not None:
                     outcomes.append(outcome)

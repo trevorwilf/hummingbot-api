@@ -7,7 +7,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import docker
 
@@ -528,18 +528,38 @@ class BotsOrchestrator:
             logger.error(f"Error getting controller performance history: {e}")
             return [], None, False
 
+    async def get_latest_controller_performance_result(
+        self,
+        bot_name: Optional[str] = None
+    ) -> Tuple[List[Dict], bool]:
+        """Latest per-controller performance PLUS a degraded flag (CDX-009).
+
+        Returns ``(snapshots, degraded)``. ``degraded`` is True ONLY when the snapshot-
+        store read RAISED — the store is UNAVAILABLE, which a consumer (a dashboard panel)
+        must be able to tell apart from a genuinely EMPTY result (``([], False)``). Never
+        raises: a repository failure is reported as the flag, not an exception, so the HTTP
+        path can surface an additive marker and stay a 200 rather than collapse to a
+        breaking 5xx or an empty success indistinguishable from 'no data'."""
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ControllerPerformanceRepository(session)
+                return await repo.get_latest_performance(bot_name=bot_name), False
+        except Exception as e:
+            logger.error(f"Error getting latest controller performance: {e}")
+            return [], True
+
     async def get_latest_controller_performance(
         self,
         bot_name: Optional[str] = None
     ) -> List[Dict]:
-        """Get the most recent performance snapshot for each bot/controller."""
-        try:
-            async with self.db_manager.get_session_context() as session:
-                repo = ControllerPerformanceRepository(session)
-                return await repo.get_latest_performance(bot_name=bot_name)
-        except Exception as e:
-            logger.error(f"Error getting latest controller performance: {e}")
-            return []
+        """Get the most recent performance snapshot for each bot/controller.
+
+        Backward-compatible list view: delegates to
+        :meth:`get_latest_controller_performance_result` and drops the degraded flag, so
+        existing callers keep their ``List[Dict]`` contract (an empty list on failure).
+        The HTTP route uses the ``_result`` variant to surface CDX-009's degraded marker."""
+        data, _ = await self.get_latest_controller_performance_result(bot_name=bot_name)
+        return data
 
     # ============================================
     # Bot Run persistence
@@ -702,19 +722,25 @@ class BotsOrchestrator:
             logger.error(f"Failed to persist retirement evidence for {bot_name}: {e}")
 
     async def _harvest_purses(
-        self, instance_dir: str, source_instance_name: str, bot_name: str
+        self, instance_dir: str, source_instance_name: str, bot_name: str,
+        final_status: Optional[Dict] = None,
     ) -> List[dict]:
         """Harvest the instance's purse journal(s) into the derived read-model
         (hbpurseapi P3, required change #9). OBSERVATION-ONLY: this is wrapped so a
         harvest failure can NEVER block or fail the retirement — the delegate is
         already exception-safe, and this is a second belt around it. Returns the
-        per-controller outcomes for the evidence trail (empty on any failure)."""
+        per-controller outcomes for the evidence trail (empty on any failure).
+
+        ``final_status`` (the pre-stop bot status captured at Step 1) is passed through
+        for the hbdash_api P3 ``source_degraded`` marker (CLA-007); it is read best-effort
+        and never affects whether/what is harvested."""
         try:
             return await harvest_instance_purses(
                 instance_dir,
                 db_manager=self.db_manager,
                 source_instance_name=source_instance_name,
                 bot_name=bot_name,
+                final_status=final_status,
             )
         except Exception as e:
             logger.error(f"Purse harvest failed for {bot_name} (retirement unaffected): {e}")
@@ -1056,7 +1082,8 @@ class BotsOrchestrator:
             # harvest and the archive see the exact same directory.
             instance_dir = os.path.join('bots', 'instances', container_name)
             purse_outcomes = await self._harvest_purses(
-                instance_dir, source_instance_name=container_name, bot_name=bot_name
+                instance_dir, source_instance_name=container_name, bot_name=bot_name,
+                final_status=final_status,
             )
             if purse_outcomes:
                 evidence["purse_snapshots"] = purse_outcomes

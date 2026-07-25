@@ -27,7 +27,7 @@ from models.purse import (
     PurseTimeseriesResponse,
 )
 from services.purse_envelope_contract import classify_purse_envelope
-from services.purse_read_model import compute_activity, compute_timeseries
+from services.purse_read_model import compute_activity, compute_timeseries, derive_incarnation_id
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,33 @@ def _provenance(row: PurseSnapshot) -> PurseProvenance:
         source_bot_run_id=row.source_bot_run_id,
         purse_sha256=row.purse_sha256,
         sequence=row.sequence,
+        # hbdash_api P3 harvest-honesty markers (additive; null on pre-P3 rows).
+        latest_epoch_id=row.latest_epoch_id,
+        reanchor_count=row.reanchor_count,
+        source_degraded=row.source_degraded,
     )
+
+
+def _row_incarnation_id(row: PurseSnapshot) -> str:
+    """The inception-lineage id (CDX-005/CLA-309) for a history row, from its OWN stored
+    journal via P1's derivation (``derive_incarnation_id``). Defensive: a row whose
+    ``records_json`` is unparseable / recordless still yields a stable id (the derivation
+    falls back to the run-id / anon basis) and NEVER raises — the history list must not
+    500 on one odd row. ``records_json`` is consumed here and NEVER placed on the response."""
+    controller_id = row.controller_id
+    records = []
+    try:
+        payload = json.loads(row.records_json)
+        if isinstance(payload, dict):
+            recs = payload.get("records")
+            if isinstance(recs, list):
+                records = recs
+            journal_cid = payload.get("controller_id")
+            if isinstance(journal_cid, str) and journal_cid:
+                controller_id = journal_cid
+    except (ValueError, TypeError):
+        records = []
+    return derive_incarnation_id(controller_id, records, row.source_bot_run_id)
 
 
 def _snapshot_not_found(controller_id: str) -> HTTPException:
@@ -162,11 +188,16 @@ async def get_purse_history(
     offset: int = Query(0, ge=0),
     db_manager: AsyncDatabaseManager = Depends(get_database_manager),
 ):
-    """All harvested purse snapshots for a controller (newest first), derived-only.
+    """All harvested purse snapshots for a controller, LINEAGE-CORRECT order, derived-only.
 
-    Excludes ``records_json`` (the raw journal): the history is a metrics/provenance
-    time series, not a journal dump. An unknown controller yields an empty list, not
-    a 404 — "no history" is a valid, non-exceptional answer for a list resource.
+    Ordered by lineage chronology (``source_bot_run_id`` then ``harvested_at``), NOT by
+    the journal ``sequence`` (which resets across incarnations), so a late-archived stale
+    instance cannot masquerade as the newest incarnation (CDX-005/CLA-309). Each entry
+    carries an ``incarnation_id`` so unrelated no-resume incarnations are distinguishable.
+    Excludes ``records_json`` (the raw journal): the history is a metrics/provenance/lineage
+    time series, not a journal dump — the stored bytes are consumed only to derive the
+    ``incarnation_id`` and never placed on the response. An unknown controller yields an
+    empty list, not a 404 — "no history" is a valid, non-exceptional answer for a list.
     """
     async with db_manager.get_session_context() as session:
         rows = await PurseSnapshotRepository(session).get_history_for_controller(
@@ -175,7 +206,12 @@ async def get_purse_history(
     return PurseHistoryResponse(
         controller_id=controller_id,
         snapshots=[
-            PurseHistoryEntry(derived=_derived(row), provenance=_provenance(row)) for row in rows
+            PurseHistoryEntry(
+                derived=_derived(row),
+                provenance=_provenance(row),
+                incarnation_id=_row_incarnation_id(row),
+            )
+            for row in rows
         ],
     )
 

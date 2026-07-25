@@ -73,10 +73,22 @@ async def get_latest_controller_performance(
     """
     Get the most recent performance snapshot for each bot/controller.
     Optionally filter by bot_name.
+
+    CDX-009: on a snapshot-store read FAILURE this returns the normal success envelope
+    with an ADDITIVE ``degraded: true`` marker rather than an empty success a panel cannot
+    tell apart from 'no data' — and never a breaking 5xx. When there IS data (or the store
+    is healthy-but-empty) the response is byte-identical to before:
+    ``{"status": "success", "data": [...]}`` with NO ``degraded`` key.
     """
     try:
-        snapshots = await bots_manager.get_latest_controller_performance(bot_name=bot_name)
-        return {"status": "success", "data": snapshots}
+        snapshots, degraded = await bots_manager.get_latest_controller_performance_result(
+            bot_name=bot_name
+        )
+        response = {"status": "success", "data": snapshots}
+        if degraded:
+            # Additive, failure-path-only: distinguishes an unavailable store from empty.
+            response["degraded"] = True
+        return response
     except Exception as e:
         logger.error(f"Failed to get latest controller performance: {e}")
         raise HTTPException(status_code=500, detail=str(e))
