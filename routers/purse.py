@@ -221,16 +221,20 @@ async def get_purse_timeseries(
     controller_id: str,
     db_manager: AsyncDatabaseManager = Depends(get_database_manager),
 ):
-    """Authoritative journal-time equity/flows series for a controller (hbdash_api P2).
+    """DERIVED journal-time equity/flows series for a controller (hbdash_api P2).
 
-    Same newest-snapshot fetch + 404 as :func:`get_purse` (via the shared sources).
-    Parses the harvested journal, re-validates the P2 envelope, then returns the P2
-    timeseries read-model: one point at each checkpoint (an in-epoch sample) and each
-    opening_epoch/reseed_epoch/reanchor (a re-baseline, flagged via ``boundary``), in
-    journal-time (each point's ``ts`` is the record's own accounting time, NOT
-    ``harvested_at`` — the CLA-M02 fix), segmentable by ``incarnation_id``/``boundary``
-    (CLA-2A-05). Money is decimal strings; the ``note`` states it is a harvested
-    snapshot, not a live tail. The raw ``records_json`` is consumed and NEVER exposed.
+    NON-AUTHORITATIVE: computed from the engine-authoritative journal bytes, never a
+    source of truth (see ``authority_note``). Same newest-snapshot fetch + 404 as
+    :func:`get_purse` (via the shared sources). Parses the harvested journal,
+    re-validates the P2 envelope, then returns the P2 timeseries read-model: one point
+    at each checkpoint (an in-epoch sample) and each opening_epoch/reseed_epoch/reanchor
+    (a re-baseline, flagged via ``boundary``), in journal-time (each point's ``ts`` is
+    the record's own accounting time, NOT ``harvested_at`` — the CLA-M02 fix),
+    segmentable by ``incarnation_id``/``boundary`` (CLA-2A-05). Money is decimal strings;
+    ``earned_realized`` is null at points before their epoch's fills have settled (the
+    light path cannot place it in time — see the ``note``); the ``note`` states it is a
+    harvested snapshot, not a live tail. The raw ``records_json`` is consumed and NEVER
+    exposed.
     """
     async with db_manager.get_session_context() as session:
         row = await PurseSnapshotRepository(session).get_latest_for_controller(controller_id)
@@ -254,7 +258,7 @@ async def get_purse_timeseries(
                 contributed=str(p.contributed),
                 withdrawn=str(p.withdrawn),
                 earned_total=str(p.earned_total),
-                earned_realized=str(p.earned_realized),
+                earned_realized=(str(p.earned_realized) if p.earned_realized is not None else None),
             )
             for p in points
         ],

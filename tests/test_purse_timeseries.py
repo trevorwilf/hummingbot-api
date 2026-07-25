@@ -218,6 +218,81 @@ def precision_journal(controller_id="ctrl_a"):
     return valid_purse_payload(controller_id=controller_id, records=records)
 
 
+def contaminated_rollup_journal(controller_id="ctrl_a"):
+    """CDX-R01/R02: the REALISTIC in-place rollup shape the engine actually writes — ONE
+    cumulative fills_rollup per epoch, its seq/ts FROZEN at the first fill (seq2, ts
+    T0+100) while its cumulative deltas + ``last_update_ts`` advance across a LATER
+    checkpoint (last_update_ts = T0+2W, verified against
+    ``purse_ledger.update_fills_rollup``). The seq3 checkpoint (ts T0+1W) falls BETWEEN
+    the rollup's frozen ts and its logical last update, so its point-in-time realized is
+    UNKNOWABLE on the light path (must be null, NOT the epoch-final −40 leaked backwards);
+    the seq4 checkpoint (ts T0+3W) is after the rollup settled, so its realized IS known.
+    ref=1 so equity == owned_quote. Every value below is hand-derived from the contract."""
+    records = [
+        opening_epoch_record(
+            seq=1, ts=T0, epoch_id="epoch-alpha",
+            owned_quote="100", owned_base="0", reference_price="1",
+            contributed_opening_quote="100", earned_opening_quote="0",
+        ),
+        fills_rollup_record(
+            seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
+            quote_delta_cum="-40", base_delta_cum="0", fees_quote_cum="0",
+            fills_seen=5, last_update_ts=T0 + 2 * WEEK,   # updated in place, PAST the seq3 ts
+        ),
+        checkpoint_record(
+            seq=3, ts=T0 + 1 * WEEK, epoch_id="epoch-alpha",
+            owned_quote="80", owned_base="0", reference_price="1", equity_quote="80",
+        ),
+        checkpoint_record(
+            seq=4, ts=T0 + 3 * WEEK, epoch_id="epoch-alpha",
+            owned_quote="60", owned_base="0", reference_price="1", equity_quote="60",
+        ),
+    ]
+    return valid_purse_payload(controller_id=controller_id, records=records)
+
+
+def terminal_flow_journal(controller_id="ctrl_a"):
+    """CDX-R03: a valid journal ENDING in a non-emitting deposit flow (after the last
+    checkpoint). Without a terminal reconciliation point the last emitted point (the
+    seq2 checkpoint) would keep the pre-deposit contributed=100; the terminal point must
+    carry contributed=150 (100 + 50), stamped at the flow's seq/journal ts, so the final
+    point reconciles with compute_derived_metrics."""
+    records = [
+        opening_epoch_record(
+            seq=1, ts=T0, epoch_id="epoch-alpha",
+            owned_quote="100", owned_base="0", reference_price="1",
+            contributed_opening_quote="100", earned_opening_quote="0",
+        ),
+        checkpoint_record(
+            seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
+            owned_quote="100", owned_base="0", reference_price="1", equity_quote="100",
+        ),
+        flow_record(seq=3, ts=T0 + 200, flow_kind="deposit", quote_valuation="50"),
+    ]
+    return valid_purse_payload(controller_id=controller_id, records=records)
+
+
+def terminal_rollup_journal(controller_id="ctrl_a"):
+    """CDX-R03: a valid journal ENDING in a fills_rollup (its frozen seq/ts is the last
+    record). The terminal point is stamped at the rollup's ``last_update_ts`` (T0+500 —
+    the settled accounting time of its realized content, NOT its frozen first-fill ts) so
+    its realized is known and the final point reconciles. ref=2 with base_delta_cum=5 so
+    the base leg (5*2=10) is exercised: realized = 0 + (−30) + 10 = −20."""
+    records = [
+        opening_epoch_record(
+            seq=1, ts=T0, epoch_id="epoch-alpha",
+            owned_quote="100", owned_base="0", reference_price="2",
+            contributed_opening_quote="100", earned_opening_quote="0",
+        ),
+        fills_rollup_record(
+            seq=2, ts=T0 + 100, epoch_id="epoch-alpha",
+            quote_delta_cum="-30", base_delta_cum="5", fees_quote_cum="0",
+            fills_seen=3, last_update_ts=T0 + 500,
+        ),
+    ]
+    return valid_purse_payload(controller_id=controller_id, records=records)
+
+
 def _spec_incarnation_id(controller_id, epoch_id):
     """Reimplement the DOCUMENTED P1 derivation independently (spec-derived, NOT captured
     from the implementation): ``inc_`` + first 16 hex of sha256 of the tagged basis."""
@@ -337,31 +412,108 @@ class TestTimeseriesComputation:
 
 
 # ===========================================================================
+# 1b. Temporal realized honesty — an in-place rollup must not leak future P&L
+#     into an earlier checkpoint (CDX-R01/R02)
+# ===========================================================================
+
+class TestRealizedTemporalHonesty:
+    def test_intermediate_checkpoint_before_rollup_settles_has_null_earned_realized(self):
+        """CDX-R01: the engine keeps ONE cumulative fills_rollup per epoch, updated in
+        place (seq/ts frozen at the first fill, cumulative deltas + last_update_ts
+        advancing). A checkpoint whose ts precedes the rollup's last_update_ts therefore
+        CANNOT know its point-in-time realized — it must be null, NOT the epoch-final
+        value leaked backward. The point-in-time metrics (equity/earned_total) stay exact.
+        MUTATION GUARDS: emitting the epoch-final realized at the mid checkpoint (removing
+        the frontier null-guard) makes mid.earned_realized == -40, not None; the CDX-R02
+        mutation that drops an updated-in-place rollup's quote leg makes final -> 0 != -40."""
+        points = compute_timeseries(contaminated_rollup_journal())
+        assert len(points) == 3                 # opening + 2 checkpoints (rollup does not emit)
+        opening, mid, final = points
+        # opening: no rollup counted yet -> realized is exact = earned_opening (0).
+        assert opening.earned_realized == Decimal("0")
+        # mid checkpoint (ts T0+1W < rollup last_update_ts T0+2W): realized UNKNOWABLE.
+        assert mid.seq == 3
+        assert mid.earned_realized is None
+        assert mid.equity_quote == Decimal("80")            # point-in-time exact
+        assert mid.earned_total == Decimal("-20")           # 80 - 100, exact
+        # final checkpoint (ts T0+3W > rollup last_update_ts): realized settled and KNOWN.
+        assert final.seq == 4
+        assert final.earned_realized == Decimal("-40")      # 0 + (-40) + 0*1
+        assert final.earned_total == Decimal("-40")         # 60 - 100
+
+    def test_final_realized_reconciles_when_settled_despite_in_place_rollup(self):
+        """Once the rollup has settled, the final point's realized equals the whole-journal
+        compute_derived_metrics — the reconciliation cross-check still holds at the end."""
+        payload = contaminated_rollup_journal()
+        final = compute_timeseries(payload)[-1]
+        m = compute_derived_metrics(payload)
+        assert final.earned_realized == m.earned_realized == Decimal("-40")
+
+
+# ===========================================================================
 # 2. Reconciliation — the final point agrees with compute_derived_metrics
 # ===========================================================================
 
 class TestReconciliation:
     @pytest.mark.parametrize(
-        "journal", [multi_epoch_series_journal, flows_journal, outflow_reanchor_journal]
+        "journal",
+        [
+            multi_epoch_series_journal,
+            flows_journal,
+            outflow_reanchor_journal,
+            terminal_flow_journal,      # CDX-R04: journal ends in a non-emitting flow
+            terminal_rollup_journal,    # CDX-R04: journal ends in a non-emitting rollup
+        ],
     )
     def test_final_point_equals_compute_derived_metrics(self, journal):
         """Single-sourcing proof: the LAST timeseries point equals the whole-journal
         ``compute_derived_metrics`` for contributed / withdrawn / earned_realized /
         earned_total / equity / owned / reference price. Any drift between the two walks
-        (a different accumulator, a different owned/ref resolution) fails this. MUTATION
-        GUARD: skipping the running-contributed update, or using a different final ref,
-        makes the two disagree."""
+        (a different accumulator, a different owned/ref resolution) fails this. Includes
+        journals that END in a non-emitting flow/rollup (CDX-R04): the terminal
+        reconciliation point must carry the whole-journal accumulators. MUTATION GUARDS:
+        skipping the running-contributed update or a different final ref makes the two
+        disagree; dropping the terminal record (records[:-1] when it is a flow/rollup)
+        leaves the final point stale and fails the flow/rollup parameters."""
         payload = journal()
         final = compute_timeseries(payload)[-1]
         m = compute_derived_metrics(payload)
         assert final.contributed == m.contributed
         assert final.withdrawn == m.withdrawn
+        assert final.earned_realized is not None            # settled at the final point
         assert final.earned_realized == m.earned_realized
         assert final.earned_total == m.earned_total
         assert final.equity_quote == m.equity_quote
         assert final.owned_quote == m.owned_quote
         assert final.owned_base == m.owned_base
         assert final.reference_price == m.reference_price_used
+
+    def test_terminal_flow_emits_reconciling_point_at_flow_journal_time(self):
+        """CDX-R03: a deposit after the last checkpoint gets a terminal point carrying the
+        post-deposit contributed and the FLOW's seq/journal ts — not the stale checkpoint
+        totals. MUTATION GUARD: not emitting the terminal point (records[:-1]) leaves the
+        final point at the checkpoint (seq 2, contributed 100) and fails the seq list."""
+        payload = terminal_flow_journal()
+        points = compute_timeseries(payload)
+        assert [p.seq for p in points] == [1, 2, 3]         # opening, checkpoint, terminal flow
+        final = points[-1]
+        assert final.boundary is None
+        assert final.ts == T0 + 200                          # the flow's own journal ts
+        assert final.contributed == Decimal("150")           # 100 + 50 deposit (was 100)
+        assert final.earned_total == Decimal("-50")          # 100 - 150
+
+    def test_terminal_rollup_emits_reconciling_point_at_settled_time(self):
+        """CDX-R03: a journal ending in a fills_rollup gets a terminal point stamped at the
+        rollup's last_update_ts (T0+500, its settled accounting time — NOT its frozen
+        first-fill ts T0+100), reconciling realized. MUTATION GUARD: dropping the terminal
+        record leaves the final point at the opening (realized 0) and fails."""
+        payload = terminal_rollup_journal()
+        points = compute_timeseries(payload)
+        assert [p.seq for p in points] == [1, 2]             # opening, terminal rollup
+        final = points[-1]
+        assert final.boundary is None
+        assert final.ts == T0 + 500                          # last_update_ts, not the frozen ts
+        assert final.earned_realized == Decimal("-20")       # 0 + (-30) + 5*2
 
 
 # ===========================================================================
@@ -409,21 +561,29 @@ class TestIncarnationSegmentation:
 class TestResponseContract:
     def test_note_disclaims_live_freshness_and_names_journal_time(self):
         """The response MUST NOT imply a live tail and MUST name the journal-time x-axis and
-        the segmentation keys (CLA-2A-05 / CLA-M02)."""
+        the segmentation keys (CLA-2A-05 / CLA-M02), AND carry the as-of-last-harvest
+        qualification (CDX-R06 — the phrasing that stops a harvested series being presented
+        as current). Each is asserted independently against the spec wording, not against a
+        self-referential copy of the implementation constant."""
         assert "note" in PurseTimeseriesResponse.model_fields
+        assert "as of last harvest" in TIMESERIES_NOTE      # CDX-R06: the harvest qualification
         assert "not a live tail" in TIMESERIES_NOTE
         assert "journal time" in TIMESERIES_NOTE
         assert "incarnation_id" in TIMESERIES_NOTE and "boundary" in TIMESERIES_NOTE
 
     def test_point_money_fields_are_strings_not_floats(self):
         """Money on every point is a decimal STRING (JSON float coercion must never corrupt a
-        balance). The model types these ``str``; a value that a float would mangle (0.1+0.2)
-        stays exact. MUTATION GUARD: typing a money field as float serializes 0.3 as
-        0.30000000000000004."""
+        balance). The point-in-time-exact fields are typed bare ``str``; a value that a float
+        would mangle (0.1+0.2) stays exact. MUTATION GUARD: typing a money field as float
+        serializes 0.3 as 0.30000000000000004. ``earned_realized`` is a NULLABLE decimal
+        string (``Optional[str]``, CDX-R01) — null where not yet temporally knowable."""
+        from typing import Optional
+
         from models.purse import PurseTimeseriesPoint
         for money_field in ("owned_quote", "owned_base", "reference_price", "equity_quote",
-                            "contributed", "withdrawn", "earned_total", "earned_realized"):
+                            "contributed", "withdrawn", "earned_total"):
             assert PurseTimeseriesPoint.model_fields[money_field].annotation is str
+        assert PurseTimeseriesPoint.model_fields["earned_realized"].annotation == Optional[str]
 
 
 # ===========================================================================
@@ -455,10 +615,20 @@ class TestTimeseriesEndpoint:
         assert resp.note == TIMESERIES_NOTE
 
     @pytest.mark.asyncio
-    async def test_404_for_unknown_controller(self, db):
-        with pytest.raises(HTTPException) as exc:
+    async def test_404_for_unknown_controller_matches_sibling_shape(self, db):
+        """CDX-R07: an unknown controller 404s with the SAME body as the sibling
+        ``get_purse`` route (Phase 2's byte-identical-404 contract), not merely status
+        404. MUTATION GUARD: returning a different 404 detail from the timeseries handler
+        (e.g. detail='wrong shape') diverges from get_purse's detail and fails."""
+        from routers.purse import get_purse
+        with pytest.raises(HTTPException) as sibling:
+            await get_purse("nobody", db_manager=db)
+        with pytest.raises(HTTPException) as series:
             await get_purse_timeseries("nobody", db_manager=db)
-        assert exc.value.status_code == 404
+        assert series.value.status_code == sibling.value.status_code == 404
+        assert series.value.detail == sibling.value.detail          # identical body, not just status
+        assert "No purse snapshot harvested" in series.value.detail  # the shared handler message
+        assert "nobody" in series.value.detail                      # names the controller
 
     @pytest.mark.asyncio
     async def test_contract_invalid_stored_journal_is_500(self, db):
@@ -507,8 +677,10 @@ class TestTimeseriesEndpointASGI:
         assert isinstance(final["contributed"], str)         # money is a JSON string, not a float
         assert final["incarnation_id"] == _spec_incarnation_id("ctrl_a", "epoch-alpha")
         assert body["note"] == TIMESERIES_NOTE
+        assert "as of last harvest" in body["note"]          # CDX-R06: harvest qualification present
         assert body["authority_note"] == AUTHORITY_NOTE
         assert body["provenance"]["sequence"] == 6
+        assert body["provenance"]["harvested_at"]            # the as-of anchor is present alongside
         assert "records_json" not in json.dumps(body)
 
     @pytest.mark.asyncio
@@ -539,9 +711,17 @@ class TestTimeseriesEndpointASGI:
 
     @pytest.mark.asyncio
     async def test_unknown_controller_404_through_router(self, db, asgi_main):
+        """CDX-R07: the 404 must be the HANDLER's snapshot-not-found body, proving the
+        request actually reached ``get_purse_timeseries`` — not a generic FastAPI routing
+        404 (``{"detail":"Not Found"}``) that a wrong route path would also produce.
+        MUTATION GUARDS: mounting the route at a different path, or a different 404 detail
+        in the handler, both fail the detail assertion below (status alone would not)."""
         from deps import get_database_manager
         asgi_main.app.dependency_overrides[get_database_manager] = lambda: db
         asgi_main.app.dependency_overrides[asgi_main.auth_user] = lambda: "tester"
 
         resp = await _asgi_get(asgi_main.app, "/purse/nobody/timeseries")
         assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert "No purse snapshot harvested" in detail        # the handler's body, not "Not Found"
+        assert "nobody" in detail                             # names the requested controller

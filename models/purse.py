@@ -132,13 +132,19 @@ class PurseActivityResponse(BaseModel):
 TIMESERIES_NOTE = (
     "journal checkpoints, as of last harvest — not a live tail; x-axis is journal "
     "time (each point's ts is the journal record's own accounting time, NOT "
-    "harvested_at); segment by incarnation_id / boundary (opening | reseed | reanchor)."
+    "harvested_at); segment by incarnation_id / boundary (opening | reseed | reanchor). "
+    "earned_realized is null at a point before its epoch's booked fills have all "
+    "settled: the light-path journal keeps ONE in-place cumulative fills_rollup per "
+    "epoch, so a checkpoint earlier than that rollup's last_update_ts cannot know its "
+    "point-in-time realized (equity / contributed / withdrawn / earned_total remain "
+    "point-in-time exact)."
 )
 
 
 class PurseTimeseriesPoint(BaseModel):
-    """One authoritative journal-time point (hbdash_api P2). Money values are decimal
-    STRINGS (JSON float coercion must never corrupt a reported balance)."""
+    """One DERIVED, non-authoritative journal-time point (hbdash_api P2) — computed from
+    engine-authoritative journal bytes. Money values are decimal STRINGS (JSON float
+    coercion must never corrupt a reported balance)."""
     ts: Optional[float] = Field(
         default=None,
         description="the journal RECORD's ts (accounting/journal epoch seconds), NOT "
@@ -165,18 +171,21 @@ class PurseTimeseriesPoint(BaseModel):
     contributed: str = Field(description="running contributed at this point")
     withdrawn: str = Field(description="running withdrawn at this point")
     earned_total: str = Field(description="equity - contributed + withdrawn at this point")
-    earned_realized: str = Field(
-        description="earned_opening + sum(quote_delta_cum + base_delta_cum * reference_price)"
+    earned_realized: Optional[str] = Field(
+        default=None,
+        description="earned_opening + sum(quote_delta_cum + base_delta_cum * reference_price); "
+        "null when not yet temporally knowable at this point (a counted in-place rollup "
+        "settled after this point's journal time — see the response note)",
     )
 
 
 class PurseTimeseriesResponse(BaseModel):
-    """The authoritative journal checkpoint/epoch series for a controller (hbdash_api P2).
+    """The DERIVED journal checkpoint/epoch series for a controller (hbdash_api P2).
 
-    Reuses :class:`PurseProvenance` + :data:`AUTHORITY_NOTE`; carries a required
-    :data:`TIMESERIES_NOTE`. Points exclude nothing authoritative, but the response
-    must not imply live freshness — it is the harvested snapshot's journal series,
-    as of ``provenance.harvested_at``.
+    NON-AUTHORITATIVE: computed from the engine-authoritative journal bytes, never the
+    source of truth. Reuses :class:`PurseProvenance` + :data:`AUTHORITY_NOTE`; carries a
+    required :data:`TIMESERIES_NOTE`. The response must not imply live freshness — it is
+    the harvested snapshot's journal series, as of ``provenance.harvested_at``.
     """
     controller_id: str
     points: List[PurseTimeseriesPoint] = Field(default_factory=list)
